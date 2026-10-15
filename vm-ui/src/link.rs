@@ -31,6 +31,8 @@ pub struct NodeHealth {
     pub avg_us: f64,
     pub max_us: u64,
     pub calls: u64,
+    /// Algorithmic latency in ms (group delay, not CPU cost).
+    pub lat_ms: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -56,6 +58,8 @@ pub struct HealthInfo {
     pub restarts: u64,
     pub last_reason: String,
     pub last_restart_unix: u64,
+    /// Chain algorithmic latency budget in ms.
+    pub latency_ms: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -397,6 +401,7 @@ fn parse_health(data: Option<&serde_json::Value>) -> HealthInfo {
                     avg_us: fnum(n.get("avgUs")),
                     max_us: num(n.get("maxUs")),
                     calls: num(n.get("calls")),
+                    lat_ms: fnum(n.get("latMs")),
                 })
                 .collect()
         })
@@ -418,6 +423,7 @@ fn parse_health(data: Option<&serde_json::Value>) -> HealthInfo {
             .unwrap_or("")
             .to_string(),
         last_restart_unix: num(wd.and_then(|w| w.get("lastRestartUnix"))),
+        latency_ms: fnum(data.and_then(|d| d.get("latencyMs"))),
     }
 }
 
@@ -443,8 +449,9 @@ mod link_tests {
                 "voice": "mic-npr-voice",
                 "link": "Streaming",
                 "graphXruns": 3,
+                "latencyMs": 10.666,
                 "nodes": [
-                    {"node": "denoise", "avgUs": 410.5, "maxUs": 900, "calls": 50}
+                    {"node": "denoise", "avgUs": 410.5, "maxUs": 900, "calls": 50, "latMs": 10.666}
                 ],
                 "capture": {"invocations": 50, "avgUs": 6.0, "maxUs": 20, "xruns": 0, "watchdogTrips": 0, "lastFrames": 960},
                 "watchdog": {"restarts": 2, "lastReason": "xrun storm", "lastRestartUnix": 42, "consecutiveFailures": 0}
@@ -456,10 +463,12 @@ mod link_tests {
         assert_eq!(s.health.link, "Streaming");
         assert!(s.health.active);
         assert_eq!(s.health.graph_xruns, 3);
+        assert!((s.health.latency_ms - 10.666).abs() < 1e-9);
         assert_eq!(s.health.nodes.len(), 1);
         assert_eq!(s.health.nodes[0].node, "denoise");
         assert!((s.health.nodes[0].avg_us - 410.5).abs() < 1e-9);
         assert_eq!(s.health.nodes[0].max_us, 900);
+        assert!((s.health.nodes[0].lat_ms - 10.666).abs() < 1e-9);
         assert_eq!(s.health.capture.invocations, 50);
         assert_eq!(s.health.playback.xruns, 0); // missing block degrades to zero
         assert_eq!(s.health.restarts, 2);

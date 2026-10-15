@@ -491,16 +491,22 @@ impl VmApp {
         });
         ui.separator();
         ui.heading("DSP nodes (µs per quantum)");
-        egui::Grid::new("node_health").num_columns(4).spacing([12.0, 4.0]).show(ui, |ui| {
+        ui.label(format!(
+            "chain algorithmic latency ≈ {:.1} ms (group delay, not CPU cost)",
+            h.latency_ms
+        ));
+        egui::Grid::new("node_health").num_columns(5).spacing([12.0, 4.0]).show(ui, |ui| {
             ui.strong("node");
             ui.strong("avg µs");
             ui.strong("max µs");
+            ui.strong("lat ms");
             ui.strong("calls");
             ui.end_row();
             for n in &h.nodes {
                 ui.label(&n.node);
                 ui.label(format!("{:.1}", n.avg_us));
                 ui.label(format!("{}", n.max_us));
+                ui.label(format!("{:.1}", n.lat_ms));
                 ui.label(format!("{}", n.calls));
                 ui.end_row();
             }
@@ -508,6 +514,9 @@ impl VmApp {
         if h.nodes.is_empty() {
             ui.label("no telemetry yet — is a voice loaded and streaming?");
         }
+        ui.label("low-latency note: denoise frame 512 halves the STFT window (≈21 ms → ≈11 ms) \
+            but also halves frequency resolution (93.8 Hz bins — bass selectivity suffers). \
+            Opt in via the denoise frame param; re-capture the noise profile after switching.");
         ui.separator();
         ui.heading("Streams");
         egui::Grid::new("stream_health").num_columns(7).spacing([12.0, 4.0]).show(ui, |ui| {

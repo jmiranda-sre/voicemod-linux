@@ -32,9 +32,6 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 const FRAME: usize = 1024;
-const HOP: usize = 256;
-/// Bins per channel (`FRAME/2 + 1`): the `profile` param length.
-const BINS: usize = FRAME / 2 + 1;
 const EPS: f32 = 1e-12;
 /// Frames below this level are "quiet": upward floor adaptation runs at
 /// full speed there (a new background noise gets learned fast). Loud
@@ -83,13 +80,13 @@ struct Coefs {
     g_rel: f32,
 }
 
-fn frame_coef(tau_secs: f32, rate: u32) -> f32 {
-    let hops = (tau_secs * rate as f32 / HOP as f32).max(1.0);
+fn frame_coef(tau_secs: f32, rate: u32, hop: usize) -> f32 {
+    let hops = (tau_secs * rate as f32 / hop as f32).max(1.0);
     1.0 - (-1.0 / hops).exp()
 }
 
 /// One analysis→gain→synthesis frame. The frame sits at the front of
-/// `ch.pending`; on return exactly `HOP` samples were consumed and `HOP`
+/// `ch.pending`; on return exactly `hop` samples were consumed and `hop`
 /// synthesized samples pushed to `ch.out`. Free function so the channel
 /// state and the shared scratch buffers borrow disjointly.
 #[allow(clippy::too_many_arguments)]
@@ -103,6 +100,8 @@ fn process_frame(
     coefs: Coefs,
     strength: f32,
     reduction_db: f32,
+    frame: usize,
+    hop: usize,
 ) {
     // Windowed analysis frame.
     for (i, s) in spec.iter_mut().enumerate() {
@@ -111,7 +110,7 @@ fn process_frame(
     }
     fft.process(spec);
 
-    let bins = FRAME / 2 + 1;
+    let bins = bins_for(frame);
     let floor_g = db_to_gain(reduction_db);
     if !ch.initialized {
         // Seed the floor with the very first frame; gains pass through
@@ -125,11 +124,11 @@ fn process_frame(
         // Frame level (time domain, pre-window) picks the rise speed:
         // quiet frames learn a new noise fast, loud frames don't.
         let mut acc = 0.0f32;
-        for i in 0..FRAME {
+        for i in 0..frame {
             let x = ch.pending[i];
             acc += x * x;
         }
-        let frame_db = 3.010_299_6 * (acc / FRAME as f32).max(1e-15).log2();
+        let frame_db = 3.010_299_6 * (acc / frame as f32).max(1e-15).log2();
         let a_up = if frame_db < QUIET_GATE_DB {
             coefs.a_up_quiet
         } else {
@@ -158,27 +157,27 @@ fn process_frame(
     }
     // Apply (real gain keeps Hermitian symmetry → real output).
     for (i, s) in spec.iter_mut().enumerate() {
-        let b = if i <= FRAME / 2 { i } else { FRAME - i };
+        let b = if i <= frame / 2 { i } else { frame - i };
         *s *= g_scratch[b];
     }
     ifft.process(spec);
-    let scale = 1.0 / FRAME as f32;
-    for i in 0..FRAME {
+    let scale = 1.0 / frame as f32;
+    for i in 0..frame {
         let v = spec[i].re * scale;
         ch.ola[i] += v * window[i];
         ch.norm[i] += window[i] * window[i];
     }
-    for i in 0..HOP {
+    for i in 0..hop {
         let o = if ch.norm[i] > 1e-9 { ch.ola[i] / ch.norm[i] } else { 0.0 };
         ch.out.push_back(o);
     }
     // Shift the tail down and zero the vacated tail (no reallocation —
-    // the Vecs are permanently FRAME long).
-    ch.ola.copy_within(HOP..FRAME, 0);
-    ch.ola[FRAME - HOP..].fill(0.0);
-    ch.norm.copy_within(HOP..FRAME, 0);
-    ch.norm[FRAME - HOP..].fill(0.0);
-    for _ in 0..HOP {
+    // the Vecs stay max-FRAME long; only the active prefix is used).
+    ch.ola.copy_within(hop..frame, 0);
+    ch.ola[frame - hop..].fill(0.0);
+    ch.norm.copy_within(hop..frame, 0);
+    ch.norm[frame - hop..].fill(0.0);
+    for _ in 0..hop {
         ch.pending.pop_front();
     }
 }
@@ -186,9 +185,14 @@ fn process_frame(
 pub struct Denoise {
     strength: f32,
     reduction_db: f32,
+    /// Active STFT frame (512 = low-latency opt-in, 1024 = default).
+    /// Hop is always `frame / 4`; plans + window are rebuilt on the
+    /// control plane when it changes (never on the RT path).
+    frame: usize,
     window: Vec<f32>,
     fft: Arc<dyn Fft<f32>>,
     ifft: Arc<dyn Fft<f32>>,
+    /// Max-frame scratch (sliced to `frame` per call, never regrown).
     spec: Vec<Complex<f32>>,
     /// Spectral smoothing scratch (bins).
     g_scratch: Vec<f32>,
@@ -199,7 +203,35 @@ pub struct Denoise {
     /// silent no-op on an empty `ch`.
     pending_profile: Option<Vec<f32>>,
     rate: u32,
+    coef_frame: usize,
     coefs: Coefs,
+}
+
+/// Bins for a frame size (`frame / 2 + 1`).
+fn bins_for(frame: usize) -> usize {
+    frame / 2 + 1
+}
+
+/// Linear-resample a saved floor between bin counts (257 ↔ 513). Only
+/// a starting point — the floor re-adapts within a frame or two — so a
+/// profile captured at one frame size stays usable at the other and a
+/// frame switch can never brick a preset load by length mismatch.
+fn resample_floor(src: &[f32], dst_bins: usize) -> Vec<f32> {
+    if src.len() == dst_bins {
+        return src.to_vec();
+    }
+    if src.len() < 2 || dst_bins == 0 {
+        return vec![0.0; dst_bins];
+    }
+    let scale = (src.len() - 1) as f32 / (dst_bins - 1).max(1) as f32;
+    (0..dst_bins)
+        .map(|i| {
+            let pos = (i as f32 * scale).min((src.len() - 1) as f32);
+            let lo = pos as usize;
+            let hi = (lo + 1).min(src.len() - 1);
+            src[lo] + (src[hi] - src[lo]) * (pos - lo as f32)
+        })
+        .collect()
 }
 
 impl Default for Denoise {
@@ -208,6 +240,7 @@ impl Default for Denoise {
         Self {
             strength: 2.0,
             reduction_db: -30.0,
+            frame: FRAME,
             window: hann(FRAME),
             fft: planner.plan_fft_forward(FRAME),
             ifft: planner.plan_fft_inverse(FRAME),
@@ -216,6 +249,7 @@ impl Default for Denoise {
             ch: Vec::new(),
             pending_profile: None,
             rate: 0,
+            coef_frame: 0,
             coefs: Coefs {
                 a_down: 0.0,
                 a_up_quiet: 0.0,
@@ -232,6 +266,7 @@ impl std::fmt::Debug for Denoise {
         f.debug_struct("Denoise")
             .field("strength", &self.strength)
             .field("reduction_db", &self.reduction_db)
+            .field("frame", &self.frame)
             .field("channels", &self.ch.len())
             .finish()
     }
@@ -239,15 +274,18 @@ impl std::fmt::Debug for Denoise {
 
 impl Denoise {
     fn ensure_rate(&mut self, rate: u32) {
-        if rate != self.rate {
+        // Hop (hence per-hop coefficients) follows the frame size.
+        let hop = self.frame / 4;
+        if rate != self.rate || self.frame != self.coef_frame {
             self.coefs = Coefs {
-                a_down: frame_coef(0.25, rate),
-                a_up_quiet: frame_coef(0.4, rate),
-                a_up_loud: frame_coef(8.0, rate),
-                g_atk: frame_coef(0.005, rate),
-                g_rel: frame_coef(0.12, rate),
+                a_down: frame_coef(0.25, rate, hop),
+                a_up_quiet: frame_coef(0.4, rate, hop),
+                a_up_loud: frame_coef(8.0, rate, hop),
+                g_atk: frame_coef(0.005, rate, hop),
+                g_rel: frame_coef(0.12, rate, hop),
             };
             self.rate = rate;
+            self.coef_frame = self.frame;
         }
     }
 }
@@ -258,29 +296,37 @@ impl AudioNode for Denoise {
     }
     fn process(&mut self, ctx: &ProcessContext, inputs: &[&[f32]], outputs: &mut [&mut [f32]]) {
         self.ensure_rate(ctx.rate);
+        let frame = self.frame;
+        let hop = frame / 4;
+        let bins = bins_for(frame);
         while self.ch.len() < inputs.len() {
             let mut ch = DenoiseCh::new();
             // A profile set before the first quantum (preset boot)
             // lands here instead of vanishing into an empty vec.
+            // Resampled: a floor captured at the other frame size stays
+            // usable (and can never panic on length).
             if let Some(floor) = &self.pending_profile {
-                ch.noise.copy_from_slice(floor);
+                let f = resample_floor(floor, bins);
+                ch.noise[..bins].copy_from_slice(&f);
                 ch.initialized = true;
             }
             self.ch.push(ch);
         }
         for ((input, output), ch) in inputs.iter().zip(outputs.iter_mut()).zip(self.ch.iter_mut()) {
             ch.pending.extend(input.iter());
-            while ch.pending.len() >= FRAME {
+            while ch.pending.len() >= frame {
                 process_frame(
-                    &self.window,
+                    &self.window[..frame],
                     &self.fft,
                     &self.ifft,
-                    &mut self.spec,
-                    &mut self.g_scratch,
+                    &mut self.spec[..frame],
+                    &mut self.g_scratch[..bins],
                     ch,
                     self.coefs,
                     self.strength,
                     self.reduction_db,
+                    frame,
+                    hop,
                 );
             }
             // Emit exactly input.len(): the FIFO empties into the
@@ -304,26 +350,68 @@ impl AudioNode for Denoise {
             }
             // Saved room profile: installs the learned floor on every
             // channel and skips the first-frame seeding (instant warmup).
-            // Boot never bricks on a hand-edited file: wrong length is
-            // an error, but non-finite/negative bins sanitize to 0
-            // (digital-silence floor, re-learns upward within a frame).
+            // Boot never bricks on a hand-edited file: a floor captured
+            // at the other frame size resamples (257 ↔ 513); anything
+            // else is an error, while non-finite/negative bins sanitize
+            // to 0 (digital-silence floor, re-learns upward within a
+            // frame).
             "profile" => {
                 let a = value
                     .as_float_array()
                     .ok_or_else(|| ParamError::TypeMismatch { name: name.into() })?;
-                if a.len() != BINS {
+                if a.len() != bins_for(512) && a.len() != bins_for(FRAME) {
                     return Err(ParamError::InvalidValue(format!(
-                        "profile has {} bins, want {BINS}",
-                        a.len()
+                        "profile has {} bins, want {} or {}",
+                        a.len(),
+                        bins_for(512),
+                        bins_for(FRAME)
                     )));
                 }
-                let floor: Vec<f32> =
+                let clean: Vec<f32> =
                     a.iter().map(|v| if v.is_finite() && *v >= 0.0 { *v } else { 0.0 }).collect();
+                let floor = resample_floor(&clean, bins_for(self.frame));
                 for ch in &mut self.ch {
-                    ch.noise.copy_from_slice(&floor);
+                    ch.noise[..floor.len()].copy_from_slice(&floor);
                     ch.initialized = true;
                 }
                 self.pending_profile = Some(floor);
+                Ok(())
+            }
+            // Low-latency opt-in: 512 halves the STFT frame (≈21 ms →
+            // ≈11 ms) at the cost of halved frequency resolution
+            // (93.8 Hz bins — bass selectivity suffers). Accepts Int or
+            // integral Float (the API delivers numbers as Float).
+            // Switching drops live channel state; the stashed profile
+            // resamples along, unsaved learning restarts.
+            "frame" => {
+                let v = float()?;
+                let frame = if v == 512.0 {
+                    512
+                } else if v == 1024.0 {
+                    FRAME
+                } else {
+                    return Err(ParamError::InvalidValue(format!(
+                        "frame {v}, want 512 or 1024"
+                    )));
+                };
+                if frame != self.frame {
+                    // Carry the live floor across (resampled): a switch
+                    // costs no re-learn. Only initialized channels count —
+                    // carrying an unseeded zero floor would pass loud
+                    // noise unsuppressed until the slow upward adaptation.
+                    if let Some(live) = self.ch.first().filter(|c| c.initialized).map(|c| c.noise.clone()) {
+                        self.pending_profile = Some(resample_floor(&live, bins_for(frame)));
+                    } else if let Some(floor) = self.pending_profile.take() {
+                        self.pending_profile =
+                            Some(resample_floor(&floor, bins_for(frame)));
+                    }
+                    self.frame = frame;
+                    self.ch.clear();
+                    let mut planner = FftPlanner::new();
+                    self.fft = planner.plan_fft_forward(frame);
+                    self.ifft = planner.plan_fft_inverse(frame);
+                    self.window = hann(frame);
+                }
                 Ok(())
             }
             _ => Err(ParamError::Unknown(name.into())),
@@ -331,16 +419,28 @@ impl AudioNode for Denoise {
     }
     fn get_param(&self, name: &str) -> Option<ParamValue> {
         match name {
-            // Channel 0's floor (mono mics: identical everywhere), or
-            // the stashed boot profile before channels exist.
-            "profile" => Some(ParamValue::FloatArray(
-                self.ch
-                    .first()
-                    .map(|c| c.noise.clone())
-                    .or_else(|| self.pending_profile.clone())?,
-            )),
+            // Channel 0's floor over the ACTIVE bins (mono mics:
+            // identical everywhere), or the stashed boot profile
+            // before channels exist.
+            "profile" => {
+                let bins = bins_for(self.frame);
+                Some(ParamValue::FloatArray(
+                    self.ch
+                        .first()
+                        .map(|c| c.noise[..bins].to_vec())
+                        .or_else(|| {
+                            self.pending_profile
+                                .as_ref()
+                                .map(|f| resample_floor(f, bins))
+                        })?,
+                ))
+            }
             _ => None,
         }
+    }
+    /// The STFT analysis frame (group delay of the spectral path).
+    fn latency_samples(&self, _rate: u32) -> usize {
+        self.frame
     }
     fn params(&self) -> Vec<PublicParam> {
         vec![
@@ -354,6 +454,12 @@ impl AudioNode for Denoise {
                 name: "reduction_db",
                 value: ParamValue::Float(self.reduction_db),
                 range: Some(RangedParam { min: -60.0, max: 0.0, default: -30.0 }),
+                public: true,
+            },
+            PublicParam {
+                name: "frame",
+                value: ParamValue::Int(self.frame as i32),
+                range: Some(RangedParam { min: 512.0, max: 1024.0, default: 1024.0 }),
                 public: true,
             },
         ]
@@ -493,7 +599,7 @@ mod denoise_tests {
         let mut n = Denoise::default();
         // Unknown readback is None (trait default contract).
         assert!(n.get_param("nope").is_none());
-        let floor = vec![0.01f32; BINS];
+        let floor = vec![0.01f32; bins_for(FRAME)];
         n.set_param("profile", ParamValue::FloatArray(floor.clone())).unwrap();
         match n.get_param("profile") {
             Some(ParamValue::FloatArray(back)) => assert_eq!(back, floor),
@@ -510,7 +616,7 @@ mod denoise_tests {
             Err(ParamError::TypeMismatch { .. })
         ));
         // Non-finite/negative bins sanitize to digital silence.
-        let mut dirty = vec![0.02f32; BINS];
+        let mut dirty = vec![0.02f32; bins_for(FRAME)];
         dirty[0] = f32::NAN;
         dirty[1] = f32::INFINITY;
         dirty[2] = -1.0;
@@ -534,7 +640,7 @@ mod denoise_tests {
         let out_fresh = run(&mut fresh, &input, 960);
         let mut primed = Denoise::default();
         primed
-            .set_param("profile", ParamValue::FloatArray(vec![0.0; BINS]))
+            .set_param("profile", ParamValue::FloatArray(vec![0.0; bins_for(FRAME)]))
             .unwrap();
         let out_primed = run(&mut primed, &input, 960);
         // Early window: past the ~FRAME startup gap, before any slow
@@ -557,7 +663,7 @@ mod denoise_tests {
         let _ = run(&mut n, &input, 960);
         match n.get_param("profile") {
             Some(ParamValue::FloatArray(floor)) => {
-                assert_eq!(floor.len(), BINS);
+                assert_eq!(floor.len(), bins_for(FRAME));
                 assert!(floor.iter().all(|v| v.is_finite() && *v >= 0.0));
                 let mean = floor.iter().sum::<f32>() / floor.len() as f32;
                 assert!(
@@ -567,5 +673,93 @@ mod denoise_tests {
             }
             other => panic!("want learned floor readback, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn frame_switch_halves_latency_and_replans() {
+        let mut n = Denoise::default();
+        assert_eq!(n.latency_samples(RATE), 1024);
+        // Int (preset files) and integral Float (Control API numbers).
+        n.set_param("frame", ParamValue::Int(512)).unwrap();
+        assert_eq!(n.latency_samples(RATE), 512);
+        n.set_param("frame", ParamValue::Float(1024.0)).unwrap();
+        assert_eq!(n.latency_samples(RATE), 1024);
+        // Anything else is an error (never a half-built STFT).
+        assert!(matches!(
+            n.set_param("frame", ParamValue::Int(777)),
+            Err(ParamError::InvalidValue(_))
+        ));
+        assert!(matches!(
+            n.set_param("frame", ParamValue::Float(777.0)),
+            Err(ParamError::InvalidValue(_))
+        ));
+        assert!(matches!(
+            n.set_param("frame", ParamValue::Text("512".into())),
+            Err(ParamError::TypeMismatch { .. })
+        ));
+        // Audio still flows after a live switch (re-planned FFT).
+        n.set_param("frame", ParamValue::Int(512)).unwrap();
+        let input = noise(24_000, 0.1);
+        let out = run(&mut n, &input, 960);
+        assert_eq!(out.len(), input.len());
+        assert!(out.iter().all(|s| s.is_finite()));
+        assert!(out.iter().any(|s| s.abs() > 0.01), "switched node must emit");
+    }
+
+    #[test]
+    fn profile_resamples_across_frame_sizes() {
+        // Captured at 1024 (513 bins), installed while running 512.
+        let mut n = Denoise::default();
+        n.set_param("frame", ParamValue::Int(512)).unwrap();
+        let big = vec![0.02f32; bins_for(1024)];
+        n.set_param("profile", ParamValue::FloatArray(big)).unwrap();
+        match n.get_param("profile") {
+            Some(ParamValue::FloatArray(floor)) => {
+                assert_eq!(floor.len(), bins_for(512));
+                // Constant floor resamples exactly.
+                assert!(floor.iter().all(|v| (*v - 0.02).abs() < 1e-6));
+            }
+            other => panic!("want resampled floor, got {other:?}"),
+        }
+        // Switching back up keeps a usable floor (no re-brick).
+        n.set_param("frame", ParamValue::Int(1024)).unwrap();
+        match n.get_param("profile") {
+            Some(ParamValue::FloatArray(floor)) => {
+                assert_eq!(floor.len(), bins_for(1024));
+                assert!(floor.iter().all(|v| (*v - 0.02).abs() < 1e-6));
+            }
+            other => panic!("want restored floor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn denoise_512_still_suppresses_stationary_noise() {
+        // Quality retained in low-latency mode (the opt-in tradeoff is
+        // frequency resolution — 93.8 Hz bins — not suppression depth).
+        let mut n = Denoise::default();
+        n.set_param("frame", ParamValue::Int(512)).unwrap();
+        let input = noise(192_000, 0.1);
+        let out = run(&mut n, &input, 960);
+        let in_r = rms(&input[144_000..]);
+        let out_r = rms(&out[144_000..]);
+        assert!(
+            out_r < in_r * 0.5,
+            "512-frame must still suppress (in {in_r:.4}, out {out_r:.4})"
+        );
+        assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn resample_floor_roundtrips_smooth_floors() {
+        let ramp: Vec<f32> = (0..bins_for(1024)).map(|i| i as f32 / 512.0).collect();
+        let down = resample_floor(&ramp, bins_for(512));
+        assert_eq!(down.len(), bins_for(512));
+        let up = resample_floor(&down, bins_for(1024));
+        // Linear interp of a linear ramp is near-exact.
+        for (a, b) in ramp.iter().zip(up.iter()) {
+            assert!((a - b).abs() < 0.01, "resample drifted: {a} vs {b}");
+        }
+        // Degenerate inputs never panic.
+        assert_eq!(resample_floor(&[], 10), vec![0.0; 10]);
     }
 }

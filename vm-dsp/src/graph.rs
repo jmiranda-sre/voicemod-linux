@@ -133,6 +133,10 @@ impl Graph {
         self.nodes.get_mut(id.0)?.as_deref_mut()
     }
 
+    pub fn node(&self, id: NodeId) -> Option<&(dyn AudioNode + 'static)> {
+        self.nodes.get(id.0)?.as_deref()
+    }
+
     /// Number of nodes (diagnostic / status reporting).
     pub fn len(&self) -> usize {
         self.order.len()
@@ -147,6 +151,17 @@ impl Graph {
     /// updates the pre-sized `telemetry` vec in place.
     pub fn telemetry(&self) -> Vec<(NodeId, NodeTelemetry)> {
         self.order.iter().map(|id| (*id, self.telemetry[id.0])).collect()
+    }
+
+    /// Chain algorithmic latency in samples at `rate`: sums each node's
+    /// group delay in execution order (exact for the linear chains we
+    /// build; CPU cost is separate — see [`Graph::telemetry`]).
+    pub fn latency_samples(&self, rate: u32) -> usize {
+        self.order
+            .iter()
+            .filter_map(|id| self.nodes[id.0].as_deref())
+            .map(|n| n.latency_samples(rate))
+            .sum()
     }
 
     /// Process the whole chain in insertion order.
@@ -248,6 +263,10 @@ mod graph_tests {
         fn name(&self) -> &'static str {
             "pass"
         }
+        /// Fixed 128-sample group delay (test double for STFT nodes).
+        fn latency_samples(&self, _rate: u32) -> usize {
+            128
+        }
         fn process(
             &mut self,
             _ctx: &ProcessContext,
@@ -296,6 +315,15 @@ mod graph_tests {
         }
         assert_eq!(t[0].0, NodeId(0));
         assert_eq!(t[1].0, NodeId(1));
+    }
+
+    #[test]
+    fn latency_sums_group_delays() {
+        let mut g = Graph::new();
+        assert_eq!(g.latency_samples(48_000), 0);
+        g.add(Box::new(Pass));
+        g.add(Box::new(Pass));
+        assert_eq!(g.latency_samples(48_000), 256);
     }
 
     #[test]

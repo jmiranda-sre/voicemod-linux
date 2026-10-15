@@ -49,5 +49,12 @@ pub trait AudioNode: Send {
     fn get_param(&self, _name: &str) -> Option<ParamValue> {
         None
     }
+    /// Algorithmic latency in samples at `rate` (STFT frame, delay
+    /// line…). Default 0 (stateless gain/mix/EQ/dynamics). The graph
+    /// sums it as the chain's latency budget — CPU cost is separate
+    /// (see telemetry).
+    fn latency_samples(&self, _rate: u32) -> usize {
+        0
+    }
     fn params(&self) -> Vec<PublicParam>;
 }

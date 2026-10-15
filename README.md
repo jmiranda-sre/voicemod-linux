@@ -172,6 +172,15 @@ Once the room is learned, snapshot it into the preset with
 lands in the preset file (non-public, machine data) and the next load
 skips the warmup. Presets without a profile keep learning dynamically.
 
+Low-latency mode (opt-in): set the denoise `frame` to 512
+(`setVoiceParameter denoise.frame 512`, or the *Voices* tab) to halve
+the STFT window (≈21.3 ms → ≈10.7 ms chain latency). The tradeoff is
+frequency resolution — 93.8 Hz bins, so bass selectivity suffers — and
+a switch drops live channel state while carrying the learned floor
+across (re-capture the profile afterwards anyway for the exact room).
+The *Health* tab proves the gain: per-node `lat ms` plus the chain
+total, next to the µs CPU cost.
+
 ## Control API (WebSocket)
 
 Connect to `ws://127.0.0.1:8765`, send JSON, receive a reply plus broadcast

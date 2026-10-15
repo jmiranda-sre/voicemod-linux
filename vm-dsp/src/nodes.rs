@@ -237,6 +237,10 @@ impl AudioNode for PitchFFT {
             _ => Err(ParamError::Unknown(name.into())),
         }
     }
+    /// The phase-vocoder analysis frame (the wet path's group delay).
+    fn latency_samples(&self, _rate: u32) -> usize {
+        super::spectral::FRAME
+    }
     fn params(&self) -> Vec<PublicParam> {
         vec![
             PublicParam {
@@ -326,6 +330,10 @@ impl AudioNode for FormantPitchShifter {
             }
             _ => Err(ParamError::Unknown(name.into())),
         }
+    }
+    /// The phase-vocoder analysis frame (the wet path's group delay).
+    fn latency_samples(&self, _rate: u32) -> usize {
+        super::spectral::FRAME
     }
     fn params(&self) -> Vec<PublicParam> {
         vec![
@@ -712,6 +720,10 @@ impl AudioNode for Delay {
             }
             _ => Err(ParamError::Unknown(name.into())),
         }
+    }
+    /// The audible echo lag (dry passes straight through).
+    fn latency_samples(&self, _rate: u32) -> usize {
+        self.delay_samples()
     }
     fn params(&self) -> Vec<PublicParam> {
         vec![

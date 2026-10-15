@@ -664,9 +664,12 @@ impl ControlHandler for DaemonState {
                 };
                 // Join graph telemetry (keyed by NodeId) with preset node
                 // ids; unnamed nodes fall back to `node<N>`. Sorted for a
-                // deterministic wire order.
+                // deterministic wire order. Each row also carries the
+                // node's algorithmic latency in ms (group delay, not CPU
+                // cost) — the chain budget the low-latency mode optimises.
                 let ids = self.node_ids.lock().unwrap();
-                let tele = self.graph.lock().map(|g| g.telemetry()).unwrap_or_default();
+                let graph = self.graph.lock().unwrap();
+                let tele = graph.telemetry();
                 let mut nodes: Vec<serde_json::Value> = tele
                     .into_iter()
                     .map(|(id, t)| {
@@ -674,16 +677,24 @@ impl ControlHandler for DaemonState {
                             .iter()
                             .find_map(|(k, v)| (*v == id).then(|| k.clone()))
                             .unwrap_or_else(|| format!("node{}", id.0));
+                        let lat_ms = graph
+                            .node(id)
+                            .map(|n| n.latency_samples(SAMPLE_RATE) as f64 * 1000.0 / SAMPLE_RATE as f64)
+                            .unwrap_or(0.0);
                         serde_json::json!({
                             "node": name,
                             "avgUs": t.avg_us,
                             "maxUs": t.max_us,
                             "calls": t.calls,
+                            "latMs": lat_ms,
                         })
                     })
                     .collect();
                 nodes.sort_by(|a, b| a["node"].as_str().cmp(&b["node"].as_str()));
+                let latency_ms: f64 =
+                    nodes.iter().map(|n| n["latMs"].as_f64().unwrap_or(0.0)).sum();
                 drop(ids);
+                drop(graph);
                 let wd = self.watchdog.lock().unwrap();
                 (
                     ControlReply::ok_data(serde_json::json!({
@@ -705,6 +716,8 @@ impl ControlHandler for DaemonState {
                         // learns changer + mute state without toggling.
                         "enabled": self.voice_enabled.load(Ordering::Relaxed),
                         "muted": self.muted.load(Ordering::Relaxed),
+                        // Chain algorithmic latency budget in ms.
+                        "latencyMs": latency_ms,
                     })),
                     Vec::new(),
                 )
@@ -1985,6 +1998,84 @@ mod profile_tests {
         let (reply, _) =
             blank.handle(&Action::CaptureNoiseProfile { node: "denoise".into() });
         assert!(!reply.ok);
+    }
+
+    #[test]
+    fn frame_switch_updates_health_latency() {
+        let state = learned_state();
+        let lat_of = |state: &Arc<DaemonState>| {
+            let (reply, _) = state.handle(&Action::GetHealth);
+            assert!(reply.ok);
+            reply.data.unwrap()
+        };
+        let data = lat_of(&state);
+        let dn = data["nodes"].as_array().unwrap().iter().find(|n| n["node"] == "denoise").unwrap().clone();
+        assert!((dn["latMs"].as_f64().unwrap() - 1024.0 * 1000.0 / 48_000.0).abs() < 1e-9);
+        assert!((data["latencyMs"].as_f64().unwrap() - dn["latMs"].as_f64().unwrap()).abs() < 1e-9,
+            "mic chain budget is the denoise frame alone");
+        // Live switch over the API (JSON numbers arrive as Float).
+        let (reply, _) = state.handle(&Action::SetVoiceParameter {
+            param: "denoise.frame".into(),
+            value: serde_json::json!(512),
+        });
+        assert!(reply.ok, "{:?}", reply.error);
+        let data = lat_of(&state);
+        let dn = data["nodes"].as_array().unwrap().iter().find(|n| n["node"] == "denoise").unwrap().clone();
+        assert!((dn["latMs"].as_f64().unwrap() - 512.0 * 1000.0 / 48_000.0).abs() < 1e-9);
+        assert!((data["latencyMs"].as_f64().unwrap() - dn["latMs"].as_f64().unwrap()).abs() < 1e-9);
+        // Capture at 512 stores 257 bins; reload applies them.
+        let (reply, _) = state.handle(&Action::CaptureNoiseProfile { node: "denoise".into() });
+        assert!(reply.ok, "{:?}", reply.error);
+        assert_eq!(reply.data.unwrap()["bins"], 257);
+        let (reply, _) = state.handle(&Action::SelectVoice { voice: "mic-npr-voice".into() });
+        assert!(reply.ok, "{:?}", reply.error);
+        // Middle values stay rejected (never a half-built STFT).
+        let (reply, _) = state.handle(&Action::SetVoiceParameter {
+            param: "denoise.frame".into(),
+            value: serde_json::json!(777),
+        });
+        assert!(!reply.ok);
+    }
+
+    #[test]
+    fn full_chain_512_attenuates_without_blowing_up() {
+        let state = learned_state();
+        let (reply, _) = state.handle(&Action::SetVoiceParameter {
+            param: "denoise.frame".into(),
+            value: serde_json::json!(512),
+        });
+        assert!(reply.ok);
+        // Fresh noise (unseen room) through the 512 chain.
+        let mut st = 0x9e37_79b9_7f4a_7c15u64;
+        let mut proc = GraphProcessor::new(
+            state.graph.clone(),
+            state.voice_enabled.clone(),
+            state.muted.clone(),
+            state.graph_xruns.clone(),
+        );
+        let mut out_all = Vec::new();
+        let mut noise = Vec::with_capacity(96_000);
+        for _ in 0..96_000 {
+            st = st.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            noise.push((((st >> 32) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0) * 0.1);
+        }
+        for chunk in noise.as_chunks::<960>().0 {
+            let input = [chunk.to_vec(), chunk.to_vec()];
+            let mut out = vec![vec![0.0f32; chunk.len()]; 2];
+            let ins: Vec<&[f32]> = input.iter().map(Vec::as_slice).collect();
+            let mut outs: Vec<&mut [f32]> = out.iter_mut().map(Vec::as_mut_slice).collect();
+            proc.process(48_000, &ins, &mut outs);
+            out_all.extend_from_slice(&out[0]);
+        }
+        assert!(out_all.iter().all(|s| s.is_finite()));
+        let rms = |x: &[f32]| (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt();
+        let in_r = rms(&noise[72_000..]);
+        let out_r = rms(&out_all[72_000..]);
+        assert!(
+            out_r < in_r * 0.9,
+            "512 chain must still suppress stationary noise: in {in_r:.4}, out {out_r:.4}"
+        );
+        assert_eq!(state.graph_xruns.load(Ordering::Relaxed), 0, "no lock contention");
     }
 }
 

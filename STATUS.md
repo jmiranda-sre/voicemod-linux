@@ -680,6 +680,22 @@ abaixo são o plano proposto p/ aprovação.
   validação, skip do first-frame seeding (primed passa 5×+ no início),
   aprendizado sem perfil, captura→arquivo→reload, rejeições.
 
+### F-5 — FECHADA (baixa latência + ms por nó) — 2026-10-15
+- `AudioNode::latency_samples` (default 0): denoise = frame ativo,
+  pitch/formant = 2048, delay = linha; `Graph` soma o budget da cadeia.
+- Denoise `frame` 512/1024 (default 1024): planos FFT + janela
+  refeitos no control plane; troca reseta canais mas carrega o floor
+  vivo (reamostrado) — sem re-learn; perfil reamostra nos dois
+  sentidos (nunca bricka load); `get_param` devolve prefixo ativo.
+- `GetHealth`: `latMs` por nó + `latencyMs` total; UI mostra coluna
+  lat ms, total da cadeia e nota do tradeoff de graves (512 = bins de
+  93.8 Hz); `mic-npr-voice` com `frame: 1024` explícito e público.
+- Testes: switch 512↔1024 + replan + rejeição de 777, resample de
+  perfil, supressão mantida em 512, soma de latência, health latMs via
+  API, E2E cadeia 512 (finito + atenua, xruns de contenção = 0).
+- Medição absoluta fim-a-fim em HW real segue no backlog item 1 (stub
+  não gera xruns; prova aqui = budget algorítmico + CPU sã).
+
 ### Ordem de execução sugerida (com motivo)
 1. **(11) Dashboard de saúde RT + watchdog** — PRIMEIRO porque é a
    instrumentação que todos os outros usam p/ se validar (xruns, CPU/nó,

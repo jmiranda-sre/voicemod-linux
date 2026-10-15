@@ -8,7 +8,8 @@
       "type": "denoise",
       "params": {
         "strength": { "value": 2.0, "range": [1.0, 4.0, 2.0], "public": true },
-        "reduction_db": { "value": -35.0, "range": [-60.0, 0.0, -30.0], "public": true }
+        "reduction_db": { "value": -35.0, "range": [-60.0, 0.0, -30.0], "public": true },
+        "frame": { "value": 1024, "range": [512.0, 1024.0, 1024.0], "public": true }
       }
     },
     {

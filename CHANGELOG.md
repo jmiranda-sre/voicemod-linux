@@ -6,6 +6,21 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added (F-5: low-latency mode + per-node latency)
+
+- `AudioNode::latency_samples` (default 0) with real group delays:
+  denoise STFT frame, pitch/formant 2048, delay line; `Graph`
+  sums the chain budget.
+- Denoise `frame` param (512/1024, default 1024): low-latency opt-in
+  halves the window (≈21.3 ms → ≈10.7 ms). FFT plans + window rebuild
+  on the control plane; channels reset with the *live* floor carried
+  across (resampled) so a switch costs no re-learn; profiles
+  resample both ways, so a switch can never brick a preset load.
+- `GetHealth` rows carry `latMs` plus a chain `latencyMs` total; the
+  UI *Health* tab shows per-node ms, the chain budget and the
+  bass-resolution tradeoff note (93.8 Hz bins at 512).
+- `mic-npr-voice` ships an explicit `frame: 1024` (editable in the UI).
+
 ### Added (F-3: saved noise profiles)
 
 - Preset values grow a `FloatArray` kind (JSON arrays; serde-untagged,
