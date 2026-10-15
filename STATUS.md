@@ -545,6 +545,18 @@ Publicação:
 14. de-esser: modelar banda de detecção f1..f2 do EasyEffects (4k–8k com
     Q) — hoje detecta tudo acima do corte em 4k; limiter com lookahead
     opcional (EasyEffects usa 2ms).
+Pós-v0.3.0 (brainstorm 2026-10-15, arquivados p/ v0.4.0+):
+15. Troca automática de preset por app/cena (detecção do destino
+    PipeWire/foco; fallback p/ padrão).
+16. Denoisers neurais opcionais via ONNX (RNNoise/DeepFilterNet; ver
+    item 6 acima — fundir ao implementar).
+17. Assistente de calibragem de ganho (wizard fala-5s → gate/makeup/
+    limiter + medidor de clipping).
+18. Integração OBS via WebSocket (preset por cena, dock VU, soundboard
+    em fontes).
+19. Marketplace de presets (bundles assinados, instalar em 1 clique).
+20. Modo filtro PipeWire nativo (alternativa ao null-sink; menos cópias,
+    mais robustez a hotplug).
 
 ## PUBLICADO — v0.1.0 no ar (2026-10-15)
 - Autenticação: `gh auth login` (HTTPS + credential helper do gh) como
@@ -590,3 +602,71 @@ Publicação:
   regressão, já era assim no 0.1.0.
 - Próximo (do usuário): PR no Flathub (manifest pronto, tag v0.2.0
   resolve), AUR (PKGBUILD pronto), issues do backlog.
+
+## v0.3.0 — ROADMAP APROVADO (planejamento, 2026-10-15 — SEM CÓDIGO AINDA)
+Escopo: 7 itens do brainstorm (numeração original entre parênteses).
+Foco: usabilidade + desempenho + integração. Nada implementado — frentes
+abaixo são o plano proposto p/ aprovação.
+
+### Ordem de execução sugerida (com motivo)
+1. **(11) Dashboard de saúde RT + watchdog** — PRIMEIRO porque é a
+   instrumentação que todos os outros usam p/ se validar (xruns, CPU/nó,
+   clipping, estado do link). Sem isso, o item 5 não tem como provar
+   ganho de latência. Dívidas que ele absorve: backlog 8 (porta em uso
+   → log claro) e o espírito do backlog 1 (medição).
+2. **(9) Hotkeys globais evdev + PTT/mute + persistência** — fecha a
+   dívida desde a v0.1.0 (backlog 4 vira esta frente) e ESTENDE a
+   superfície da Control API (ações add/remove/list binds). Vem antes
+   do item 8 para o Stream Deck já nascer cobrindo os binds novos.
+3. **(8) Stream Deck / Companion** — consome a API estabilizada no
+   passo anterior: documenta o mapeamento ação→botão, garante feedback
+   via eventos existentes (`voiceChanged` etc.) e GetBitmap honesto.
+   Quase só cola + docs + testes de protocolo.
+4. **(3) Perfil de ruído da sala salvo no preset** — DSP autocontido
+   (snapshot do floor em `$VM_CONFIG_DIR`, reload no boot, versão do
+   formato p/ invalidar perfis velhos). Validado pelo dashboard do
+   passo 1 (warmup ~1s → ~0). Absorve a parte "warmup" do backlog 13.
+5. **(5) Modo baixa latência + ms por nó na UI** — usa a medição do
+   passo 1: chave STFT 512/1024 no denoise (+ talvez quantum), mostra
+   custo por nó. Absorve backlog 1 (re-medir c/ espectral ativa) e 2
+   (STFT adaptativo).
+6. **(6) Pack de vozes-personagem de fábrica** — SÓ CONTEÚDO (nós já
+   existem: pitch/formant/reverb/tube/delay): robô, demônio, rádio,
+   chipmunk, etc. via `BUILTIN_PRESETS`. Paralelizável a qualquer
+   momento; colocado aqui porque é entrega visível de fim de ciclo.
+   Critério: cada preset valida em `vm check-preset` + teste golden
+   (ex.: +12st → pico em 880Hz ±5%, como já fazemos).
+7. **(13) Autostart + tray** — POR ÚLTIMO: é integração/empacotamento
+   (systemd user unit, `.desktop`, portal Flatpak, tray no egui) e deve
+   coroar o daemon com comportamento final — autostartar algo ainda em
+   mudança gera bug fantasma. Inclui "não oferecer Launch c/ systemd
+   ativo" (lição da Fase 6).
+
+### Frentes de trabalho (o quê / onde toca / aceite)
+- **F-A observabilidade (11)**: telemetria por nó (µs + xruns) no
+  `GraphProcessor`, evento/status na API, aba "Health" na UI, watchdog
+  c/ reconexão (modelo: `TryRestartOnInternalError` do original, Fase 2).
+  Aceite: forçar xrun artificial → UI mostra + reconecta sem restart.
+- **F-B controle físico (9+8)**: `Keybind` persistido em JSON + ações
+  `addHotkey/removeHotkey/listHotkeys` + perfis por preset
+  (PTT/PTM/mute); doc de mapeamento Stream Deck/Companion + fixture de
+  teste de protocolo. Aceite: bind sobrevive a restart; botão físico
+  (simulado via evento) troca voz. Sandbox: degrada sem /dev/input
+  (já faz — Fase 6).
+- **F-C DSP de mic (3+5)**: snapshot de floor + chave de frame + tabela
+  de latência por nó. Aceite: 2º boot sem warmup audível; UI mostra ms
+  por nó somando ≈ medido fim-a-fim (±20%).
+- **F-D conteúdo (6)**: N presets curados + docs. Aceite: todos passam
+  em `check-preset` + golden de pitch.
+- **F-E sistema (13)**: unit user + tray + autostart opt-in + docs de
+  sandbox (Flatpak sem tray/evdev = degradação documentada, não bug).
+  Aceite: login → daemon ativo → vm-mic selecionável sem abrir UI.
+
+### Riscos conhecidos
+- evdev precisa grupo `input`/udev (já documentado Fase 3); Flatpak não
+  tem /dev/input nem tray pleno — escopo nativo/AUR+AppImage, resto
+  degrada com mensagem honesta.
+- STFT 512 piora resolução de graves do denoise — o modo baixa latência
+  nasce como OPT-IN com o trade-off escrito na UI, não default.
+- Hotkeys globais fora de jogo Wayland: evdev lê hardware, não
+  compositor — funciona, mas testar em CachyOS/KWin antes de prometer.
