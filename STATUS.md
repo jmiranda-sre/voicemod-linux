@@ -511,8 +511,8 @@ branco pelo GraphProcessor — saída finita e ruído estacionário atenuado).
 Latência: denoise adiciona ~21ms ao caminho do preset de mic (E2E ~72ms com a
 cadeia espectral; medir de verdade = item 1 do backlog).
 
-Pendente p/ entregar ao usuário final: **corte do 0.1.1** (o AppImage publicado
-v0.1.0 não contém os presets — bump de versão, rebuild, tag, release).
+Entrega fechada com a **release 0.2.0** (bump minor por semver — features
+novas em 0.x): ver PUBLICADO 0.2.0 abaixo.
 
 ## BACKLOG PÓS-LANÇAMENTO (itens NÃO entregues no 0.1.0 — registry p/ issues)
 Dívidas Fase 4 (medição/latência):
@@ -565,3 +565,28 @@ Publicação:
 - Próximo (do usuário): PR no Flathub (manifest pronto, tag resolve),
   AUR (PKGBUILD pronto, .SRCINFO com MAKEPKG_LINT_PKGBUILD=0),
   Issue tracker para o backlog do STATUS.md.
+
+## PUBLICADO — v0.2.0 no ar (2026-10-15)
+- Bump em 4 arquivos (workspace Cargo.toml + Cargo.lock, metainfo com nova
+  entrada `<release version="0.2.0">`, manifest Flatpak `tag: v0.2.0` +
+  fix da URL do x-checker-data que apontava pra `voicemodlinux/app`
+  inexistente). PKGBUILD não muda: pkgver deriva de `git describe`.
+- `appstreamcli validate` ✔ 100% (URL da repo agora resolve); 55/55
+  testes; clippy dos crates novos limpo (resta só débito pré-existente:
+  spectral.rs/graph.rs/vm-audio/vm-soundboard).
+- AppImage reconstruído pelo `packaging/appimage/build.sh`:
+  VoicemodLinux-0.2.0-x86_64.AppImage (16.439.800 bytes) — **contém os
+  presets de fábrica** (seed no boot), ao contrário do 0.1.0.
+- Commits `08edfbe` (feat/dsp) + `8c09082` (release) + tag anotada
+  `v0.2.0`; push main + tag OK; Release criada
+  github.com/jmiranda-sre/voicemod-linux/releases/tag/v0.2.0
+  (não-draft, não-prerelease) com AppImage anexado + notas do CHANGELOG.
+- Smoke real pós-build (daemon release, backend stub, config dir novo):
+  seed de `mic-npr-voice`, `vm check-preset` → 11 nós/10 arestas,
+  `selectVoice` → `ok:true` + evento `voiceChanged`, `setVoiceParameter`
+  em comp/denoise/limit → `ok:true`, nó inexistente → erro limpo.
+- Aviso conhecido p/ clientes: mensagem que falha no parse responde
+  `ok:false` SEM ecoar `id` (o id pertence ao payload inválido) — não é
+  regressão, já era assim no 0.1.0.
+- Próximo (do usuário): PR no Flathub (manifest pronto, tag v0.2.0
+  resolve), AUR (PKGBUILD pronto), issues do backlog.
