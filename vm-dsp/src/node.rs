@@ -44,5 +44,10 @@ pub trait AudioNode: Send {
     fn name(&self) -> &'static str;
     fn process(&mut self, ctx: &ProcessContext, inputs: &[&[f32]], outputs: &mut [&mut [f32]]);
     fn set_param(&mut self, name: &str, value: ParamValue) -> Result<(), ParamError>;
+    /// Read back a live value (calibration capture, e.g. a denoise
+    /// noise profile). Default is "no readable params" — nodes opt in.
+    fn get_param(&self, _name: &str) -> Option<ParamValue> {
+        None
+    }
     fn params(&self) -> Vec<PublicParam>;
 }

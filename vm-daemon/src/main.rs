@@ -194,6 +194,40 @@ impl DaemonState {
             .map_err(|e| format!("write {}: {e}", self.config_path.display()))
     }
 
+    /// Write a captured noise floor into the current voice's preset
+    /// file as the node's non-public `profile` param. The updated file
+    /// is re-validated before it reaches disk; user edits to every
+    /// other param survive untouched (only `profile` is inserted).
+    fn store_noise_profile(&self, node: &str, profile: &[f64]) -> Result<usize, String> {
+        let voice = self.voice_name.lock().unwrap().clone();
+        if voice.is_empty() {
+            return Err("no voice loaded".to_string());
+        }
+        let path = self.preset_dir.join(format!("{voice}.json"));
+        let text = std::fs::read_to_string(&path)
+            .map_err(|_| format!("preset file missing for '{voice}'"))?;
+        let mut preset = vm_preset::load(&text).map_err(|e| format!("bad preset: {e}"))?;
+        let spec = preset
+            .nodes
+            .iter_mut()
+            .find(|n| n.id == node)
+            .ok_or_else(|| format!("node '{node}' not in preset '{voice}'"))?;
+        spec.params.insert(
+            "profile".to_string(),
+            vm_preset::ParamSpec {
+                value: vm_preset::JsonParamValue::FloatArray(profile.to_vec()),
+                range: None,
+                public: false,
+                modulation: None,
+            },
+        );
+        let out =
+            serde_json::to_string_pretty(&preset).map_err(|e| format!("encode: {e}"))?;
+        vm_preset::load(&out).map_err(|e| format!("wrote invalid preset: {e}"))?;
+        std::fs::write(&path, out).map_err(|e| format!("write {}: {e}", path.display()))?;
+        Ok(profile.len())
+    }
+
     /// Runtime input switch: stop → reopen on the new input (same virtual
     /// output) → start. Drops in-flight audio; the graph keeps running.
     fn switch_input(&self, uid: &str) -> Result<(), String> {
@@ -313,6 +347,9 @@ impl DaemonState {
                     vm_preset::JsonParamValue::Int(v) => vm_dsp::ParamValue::Int(*v as i32),
                     vm_preset::JsonParamValue::Bool(v) => vm_dsp::ParamValue::Bool(*v),
                     vm_preset::JsonParamValue::Text(v) => vm_dsp::ParamValue::Text(v.clone()),
+                    vm_preset::JsonParamValue::FloatArray(v) => {
+                        vm_dsp::ParamValue::FloatArray(v.iter().map(|x| *x as f32).collect())
+                    }
                 };
                 node.set_param(pname, v).map_err(|e| format!("param {pname}: {e}"))?;
             }
@@ -531,6 +568,50 @@ impl ControlHandler for DaemonState {
                     })
                     .collect();
                 (ControlReply::ok_data(serde_json::json!({ "hotkeys": binds })), Vec::new())
+            }
+            Action::CaptureNoiseProfile { node } => {
+                // Read the live floor off the running node, then store it
+                // into the current voice's preset file (round-trips
+                // through validation before touching disk).
+                let profile: Vec<f64> = {
+                    let ids = self.node_ids.lock().unwrap();
+                    let Some(id) = ids.get(node).copied() else {
+                        return (
+                            ControlReply::err(format!("unable to find node '{node}'")),
+                            Vec::new(),
+                        );
+                    };
+                    drop(ids);
+                    let mut graph = self.graph.lock().unwrap();
+                    let Some(n) = graph.node_mut(id) else {
+                        return (
+                            ControlReply::err(format!("node '{node}' retired")),
+                            Vec::new(),
+                        );
+                    };
+                    match n.get_param("profile") {
+                        Some(vm_dsp::ParamValue::FloatArray(p)) => {
+                            p.iter().map(|x| *x as f64).collect()
+                        }
+                        _ => {
+                            return (
+                                ControlReply::err(format!(
+                                    "node '{node}' exposes no noise profile (want a denoise node)"
+                                )),
+                                Vec::new(),
+                            )
+                        }
+                    }
+                };
+                match self.store_noise_profile(node, &profile) {
+                    Ok(bins) => (
+                        ControlReply::ok_data(
+                            serde_json::json!({ "node": node, "bins": bins }),
+                        ),
+                        Vec::new(),
+                    ),
+                    Err(e) => (ControlReply::err(e), Vec::new()),
+                }
             }
             Action::StartAudioStreaming => {
                 let mut audio = self.audio.lock().unwrap();
@@ -1807,6 +1888,102 @@ mod widget_matrix_tests {
             param: "drive.note".into(),
             value: serde_json::json!(1.5),
         });
+        assert!(!reply.ok);
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    fn learned_state() -> Arc<DaemonState> {
+        let state = test_state();
+        seed_builtin_presets(&state.preset_dir).unwrap();
+        let (reply, _) = state.handle(&Action::SelectVoice { voice: "mic-npr-voice".into() });
+        assert!(reply.ok, "{:?}", reply.error);
+        // 2 s of room noise through the chain: the floor learns.
+        let mut st = 0x2545_f491_4f6c_dd1du64;
+        let mut proc = GraphProcessor::new(
+            state.graph.clone(),
+            state.voice_enabled.clone(),
+            state.muted.clone(),
+            state.graph_xruns.clone(),
+        );
+        for _ in 0..100 {
+            let mut chunk = vec![0.0f32; 960];
+            for s in chunk.iter_mut() {
+                st = st.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                *s = (((st >> 32) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0) * 0.05;
+            }
+            let input = [chunk.clone(), chunk];
+            let mut out = vec![vec![0.0f32; 960]; 2];
+            let ins: Vec<&[f32]> = input.iter().map(Vec::as_slice).collect();
+            let mut outs: Vec<&mut [f32]> = out.iter_mut().map(Vec::as_mut_slice).collect();
+            proc.process(48_000, &ins, &mut outs);
+        }
+        state
+    }
+
+    #[test]
+    fn capture_writes_profile_and_reload_applies_it() {
+        let state = learned_state();
+        let (reply, _) = state.handle(&Action::CaptureNoiseProfile { node: "denoise".into() });
+        assert!(reply.ok, "{:?}", reply.error);
+        assert_eq!(reply.data.unwrap()["bins"], 513);
+
+        // File: profile present, non-public, everything else intact.
+        let path = state.preset_dir.join("mic-npr-voice.json");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let preset = vm_preset::load(&text).expect("captured file must validate");
+        let dn = preset.nodes.iter().find(|n| n.id == "denoise").unwrap();
+        let prof = &dn.params["profile"];
+        assert!(!prof.public);
+        assert!(prof.range.is_none());
+        match &prof.value {
+            vm_preset::JsonParamValue::FloatArray(bins) => assert_eq!(bins.len(), 513),
+            other => panic!("want FloatArray, got {other:?}"),
+        }
+        assert_eq!(
+            dn.params["strength"].value,
+            vm_preset::JsonParamValue::Float(2.0),
+            "unrelated params survive capture"
+        );
+
+        // Reload (boot path): the installed floor equals the file.
+        let (reply, _) = state.handle(&Action::SelectVoice { voice: "mic-npr-voice".into() });
+        assert!(reply.ok, "{:?}", reply.error);
+        let ids = state.node_ids.lock().unwrap();
+        let mut graph = state.graph.lock().unwrap();
+        let n = graph.node_mut(ids["denoise"]).unwrap();
+        match n.get_param("profile") {
+            Some(vm_dsp::ParamValue::FloatArray(floor)) => {
+                assert_eq!(floor.len(), 513);
+                match &prof.value {
+                    vm_preset::JsonParamValue::FloatArray(bins) => {
+                        for (a, b) in floor.iter().zip(bins.iter()) {
+                            assert!((a - *b as f32).abs() < 1e-6);
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            other => panic!("want installed floor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capture_rejects_unknown_and_non_denoise_nodes() {
+        let state = test_state();
+        let (reply, _) = state.handle(&Action::SelectVoice { voice: "example-drive".into() });
+        assert!(reply.ok);
+        let (reply, _) = state.handle(&Action::CaptureNoiseProfile { node: "ghost".into() });
+        assert!(!reply.ok);
+        let (reply, _) = state.handle(&Action::CaptureNoiseProfile { node: "drive".into() });
+        assert!(!reply.ok, "gain node exposes no profile");
+        // No voice loaded at all: node lookup fails first, cleanly.
+        let blank = test_state();
+        let (reply, _) =
+            blank.handle(&Action::CaptureNoiseProfile { node: "denoise".into() });
         assert!(!reply.ok);
     }
 }

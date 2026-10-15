@@ -35,6 +35,10 @@ pub enum Action {
     /// List loadable voice preset names (sorted stems of
     /// `$VM_CONFIG_DIR/presets/*.json`) — feeds Companion dropdowns.
     GetVoices,
+    /// Snapshot a denoise node's live noise floor into the current
+    /// voice's preset file (`profile` param): the next load skips the
+    /// ~1 s warmup. The "learn room" button for users and Companion.
+    CaptureNoiseProfile { node: String },
     GetBitmap { resource: String },
     SetSoundboardMasterVolume { per_mille: u16 },
     SelectInput { uid: String },
@@ -137,8 +141,9 @@ mod action_shape_tests {
             Action::ListHotkeys,
             Action::SetMuted { muted: false },
             Action::GetVoices,
+            Action::CaptureNoiseProfile { node: String::new() },
         ];
-        assert_eq!(all.len(), 22, "keep this list in sync with the catalogue");
+        assert_eq!(all.len(), 23, "keep this list in sync with the catalogue");
         for a in &all {
             let o = serde_json::to_value(a).unwrap();
             let o = o.as_object().unwrap();

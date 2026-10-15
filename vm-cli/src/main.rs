@@ -107,6 +107,7 @@ async fn main() {
                 "listHotkeys",
                 "setMuted",
                 "getVoices",
+                "captureNoiseProfile",
                 "getBitmap",
                 "setSoundboardMasterVolume",
                 "selectInput",

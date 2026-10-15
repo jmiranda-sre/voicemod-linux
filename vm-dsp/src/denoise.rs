@@ -33,6 +33,8 @@ use std::sync::Arc;
 
 const FRAME: usize = 1024;
 const HOP: usize = 256;
+/// Bins per channel (`FRAME/2 + 1`): the `profile` param length.
+const BINS: usize = FRAME / 2 + 1;
 const EPS: f32 = 1e-12;
 /// Frames below this level are "quiet": upward floor adaptation runs at
 /// full speed there (a new background noise gets learned fast). Loud
@@ -191,6 +193,11 @@ pub struct Denoise {
     /// Spectral smoothing scratch (bins).
     g_scratch: Vec<f32>,
     ch: Vec<DenoiseCh>,
+    /// Saved room floor waiting for channel creation: `process` builds
+    /// channels lazily, but `apply_preset` sets `profile` before the
+    /// first quantum — without the stash the boot install would be a
+    /// silent no-op on an empty `ch`.
+    pending_profile: Option<Vec<f32>>,
     rate: u32,
     coefs: Coefs,
 }
@@ -207,6 +214,7 @@ impl Default for Denoise {
             spec: vec![Complex::default(); FRAME],
             g_scratch: vec![1.0; FRAME / 2 + 1],
             ch: Vec::new(),
+            pending_profile: None,
             rate: 0,
             coefs: Coefs {
                 a_down: 0.0,
@@ -251,7 +259,14 @@ impl AudioNode for Denoise {
     fn process(&mut self, ctx: &ProcessContext, inputs: &[&[f32]], outputs: &mut [&mut [f32]]) {
         self.ensure_rate(ctx.rate);
         while self.ch.len() < inputs.len() {
-            self.ch.push(DenoiseCh::new());
+            let mut ch = DenoiseCh::new();
+            // A profile set before the first quantum (preset boot)
+            // lands here instead of vanishing into an empty vec.
+            if let Some(floor) = &self.pending_profile {
+                ch.noise.copy_from_slice(floor);
+                ch.initialized = true;
+            }
+            self.ch.push(ch);
         }
         for ((input, output), ch) in inputs.iter().zip(outputs.iter_mut()).zip(self.ch.iter_mut()) {
             ch.pending.extend(input.iter());
@@ -276,17 +291,55 @@ impl AudioNode for Denoise {
         }
     }
     fn set_param(&mut self, name: &str, value: ParamValue) -> Result<(), ParamError> {
-        let v = value.as_float().ok_or_else(|| ParamError::TypeMismatch { name: name.into() });
+        let float = || value.as_float().ok_or_else(|| ParamError::TypeMismatch { name: name.into() });
         match name {
             "strength" => {
-                self.strength = clamp(v?, RangedParam { min: 1.0, max: 4.0, default: 2.0 });
+                self.strength = clamp(float()?, RangedParam { min: 1.0, max: 4.0, default: 2.0 });
                 Ok(())
             }
             "reduction_db" => {
-                self.reduction_db = clamp(v?, RangedParam { min: -60.0, max: 0.0, default: -30.0 });
+                self.reduction_db =
+                    clamp(float()?, RangedParam { min: -60.0, max: 0.0, default: -30.0 });
+                Ok(())
+            }
+            // Saved room profile: installs the learned floor on every
+            // channel and skips the first-frame seeding (instant warmup).
+            // Boot never bricks on a hand-edited file: wrong length is
+            // an error, but non-finite/negative bins sanitize to 0
+            // (digital-silence floor, re-learns upward within a frame).
+            "profile" => {
+                let a = value
+                    .as_float_array()
+                    .ok_or_else(|| ParamError::TypeMismatch { name: name.into() })?;
+                if a.len() != BINS {
+                    return Err(ParamError::InvalidValue(format!(
+                        "profile has {} bins, want {BINS}",
+                        a.len()
+                    )));
+                }
+                let floor: Vec<f32> =
+                    a.iter().map(|v| if v.is_finite() && *v >= 0.0 { *v } else { 0.0 }).collect();
+                for ch in &mut self.ch {
+                    ch.noise.copy_from_slice(&floor);
+                    ch.initialized = true;
+                }
+                self.pending_profile = Some(floor);
                 Ok(())
             }
             _ => Err(ParamError::Unknown(name.into())),
+        }
+    }
+    fn get_param(&self, name: &str) -> Option<ParamValue> {
+        match name {
+            // Channel 0's floor (mono mics: identical everywhere), or
+            // the stashed boot profile before channels exist.
+            "profile" => Some(ParamValue::FloatArray(
+                self.ch
+                    .first()
+                    .map(|c| c.noise.clone())
+                    .or_else(|| self.pending_profile.clone())?,
+            )),
+            _ => None,
         }
     }
     fn params(&self) -> Vec<PublicParam> {
@@ -433,5 +486,86 @@ mod denoise_tests {
             n.set_param("nope", ParamValue::Float(1.0)),
             Err(ParamError::Unknown(_))
         ));
+    }
+
+    #[test]
+    fn profile_installs_reads_back_and_validates() {
+        let mut n = Denoise::default();
+        // Unknown readback is None (trait default contract).
+        assert!(n.get_param("nope").is_none());
+        let floor = vec![0.01f32; BINS];
+        n.set_param("profile", ParamValue::FloatArray(floor.clone())).unwrap();
+        match n.get_param("profile") {
+            Some(ParamValue::FloatArray(back)) => assert_eq!(back, floor),
+            other => panic!("want FloatArray readback, got {other:?}"),
+        }
+        // Wrong length errors (never silently truncates/pads).
+        assert!(matches!(
+            n.set_param("profile", ParamValue::FloatArray(vec![0.0; 512])),
+            Err(ParamError::InvalidValue(_))
+        ));
+        // Scalar is a type error, not a silent no-op.
+        assert!(matches!(
+            n.set_param("profile", ParamValue::Float(1.0)),
+            Err(ParamError::TypeMismatch { .. })
+        ));
+        // Non-finite/negative bins sanitize to digital silence.
+        let mut dirty = vec![0.02f32; BINS];
+        dirty[0] = f32::NAN;
+        dirty[1] = f32::INFINITY;
+        dirty[2] = -1.0;
+        n.set_param("profile", ParamValue::FloatArray(dirty)).unwrap();
+        match n.get_param("profile") {
+            Some(ParamValue::FloatArray(back)) => {
+                assert_eq!(&back[..3], &[0.0, 0.0, 0.0]);
+                assert!(back[3..].iter().all(|v| *v == 0.02));
+            }
+            other => panic!("want sanitized readback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_skips_first_frame_seeding() {
+        // Same loud stationary noise into a fresh node (seeds the floor
+        // from frame 1 → suppresses) and a node with a silence floor
+        // installed (nothing learned, everything is signal → passes).
+        let input = noise(24_000, 0.1);
+        let mut fresh = Denoise::default();
+        let out_fresh = run(&mut fresh, &input, 960);
+        let mut primed = Denoise::default();
+        primed
+            .set_param("profile", ParamValue::FloatArray(vec![0.0; BINS]))
+            .unwrap();
+        let out_primed = run(&mut primed, &input, 960);
+        // Early window: past the ~FRAME startup gap, before any slow
+        // adaptation could matter.
+        let win = 2_048..6_144;
+        let r_fresh = rms(&out_fresh[win.clone()]);
+        let r_primed = rms(&out_primed[win]);
+        assert!(
+            r_primed > r_fresh * 5.0,
+            "primed node must pass from the start (primed {r_primed:.4}, fresh {r_fresh:.4})"
+        );
+    }
+
+    #[test]
+    fn no_profile_learns_floor_from_first_frame() {
+        // Backcompat: without a profile the floor still learns
+        // dynamically (this is what presets without `profile` do).
+        let mut n = Denoise::default();
+        let input = noise(96_000, 0.002); // 2 s near-silence
+        let _ = run(&mut n, &input, 960);
+        match n.get_param("profile") {
+            Some(ParamValue::FloatArray(floor)) => {
+                assert_eq!(floor.len(), BINS);
+                assert!(floor.iter().all(|v| v.is_finite() && *v >= 0.0));
+                let mean = floor.iter().sum::<f32>() / floor.len() as f32;
+                assert!(
+                    mean > 0.0 && mean < 0.05,
+                    "learned floor must reflect the quiet room, got mean {mean:.5}"
+                );
+            }
+            other => panic!("want learned floor readback, got {other:?}"),
+        }
     }
 }

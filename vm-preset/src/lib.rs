@@ -22,12 +22,15 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// NOTE: `Int` comes first: serde untagged tries variants in order, so
 /// plain `250` lands on `Int` while `1.5` falls through to `Float`.
+/// `FloatArray` is last: JSON arrays only match it (e.g. a saved
+/// denoise noise profile — 513 magnitudes, non-public, no range).
 #[serde(untagged)]
 pub enum JsonParamValue {
     Int(i64),
     Float(f64),
     Bool(bool),
     Text(String),
+    FloatArray(Vec<f64>),
 }
 
 /// One parameter entry: value + optional range + visibility.
@@ -245,5 +248,28 @@ mod tests {
         let text = r#"{"name":"x","nodes":[{"id":"a","type":"gain"}],
                        "edges":[{"from":"a","from_ch":0,"to":"ghost","to_ch":0}]}"#;
         assert!(matches!(load(text), Err(PresetError::UnknownNode(_))));
+    }
+
+    #[test]
+    fn float_array_values_roundtrip() {
+        // A saved noise profile: 513 magnitudes, non-public, no range.
+        let text = r#"{"name":"mic","rate":48000,
+            "nodes":[{"id":"dn","type":"denoise","params":{
+                "strength":{"value":2.0,"range":[1.0,4.0,2.0],"public":true},
+                "profile":{"value":[0.0,0.001,0.002],"public":false}}}],
+            "edges":[]}"#;
+        let preset = load(text).expect("array param validates");
+        let prof = &preset.nodes[0].params["profile"];
+        assert!(!prof.public);
+        assert!(prof.range.is_none());
+        assert_eq!(
+            prof.value,
+            JsonParamValue::FloatArray(vec![0.0, 0.001, 0.002])
+        );
+        // Serde roundtrip preserves the array shape (stays an array,
+        // never collapses into scalars).
+        let back: Preset =
+            serde_json::from_str(&serde_json::to_string(&preset).unwrap()).unwrap();
+        assert_eq!(back.nodes[0].params["profile"].value, prof.value);
     }
 }

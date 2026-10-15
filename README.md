@@ -167,6 +167,11 @@ costs ~21 ms of latency and needs about a second to learn the room; the
 EasyEffects `wet`/`dry`/`lookahead` options are not modeled (our limiter
 is lookahead-free with instant attack).
 
+Once the room is learned, snapshot it into the preset with
+`{"action":"captureNoiseProfile","node":"denoise"}` — the `profile`
+lands in the preset file (non-public, machine data) and the next load
+skips the warmup. Presets without a profile keep learning dynamically.
+
 ## Control API (WebSocket)
 
 Connect to `ws://127.0.0.1:8765`, send JSON, receive a reply plus broadcast
@@ -183,7 +188,8 @@ Actions: `selectVoice`, `toggleVoiceChanger`, `stopAllSounds`, `playSound`,
 `setDefaultMicrophone`, `getAudioDevices`, `getUserLicense`, `fadeSound`,
 `startAudioStreaming`, `getAudioStreamStatus`, `getHealth`, `addHotkey`,
 `removeHotkey`, `listHotkeys`, `setMuted`, `getVoices`, `getBitmap`,
-`setSoundboardMasterVolume`, `selectInput` (22 total — `vm actions`).
+`setSoundboardMasterVolume`, `selectInput`, `getVoices`,
+`captureNoiseProfile` (23 total — `vm actions`).
 
 Events: `voiceChanged`, `voiceParameterChanged`, `soundStarted`,
 `soundStopped`, `voiceChangerToggled`, `mutedChanged`, `streamStatus`,

@@ -6,6 +6,25 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added (F-3: saved noise profiles)
+
+- Preset values grow a `FloatArray` kind (JSON arrays; serde-untagged,
+  last variant) and DSP `ParamValue` mirrors it — scalar paths
+  (`as_float`, UI sliders, `setVoiceParameter`) reject arrays as
+  `TypeMismatch`, never silently coerce.
+- `denoise` learns a `profile` param: installs the 513-bin floor on
+  all channels (+ a stash for channels created later, so the boot
+  install before the first quantum is never a silent no-op) and reads
+  it back via the new `AudioNode::get_param` (default: none).
+- `captureNoiseProfile{node}` action ("learn room" button): snapshots
+  the live floor into the current voice's preset file as a non-public,
+  range-less `profile` (re-validated before touching disk; every other
+  param untouched). Next load skips the ~1 s warmup.
+- UI renders a stored profile as a read-only "N bins stored" row.
+- Backcompat: presets without `profile` learn dynamically exactly as
+  before (covered by an explicit test).
+- `vm actions` lists `captureNoiseProfile` (23 total).
+
 ### Added (F-8: Stream Deck / Companion surface)
 
 - `GetVoices` action (sorted preset stems for Companion dropdowns).

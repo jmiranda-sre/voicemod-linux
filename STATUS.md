@@ -660,7 +660,25 @@ abaixo são o plano proposto p/ aprovação.
   (estavam defasadas desde a F-A/F-B).
 - Testes: E2E socket real c/ handler real (select→voiceChanged,
   mute→mutedChanged, toggle→evento, health, voices, ids estritos);
-  anti-colisão 22/22 ações.
+  anti-colisão 22/22 ações (23 após F-3: `captureNoiseProfile`).
+
+### F-3 — FECHADA (perfil de ruído salvo) — 2026-10-15
+- `JsonParamValue::FloatArray` (última variante untagged) +
+  `ParamValue::FloatArray` + `AudioNode::get_param` (default: None).
+  Scalars rejeitam arrays (`TypeMismatch`, nunca coerção silenciosa).
+- `denoise`: param `profile` (513 bins; instala em todos os canais +
+  `pending_profile` p/ canais criados depois — sem o stash o install
+  do boot era no-op silencioso, pego pelos testes); `get_param`
+  devolve o floor do canal 0; bins inválidos sanitizam p/ 0.
+- `CaptureNoiseProfile{node}` ("learn room"): lê o floor vivo e grava
+  no preset da voz atual como `profile` não-público/sem range
+  (re-validado antes do disco; demais params intactos). Próximo load =
+  warmup instantâneo; sem perfil = aprendizado dinâmico (teste
+  explícito de retrocompat).
+- UI: linha read-only "N bins stored"; `vm actions` = 23.
+- Testes: schema array (roundtrip/validação), install+readback+
+  validação, skip do first-frame seeding (primed passa 5×+ no início),
+  aprendizado sem perfil, captura→arquivo→reload, rejeições.
 
 ### Ordem de execução sugerida (com motivo)
 1. **(11) Dashboard de saúde RT + watchdog** — PRIMEIRO porque é a

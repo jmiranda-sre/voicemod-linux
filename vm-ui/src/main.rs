@@ -109,6 +109,9 @@ impl VmApp {
                             vm_preset::JsonParamValue::Text(v) => {
                                 self.texts.insert(key, v.clone());
                             }
+                            // Saved noise profile: machine data, not
+                            // hand-editable (capture via Control API).
+                            vm_preset::JsonParamValue::FloatArray(_) => {}
                         }
                     }
                 }
@@ -336,6 +339,12 @@ impl VmApp {
                                         } else {
                                             self.texts.insert(key, v);
                                         }
+                                    }
+                                    (vm_preset::JsonParamValue::FloatArray(bins), _) => {
+                                        ui.label(format!(
+                                            "{pname}: {} bins stored (noise profile)",
+                                            bins.len()
+                                        ));
                                     }
                                 }
                             }

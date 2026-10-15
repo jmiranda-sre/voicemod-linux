@@ -11,6 +11,10 @@ pub enum ParamValue {
     Int(i32),
     Bool(bool),
     Text(String),
+    /// Multi-lane value (e.g. a denoise noise profile: one magnitude
+    /// per FFT bin). Nodes that don't understand it reject with
+    /// `TypeMismatch` via the accessors below.
+    FloatArray(Vec<f32>),
 }
 
 impl ParamValue {
@@ -18,6 +22,13 @@ impl ParamValue {
         match self {
             Self::Float(v) => Some(*v),
             Self::Int(v) => Some(*v as f32),
+            _ => None,
+        }
+    }
+
+    pub fn as_float_array(&self) -> Option<&[f32]> {
+        match self {
+            Self::FloatArray(v) => Some(v),
             _ => None,
         }
     }
