@@ -4,6 +4,47 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 semantic versioning.
 
+## [Unreleased]
+
+### Added
+
+**Mic-processing section (`vm-dsp`)**
+- `denoise`: spectral noise suppressor — per-bin noise floor with two
+  time constants (fast fall; rise fast only when the frame is quiet,
+  −40 dBFS, so sustained speech is never learned as noise), over-subtracted
+  Wiener-style gain with a hard `reduction_db` floor, per-bin attack /
+  release smoothing plus a 3-tap spectral smooth against musical noise.
+  STFT 1024/hop 256 Hann+WOLA → ~21 ms latency; phase untouched.
+- `gate`: noise gate with RMS detector, hysteresis (close point below the
+  open point), attack/release ballistics, `reduction_db` floor.
+- `compressor`: feed-forward downward compressor — symmetric RMS
+  detector, soft-knee static curve, dB-domain attack/release smoothing,
+  static makeup. Ratio 1 is a bit-exact no-op.
+- `limiter`: lookahead-free peak limiter — instant attack, release-timed
+  recovery; output peak never crosses `threshold_db`.
+- `de-esser`: split-band compressor — low band through an RBJ lowpass,
+  high band as the exact complement `x − low` (keeps the split
+  phase-exact), reduction applied to the high band only.
+- `biquad` now selects its type at runtime (`lowpass`, `highpass`,
+  `peaking`/`bell`, `lowshelf`, `highshelf`, `bandpass`, `notch`) with
+  `freq_hz`/`q`/`gain_db` params — the EQ work deferred from Fase 3b.
+  Coefficients are the RBJ cookbook, recomputed on param/rate change.
+
+**Ready-made presets (`vm-preset`, `vm-daemon`)**
+- Built-in `mic-npr-voice`: a faithful port of the EasyEffects *Masc NPR
+  Voice + Noise Reduction* chain (denoise → gate → 5-band EQ → 3:1
+  compressor → 4 kHz de-esser → −1.5 dB limiter), embedded in the binary
+  via `BUILTIN_PRESETS` and seeded into `~/.config/vm/presets/` on first
+  boot (never overwrites user edits).
+
+### Verified
+
+- 55/55 workspace tests (+22): dynamics/denoise/EQ units (static-curve
+  accuracy, gate open/close, limiter ceiling, split-band complement),
+  builtin validation, seed-preserves-edits, and an end-to-end run of the
+  full mic chain over noise through the graph processor (finite output,
+  stationary noise attenuated).
+
 ## [0.1.0] — 2026-10-15
 
 First public release: a from-scratch, open-source clean-room port of the

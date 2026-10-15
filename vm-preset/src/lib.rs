@@ -124,6 +124,11 @@ pub const KNOWN_NODE_TYPES: &[&str] = &[
     "reverb",
     "tube",
     "oscillator",
+    "gate",
+    "compressor",
+    "limiter",
+    "de-esser",
+    "denoise",
 ];
 
 /// Parse + validate a preset. Validation mirrors loader strictness:
@@ -161,6 +166,13 @@ pub fn validate(preset: &Preset) -> Result<(), PresetError> {
     Ok(())
 }
 
+/// Presets embedded in the binary and seeded into
+/// `$VM_CONFIG_DIR/presets` (default `~/.config/vm/presets`) on first
+/// boot: `(file stem, JSON text)`. Seeding never overwrites — edits the
+/// user makes to a seeded file always win.
+pub const BUILTIN_PRESETS: &[(&str, &str)] =
+    &[("mic-npr-voice", include_str!("../builtin/mic-npr-voice.json"))];
+
 /// A neutral built-in example (own design, not a vendor pack):
 /// gentle drive → low-pass → output.
 pub fn example_drive() -> Preset {
@@ -184,5 +196,54 @@ pub fn example_drive() -> Preset {
         ],
         edges: vec![EdgeSpec { from: "drive".into(), from_ch: 0, to: "smooth".into(), to_ch: 0 }],
         public_params: vec!["drive.gain".into()],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn example_drive_loads() {
+        let text = serde_json::to_string(&example_drive()).unwrap();
+        load(&text).unwrap();
+    }
+
+    #[test]
+    fn builtin_presets_embed_and_validate() {
+        assert!(!BUILTIN_PRESETS.is_empty());
+        for (stem, text) in BUILTIN_PRESETS {
+            let preset = load(text)
+                .unwrap_or_else(|e| panic!("builtin '{stem}' failed validation: {e}"));
+            assert_eq!(&preset.name, stem, "builtin file stem must match preset name");
+            assert!(!preset.nodes.is_empty());
+        }
+    }
+
+    #[test]
+    fn mic_npr_voice_covers_the_full_mic_chain() {
+        let (_, text) = BUILTIN_PRESETS
+            .iter()
+            .find(|(s, _)| *s == "mic-npr-voice")
+            .expect("mic-npr-voice builtin present");
+        let preset = load(text).unwrap();
+        let types: Vec<&str> = preset.nodes.iter().map(|n| n.r#type.as_str()).collect();
+        // The EasyEffects chain maps 1:1 (rnnoise+deepfilternet →
+        // denoise; two Hi-pass stages mirror slope x2).
+        for want in ["denoise", "gate", "biquad", "compressor", "de-esser", "limiter"] {
+            assert!(types.contains(&want), "chain missing node type {want}");
+        }
+        // Sequential edges: 10 links for 11 nodes.
+        assert_eq!(preset.edges.len(), preset.nodes.len() - 1);
+        assert!(preset.public_params.contains(&"comp.threshold_db".to_string()));
+    }
+
+    #[test]
+    fn rejects_unknown_node_type_and_bad_edge() {
+        let text = r#"{"name":"x","nodes":[{"id":"a","type":"not-a-node"}],"edges":[]}"#;
+        assert!(matches!(load(text), Err(PresetError::UnknownNodeType(_))));
+        let text = r#"{"name":"x","nodes":[{"id":"a","type":"gain"}],
+                       "edges":[{"from":"a","from_ch":0,"to":"ghost","to_ch":0}]}"#;
+        assert!(matches!(load(text), Err(PresetError::UnknownNode(_))));
     }
 }

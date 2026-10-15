@@ -442,6 +442,20 @@ async fn main() {
     }
 }
 
+/// Copy the built-in presets into `preset_dir` on boot. Never
+/// overwrites an existing file: user edits to a seeded preset win.
+/// (`example-drive` is seeded separately below because it is generated,
+/// not embedded.)
+fn seed_builtin_presets(preset_dir: &std::path::Path) -> std::io::Result<()> {
+    for (stem, text) in vm_preset::BUILTIN_PRESETS {
+        let path = preset_dir.join(format!("{stem}.json"));
+        if !path.exists() {
+            std::fs::write(path, text)?;
+        }
+    }
+    Ok(())
+}
+
 async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
     let (preset_dir, sound_dir) = config_dirs();
     std::fs::create_dir_all(&preset_dir)?;
@@ -452,6 +466,8 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
         let text = serde_json::to_string_pretty(&vm_preset::example_drive())?;
         std::fs::write(&example, text)?;
     }
+    // Ship the ready-made mic presets (Fase 7); user edits always win.
+    seed_builtin_presets(&preset_dir)?;
 
     let state = Arc::new(DaemonState {
         graph: Arc::new(Mutex::new(Graph::new())),
@@ -912,6 +928,68 @@ mod osc_chain_tests {
         let peak = steady.iter().fold(0.0f32, |a, s| a.max(s.abs()));
         assert!((f - 440.0).abs() < 440.0 * 0.05, "got {f:.1} Hz peak {peak:.3}");
         assert!((peak - 0.5).abs() < 0.05, "peak {peak:.3}, want 0.5");
+    }
+
+    #[test]
+    fn seed_builtin_presets_writes_and_preserves_edits() {
+        let dir = std::env::temp_dir().join(format!("vm-seed-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        seed_builtin_presets(&dir).unwrap();
+        let path = dir.join("mic-npr-voice.json");
+        assert!(path.exists(), "builtin must be seeded on first boot");
+        let embedded = vm_preset::BUILTIN_PRESETS
+            .iter()
+            .find(|(s, _)| *s == "mic-npr-voice")
+            .unwrap()
+            .1;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), embedded);
+
+        // A second boot must NOT clobber the user's edits.
+        std::fs::write(&path, "user edit").unwrap();
+        seed_builtin_presets(&dir).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "user edit");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn select_mic_npr_voice_processes_noise_end_to_end() {
+        let state = test_state();
+        seed_builtin_presets(&state.preset_dir).unwrap();
+        let (reply, evts) = state.handle(&Action::SelectVoice { voice: "mic-npr-voice".into() });
+        assert!(reply.ok, "{:?}", reply.error);
+        assert!(matches!(evts[0], ControlEvent::VoiceChanged { .. }));
+        assert_eq!(*state.voice_name.lock().unwrap(), "mic-npr-voice");
+        assert_eq!(state.node_ids.lock().unwrap().len(), 11, "full chain must be wired");
+
+        // Deterministic white noise (LCG), ±amp.
+        let mut st = 0x2545_f491_4f6c_dd1du64;
+        let mut noise = Vec::with_capacity(96_000);
+        for _ in 0..96_000 {
+            st = st.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            noise.push((((st >> 32) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0) * 0.1);
+        }
+        let rms = |x: &[f32]| (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt();
+        let mut proc = GraphProcessor::new(state.graph.clone(), state.voice_enabled.clone());
+        let mut out_all = Vec::new();
+        for chunk in noise.chunks_exact(960) {
+            let input = [chunk.to_vec(), chunk.to_vec()];
+            let mut out = vec![vec![0.0f32; chunk.len()]; 2];
+            let ins: Vec<&[f32]> = input.iter().map(Vec::as_slice).collect();
+            let mut outs: Vec<&mut [f32]> = out.iter_mut().map(Vec::as_mut_slice).collect();
+            proc.process(48_000, &ins, &mut outs);
+            out_all.extend_from_slice(&out[0]);
+        }
+        assert!(out_all.iter().all(|s| s.is_finite()), "chain output must be finite");
+        // Steady state (after the denoiser's ~1 s warmup + 21 ms frame):
+        // stationary noise must come out quieter than it went in.
+        let in_r = rms(&noise[72_000..]);
+        let out_r = rms(&out_all[72_000..]);
+        assert!(
+            out_r < in_r * 0.9,
+            "mic chain must attenuate stationary noise: in {in_r:.4}, out {out_r:.4}"
+        );
+        assert!(out_r > in_r * 0.001, "output must not be muted: {out_r:.5}");
     }
 }
 

@@ -14,6 +14,8 @@
 //! here is N-channel native.
 
 pub mod buffer;
+pub mod denoise;
+pub mod dynamics;
 pub mod factory;
 pub mod graph;
 pub mod node;

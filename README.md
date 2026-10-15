@@ -105,7 +105,9 @@ Runtime data lives in `$VM_CONFIG_DIR` (default `~/.config/vm`):
 ```
 ~/.config/vm/presets/*.json     # voice presets (nodes: gain, biquad, delay,
                                 # pitch-fft, formant-pitch-shifter, reverb,
-                                # tube, oscillator, mute, mix…)
+                                # tube, oscillator, mute, mix…, plus the mic
+                                # section: denoise, gate, compressor,
+                                # de-esser, limiter)
 ~/.config/vm/sounds/            # .ogg (Opus), .wav — used by the soundboard
 ```
 
@@ -114,6 +116,32 @@ A demo preset with every UI widget (bool/int/text/slider) is included:
 
 Parameters support `float`, `int`, `bool` and `text`; edit them live in the
 UI's *Voices* tab or over the Control API (`setVoiceParameter`).
+
+### Ready-made mic preset
+
+On first boot the daemon seeds `mic-npr-voice` into
+`~/.config/vm/presets/` — a complete "plug in and talk" chain. Seeding
+never overwrites: edits you make to the seeded file always win. Select it
+with `selectVoice mic-npr-voice` (Control API), in the UI's *Voices* tab,
+or over a hotkey.
+
+The chain is a clean-room port of the popular EasyEffects *Masc NPR Voice
++ Noise Reduction* preset:
+
+| Stage | EasyEffects | Our node |
+| --- | --- | --- |
+| Noise removal | rnnoise + DeepFilterNet (neural) | `denoise` (spectral, per-bin noise floor) |
+| Between-speech cut | gate −50 dB / −12 dB | `gate` (hysteresis 3 dB) |
+| Rumble filter | Hi-pass 80 Hz, slope ×2 | two cascaded `biquad` highpasses |
+| Tone shaping | Bell 220 −2, Bell 350 −2, Bell 3.5k +2, Hi-shelf 10k +2 | four `biquad` (peaking/shelf) |
+| Leveling | Compressor −18 dB, 3:1, knee 6, +3 makeup | `compressor` |
+| Sibilance | De-esser 4 kHz, −22 dB, 3:1 | `de-esser` |
+| Safety ceiling | Limiter −1.5 dB | `limiter` |
+
+Differences worth knowing: our denoiser is spectral (not neural), so it
+costs ~21 ms of latency and needs about a second to learn the room; the
+EasyEffects `wet`/`dry`/`lookahead` options are not modeled (our limiter
+is lookahead-free with instant attack).
 
 ## Control API (WebSocket)
 

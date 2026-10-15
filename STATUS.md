@@ -460,6 +460,60 @@ Validado: desktop-file-validate OK; appstreamcli só avisa url placeholder
   seções "to install" (flatpak/appimage/aur) vs "to build", VM_INPUT_UID,
   config dir do sandbox flatpak.
 
+## FASE 7 — Presets de fábrica + seção de dinâmica do microfone (2026-10-15)
+
+Pedido: presets prontos "baixar e já usar" a partir de 2 configs EasyEffects
+do usuário (fifine_masc_voice_noise_reduction.json do Downloads + gist
+"Masc NPR Voice + Noise Reduction" — os dois são **idênticos**, mesma cadeia).
+
+Diagnóstico inicial: o engine só tinha `null/gain/mute/mix/biquad/pitch-fft/
+delay/formant/reverb/tube/oscillator` — a cadeia EasyEffects pedia rnnoise,
+deepfilternet, gate, equalizer, compressor, deesser, limiter. Usuário escolheu
+**port completo** (pergunta de escopo registrada na sessão).
+
+Entregue:
+- `vm-dsp/src/dynamics.rs`: **gate** (RMS simétrico + histerese), **compressor**
+  (curve soft-knee em dB, makeup estático, ratio 1 = no-op exato), **limiter**
+  (ataque instantâneo, release exponencial, teto nunca cruza o threshold),
+  **de-esser** (split por lowpass RBJ, faixa alta = `x − low` EXATA por
+  construção — versão inicial com highpass deu fase de 56° em 6.3kHz e a
+  redução se desfazia; detector nessa faixa).
+- `vm-dsp/src/denoise.rs`: supressor espectral (STFT 1024/hop 256 Hann+WOLA,
+  ~21ms latência) — piso de ruído por bin com queda rápida/subida rápida só
+  em frame QUIETO (< −40dBFS, gate de nível: fala sustentada nunca vira
+  "ruído"), ganho Wiener com sobre-subtração + piso `reduction_db`, suavização
+  temporal ataque/release + smooth espectral 3 taps (antimusical noise).
+- `biquad` ganhou tipo runtime (lowpass/highpass/peaking|bell/lowshelf/
+  highshelf/bandpass/notch + freq/q/gain_db, RBJ, recomputa em set_param ou
+  troca de rate) — o "EQ work" que ficou pendente desde a Fase 3b.
+- `vm-preset`: `KNOWN_NODE_TYPES` + `BUILTIN_PRESETS` (include_str! de
+  `builtin/mic-npr-voice.json`); `vm-daemon`: `seed_builtin_presets` no boot
+  (nunca sobrescreve — edição do usuário vence).
+- Preset `mic-npr-voice` mapeando a cadeia 1:1: denoise(strength 2.0,
+  reduction −35) → gate(−50/−12/5/250/hist 3) → HPF 80 ×2 (slope x2 do
+  EasyEffects) → bells 220 −2 (Q0.7) / 350 −2 (Q1.2) / 3500 +2 (Q0.9) →
+  shelf 10k +2 → comp(−18/3:1/15/200/knee6/+3) → deess(4k/−22/3:1) →
+  limiter(−1.5/release 5).
+
+Bugs reais pegos pelos testes (com lição):
+- **`db_to_gain` errado**: `exp2(db/20)` = 2^(dB/20), faltava ×log2(10)
+  (10^(dB/20)). Os testes de dynamics passaram primeiro porque usavam a MESMA
+  fórmula como oráculo (circularidade); o bell/shelf (oráculo hardcoded
+  1.995) denunciou. Corrigido produção + todos os oráculos → `10f32.powf`.
+- Detector RMS assimétrico (ataque rápido/lenta) enviesava nível em seno
+  ~+1.2dB → virou one-pole SIMÉTRICO (ballistics é papel do ganho, não do
+  detector).
+- Fase do split do de-esser (acima).
+
+Validado: **55/55 testes workspace** (+22: unidades de todos os processadores,
+validação dos builtins, seed-preserva-edição, E2E da cadeia completa com ruído
+branco pelo GraphProcessor — saída finita e ruído estacionário atenuado).
+Latência: denoise adiciona ~21ms ao caminho do preset de mic (E2E ~72ms com a
+cadeia espectral; medir de verdade = item 1 do backlog).
+
+Pendente p/ entregar ao usuário final: **corte do 0.1.1** (o AppImage publicado
+v0.1.0 não contém os presets — bump de versão, rebuild, tag, release).
+
 ## BACKLOG PÓS-LANÇAMENTO (itens NÃO entregues no 0.1.0 — registry p/ issues)
 Dívidas Fase 4 (medição/latência):
 1. Re-medir latência absoluta com voz ESPECTRAL ativa (STFT 2048 no caminho
@@ -485,6 +539,12 @@ Publicação:
 11. CI: matrix de build + publish AppImage no release.
 12. pacman ≥7.1: revalidar pkgver local quando a regressão for corrigida
     (remover nota do PKGBUILD se o upstream consertar).
+13. denoise: refinamentos pós-0.1.1 — VAD/acima de −40dBFS mais fino,
+    suavização espectral adaptativa, warmup < 1s (hoje piso semeia no
+    primeiro frame); possivelmente RNNoise/DeepFilterNet via ONNX (item 6).
+14. de-esser: modelar banda de detecção f1..f2 do EasyEffects (4k–8k com
+    Q) — hoje detecta tudo acima do corte em 4k; limiter com lookahead
+    opcional (EasyEffects usa 2ms).
 
 ## PUBLICADO — v0.1.0 no ar (2026-10-15)
 - Autenticação: `gh auth login` (HTTPS + credential helper do gh) como

@@ -604,8 +604,6 @@ impl AudioNode for Tube {
         ]
     }
 }
-/// Coefficients follow the standard RBJ cookbook (clean-room
-/// re-derivation of textbook formulas).
 /// Test oscillator: pure sine generator (measurement fixture, not an effect).
 #[derive(Debug)]
 pub struct Oscillator {
@@ -739,8 +737,157 @@ impl AudioNode for Delay {
     }
 }
 
+/// Filter shape: standard RBJ cookbook types selected at runtime via
+/// the `type` param (`bell` is accepted as an alias for `peaking` to
+/// match common EQ vocabulary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BqType {
+    Lowpass,
+    Highpass,
+    Peaking,
+    Lowshelf,
+    Highshelf,
+    Bandpass,
+    Notch,
+}
+
+impl BqType {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "lowpass" => Some(Self::Lowpass),
+            "highpass" => Some(Self::Highpass),
+            "peaking" | "bell" => Some(Self::Peaking),
+            "lowshelf" => Some(Self::Lowshelf),
+            "highshelf" => Some(Self::Highshelf),
+            "bandpass" => Some(Self::Bandpass),
+            "notch" => Some(Self::Notch),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lowpass => "lowpass",
+            Self::Highpass => "highpass",
+            Self::Peaking => "peaking",
+            Self::Lowshelf => "lowshelf",
+            Self::Highshelf => "highshelf",
+            Self::Bandpass => "bandpass",
+            Self::Notch => "notch",
+        }
+    }
+}
+
+/// RBJ cookbook coefficients (clean-room re-derivation of the published
+/// textbook formulas), denormalized to `[b0, b1, b2, a1, a2]`.
+fn normalize(b0: f32, b1: f32, b2: f32, a0: f32, a1: f32, a2: f32) -> [f32; 5] {
+    [b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0]
+}
+
+/// RBJ lowpass (paired with [`rbj_highpass`] for band splits).
+pub(crate) fn rbj_lowpass(rate: f32, freq: f32, q: f32) -> [f32; 5] {
+    let rate = rate.max(1.0);
+    let freq = freq.clamp(1.0, rate * 0.49);
+    let w0 = 2.0 * std::f32::consts::PI * freq / rate;
+    let (sin, cos) = w0.sin_cos();
+    let alpha = sin / (2.0 * q.max(0.05));
+    let a0 = 1.0 + alpha;
+    normalize(
+        (1.0 - cos) / 2.0,
+        1.0 - cos,
+        (1.0 - cos) / 2.0,
+        a0,
+        -2.0 * cos,
+        1.0 - alpha,
+    )
+}
+
+/// RBJ highpass (also used by the de-esser's band split).
+pub(crate) fn rbj_highpass(rate: f32, freq: f32, q: f32) -> [f32; 5] {
+    let rate = rate.max(1.0);
+    let freq = freq.clamp(1.0, rate * 0.49);
+    let w0 = 2.0 * std::f32::consts::PI * freq / rate;
+    let (sin, cos) = w0.sin_cos();
+    let alpha = sin / (2.0 * q.max(0.05));
+    let a0 = 1.0 + alpha;
+    normalize(
+        (1.0 + cos) / 2.0,
+        -(1.0 + cos),
+        (1.0 + cos) / 2.0,
+        a0,
+        -2.0 * cos,
+        1.0 - alpha,
+    )
+}
+
+fn biquad_coeffs(kind: BqType, rate: f32, freq: f32, q: f32, gain_db: f32) -> [f32; 5] {
+    let rate = rate.max(1.0);
+    let freq = freq.clamp(1.0, rate * 0.49);
+    let q = q.max(0.05);
+    let w0 = 2.0 * std::f32::consts::PI * freq / rate;
+    let (sin, cos) = w0.sin_cos();
+    let alpha = sin / (2.0 * q);
+    match kind {
+        BqType::Lowpass => normalize(
+            (1.0 - cos) / 2.0,
+            1.0 - cos,
+            (1.0 - cos) / 2.0,
+            1.0 + alpha,
+            -2.0 * cos,
+            1.0 - alpha,
+        ),
+        BqType::Highpass => rbj_highpass(rate, freq, q),
+        BqType::Peaking => {
+            let a = 10f32.powf(gain_db * (1.0 / 40.0)); // 10^(dB/40)
+            normalize(
+                1.0 + alpha * a,
+                -2.0 * cos,
+                1.0 - alpha * a,
+                1.0 + alpha / a,
+                -2.0 * cos,
+                1.0 - alpha / a,
+            )
+        }
+        BqType::Lowshelf | BqType::Highshelf => {
+            // `q` maps to the cookbook shelf slope S (1 = steepest
+            // monotonic); clamping to ≤ 1 keeps the shelf well-behaved.
+            let s = q.min(1.0);
+            let a = 10f32.powf(gain_db * (1.0 / 40.0)); // 10^(dB/40)
+            let alpha = (sin / 2.0) * (((a + 1.0 / a) * (1.0 / s - 1.0) + 2.0).max(0.0)).sqrt();
+            let beta = 2.0 * a.sqrt() * alpha;
+            match kind {
+                BqType::Lowshelf => normalize(
+                    a * ((a + 1.0) - (a - 1.0) * cos + beta),
+                    2.0 * a * ((a - 1.0) - (a + 1.0) * cos),
+                    a * ((a + 1.0) - (a - 1.0) * cos - beta),
+                    (a + 1.0) + (a - 1.0) * cos + beta,
+                    -2.0 * ((a - 1.0) + (a + 1.0) * cos),
+                    (a + 1.0) + (a - 1.0) * cos - beta,
+                ),
+                _ => normalize(
+                    a * ((a + 1.0) + (a - 1.0) * cos + beta),
+                    -2.0 * a * ((a - 1.0) + (a + 1.0) * cos),
+                    a * ((a + 1.0) + (a - 1.0) * cos - beta),
+                    (a + 1.0) - (a - 1.0) * cos + beta,
+                    2.0 * ((a - 1.0) - (a + 1.0) * cos),
+                    (a + 1.0) - (a - 1.0) * cos - beta,
+                ),
+            }
+        }
+        BqType::Bandpass => normalize(alpha, 0.0, -alpha, 1.0 + alpha, -2.0 * cos, 1.0 - alpha),
+        BqType::Notch => normalize(1.0, -2.0 * cos, 1.0, 1.0 + alpha, -2.0 * cos, 1.0 - alpha),
+    }
+}
+
+/// RBJ biquad with runtime-selectable type/frequency/Q/gain (the EQ
+/// work deferred from Fase 3b): `set_param` takes effect immediately
+/// and coefficients recompute on the next quantum at the stream rate.
 #[derive(Debug)]
 pub struct Biquad {
+    kind: BqType,
+    freq_hz: f32,
+    q: f32,
+    gain_db: f32,
     b0: f32,
     b1: f32,
     b2: f32,
@@ -748,11 +895,17 @@ pub struct Biquad {
     a2: f32,
     z1: Vec<f32>,
     z2: Vec<f32>,
+    /// Rate the current coefficients were computed at (0 = pending).
+    coeff_rate: u32,
 }
 
 impl Default for Biquad {
     fn default() -> Self {
-        let mut b = Self {
+        Self {
+            kind: BqType::Lowpass,
+            freq_hz: 1_000.0,
+            q: std::f32::consts::FRAC_1_SQRT_2,
+            gain_db: 0.0,
             b0: 1.0,
             b1: 0.0,
             b2: 0.0,
@@ -760,30 +913,34 @@ impl Default for Biquad {
             a2: 0.0,
             z1: Vec::new(),
             z2: Vec::new(),
-        };
-        b.set_lowpass(48_000.0, 1_000.0, 0.7071);
-        b
+            coeff_rate: 0,
+        }
     }
 }
 
 impl Biquad {
-    /// Low-pass; `q` is the resonance (0.5 = Butterworth-ish for 2nd order
-    /// cascades; 0.7071 = maximally flat single stage).
+    /// Construction-time lowpass (legacy API). `q` is the resonance
+    /// (0.7071 = maximally flat single stage).
     pub fn set_lowpass(&mut self, rate: f32, freq: f32, q: f32) {
-        let w0 = 2.0 * std::f32::consts::PI * freq / rate;
-        let (sin, cos) = w0.sin_cos();
-        let alpha = sin / (2.0 * q);
-        let b0 = (1.0 - cos) / 2.0;
-        let b1 = 1.0 - cos;
-        let b2 = (1.0 - cos) / 2.0;
-        let a0 = 1.0 + alpha;
-        let a1 = -2.0 * cos;
-        let a2 = 1.0 - alpha;
-        self.b0 = b0 / a0;
-        self.b1 = b1 / a0;
-        self.b2 = b2 / a0;
-        self.a1 = a1 / a0;
-        self.a2 = a2 / a0;
+        self.kind = BqType::Lowpass;
+        self.freq_hz = freq;
+        self.q = q;
+        let c = biquad_coeffs(self.kind, rate, freq, q, self.gain_db);
+        self.apply(c, rate as u32);
+    }
+
+    fn apply(&mut self, c: [f32; 5], rate: u32) {
+        self.b0 = c[0];
+        self.b1 = c[1];
+        self.b2 = c[2];
+        self.a1 = c[3];
+        self.a2 = c[4];
+        self.coeff_rate = rate;
+    }
+
+    fn retune(&mut self, rate: u32) {
+        let c = biquad_coeffs(self.kind, rate as f32, self.freq_hz, self.q, self.gain_db);
+        self.apply(c, rate);
     }
 }
 
@@ -791,7 +948,10 @@ impl AudioNode for Biquad {
     fn name(&self) -> &'static str {
         "biquad"
     }
-    fn process(&mut self, _ctx: &ProcessContext, inputs: &[&[f32]], outputs: &mut [&mut [f32]]) {
+    fn process(&mut self, ctx: &ProcessContext, inputs: &[&[f32]], outputs: &mut [&mut [f32]]) {
+        if self.coeff_rate != ctx.rate {
+            self.retune(ctx.rate);
+        }
         if self.z1.len() < inputs.len() {
             self.z1.resize(inputs.len(), 0.0);
             self.z2.resize(inputs.len(), 0.0);
@@ -802,7 +962,7 @@ impl AudioNode for Biquad {
             .zip(self.z1.iter_mut().zip(self.z2.iter_mut()))
         {
             for (s, d) in i.iter().zip(o.iter_mut()) {
-                // Transposed DF-II, denormal-guarded by voice-gate upstream.
+                // Transposed DF-II.
                 let out = self.b0 * *s + *z1;
                 *z1 = self.b1 * *s - self.a1 * out + *z2;
                 *z2 = self.b2 * *s - self.a2 * out;
@@ -810,13 +970,86 @@ impl AudioNode for Biquad {
             }
         }
     }
-    fn set_param(&mut self, name: &str, _value: ParamValue) -> Result<(), ParamError> {
-        // Frequency/q are construction-time in MVP; runtime retune lands
-        // in Fase 3b with the EQ node work.
-        Err(ParamError::Unknown(name.into()))
+    fn set_param(&mut self, name: &str, value: ParamValue) -> Result<(), ParamError> {
+        let need_float = |v: ParamValue| {
+            v.as_float().ok_or_else(|| ParamError::TypeMismatch { name: name.into() })
+        };
+        match name {
+            "type" => {
+                let s = match value {
+                    ParamValue::Text(s) => s,
+                    _ => return Err(ParamError::TypeMismatch { name: name.into() }),
+                };
+                let kind =
+                    BqType::parse(&s).ok_or_else(|| ParamError::InvalidValue(format!("type '{s}'")))?;
+                self.kind = kind;
+                if self.coeff_rate != 0 {
+                    let rate = self.coeff_rate;
+                    self.retune(rate);
+                }
+                Ok(())
+            }
+            "freq_hz" => {
+                self.freq_hz = RangedParam { min: 20.0, max: 20_000.0, default: 1_000.0 }
+                    .clamp(need_float(value)?);
+                if self.coeff_rate != 0 {
+                    let rate = self.coeff_rate;
+                    self.retune(rate);
+                }
+                Ok(())
+            }
+            "q" => {
+                self.q = RangedParam { min: 0.1, max: 18.0, default: std::f32::consts::FRAC_1_SQRT_2 }
+                    .clamp(need_float(value)?);
+                if self.coeff_rate != 0 {
+                    let rate = self.coeff_rate;
+                    self.retune(rate);
+                }
+                Ok(())
+            }
+            "gain_db" => {
+                self.gain_db =
+                    RangedParam { min: -24.0, max: 24.0, default: 0.0 }.clamp(need_float(value)?);
+                if self.coeff_rate != 0 {
+                    let rate = self.coeff_rate;
+                    self.retune(rate);
+                }
+                Ok(())
+            }
+            _ => Err(ParamError::Unknown(name.into())),
+        }
     }
     fn params(&self) -> Vec<PublicParam> {
-        Vec::new()
+        vec![
+            PublicParam {
+                name: "type",
+                value: ParamValue::Text(self.kind.as_str().into()),
+                range: None,
+                public: true,
+            },
+            PublicParam {
+                name: "freq_hz",
+                value: ParamValue::Float(self.freq_hz),
+                range: Some(RangedParam { min: 20.0, max: 20_000.0, default: 1_000.0 }),
+                public: true,
+            },
+            PublicParam {
+                name: "q",
+                value: ParamValue::Float(self.q),
+                range: Some(RangedParam {
+                    min: 0.1,
+                    max: 18.0,
+                    default: std::f32::consts::FRAC_1_SQRT_2,
+                }),
+                public: true,
+            },
+            PublicParam {
+                name: "gain_db",
+                value: ParamValue::Float(self.gain_db),
+                range: Some(RangedParam { min: -24.0, max: 24.0, default: 0.0 }),
+                public: true,
+            },
+        ]
     }
 }
 
@@ -1003,5 +1236,113 @@ mod delay_tests {
         assert!(out[0][479].abs() < 1e-6 && out[0][481].abs() < 1e-6);
         // Int values coerce (UI sends ints for int-typed params).
         d.set_param("delay_ms", ParamValue::Int(10)).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod biquad_tests {
+    use super::*;
+    use crate::ProcessContext;
+
+    const RATE: u32 = 48_000;
+
+    fn sine(freq: f32, len: usize, amp: f32) -> Vec<f32> {
+        (0..len)
+            .map(|i| amp * (2.0 * std::f32::consts::PI * freq * i as f32 / RATE as f32).sin())
+            .collect()
+    }
+
+    fn rms(x: &[f32]) -> f32 {
+        (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt()
+    }
+
+    fn run(node: &mut dyn AudioNode, input: &[f32], chunk: usize) -> Vec<f32> {
+        let c = ProcessContext { rate: RATE, frames: chunk };
+        let mut out = vec![0.0; input.len()];
+        for (ib, ob) in input.chunks(chunk).zip(out.chunks_mut(chunk)) {
+            let mut ibp = ib.to_vec();
+            ibp.resize(chunk, 0.0);
+            let mut obp = vec![0.0; chunk];
+            {
+                let ins = [ibp.as_slice()];
+                let mut outs = [obp.as_mut_slice()];
+                node.process(&c, &ins, &mut outs);
+            }
+            ob.copy_from_slice(&obp[..ob.len()]);
+        }
+        out
+    }
+
+    /// Steady-state gain ratio of a sine through the node (second half).
+    fn gain_at(node: &mut dyn AudioNode, freq: f32) -> f32 {
+        let input = sine(freq, 48_000, 0.5);
+        let out = run(node, &input, 960);
+        rms(&out[24_000..]) / rms(&input[24_000..])
+    }
+
+    #[test]
+    fn highpass_filters_lows_passes_highs() {
+        let mut b = Biquad::default();
+        b.set_param("type", ParamValue::Text("highpass".into())).unwrap();
+        b.set_param("freq_hz", ParamValue::Float(100.0)).unwrap();
+        b.set_param("q", ParamValue::Float(std::f32::consts::FRAC_1_SQRT_2)).unwrap();
+        let r_lo = gain_at(&mut b, 40.0);
+        assert!(r_lo < 0.4, "40 Hz through a 100 Hz HPF: {r_lo:.3}, want < 0.4");
+        let r_hi = gain_at(&mut b, 1_000.0);
+        assert!((r_hi - 1.0).abs() < 0.06, "1 kHz must pass: {r_hi:.3}");
+    }
+
+    #[test]
+    fn peaking_bell_boosts_band_only() {
+        let mut b = Biquad::default();
+        b.set_param("type", ParamValue::Text("bell".into())).unwrap(); // alias
+        b.set_param("freq_hz", ParamValue::Float(1_000.0)).unwrap();
+        b.set_param("q", ParamValue::Float(1.0)).unwrap();
+        b.set_param("gain_db", ParamValue::Float(6.0)).unwrap();
+        let r_on = gain_at(&mut b, 1_000.0);
+        assert!((r_on - 1.995).abs() < 0.35, "bell peak {r_on:.3}, want ≈ 1.995 (+6 dB)");
+        let r_off = gain_at(&mut b, 8_000.0);
+        assert!(r_off < 1.15, "far bin must stay flat: {r_off:.3}");
+    }
+
+    #[test]
+    fn highshelf_lifts_air_band() {
+        let mut b = Biquad::default();
+        b.set_param("type", ParamValue::Text("highshelf".into())).unwrap();
+        b.set_param("freq_hz", ParamValue::Float(4_000.0)).unwrap();
+        b.set_param("gain_db", ParamValue::Float(6.0)).unwrap();
+        let r_air = gain_at(&mut b, 10_000.0);
+        assert!(r_air > 1.3, "air band must lift: {r_air:.3}");
+        let r_low = gain_at(&mut b, 200.0);
+        assert!(r_low < 1.12, "shelf must not touch lows: {r_low:.3}");
+    }
+
+    #[test]
+    fn retype_at_runtime_and_validation() {
+        let mut b = Biquad::default(); // lowpass 1 kHz
+        let r_lp = gain_at(&mut b, 8_000.0);
+        assert!(r_lp < 0.3, "default lowpass must tame 8 kHz: {r_lp:.3}");
+
+        b.set_param("type", ParamValue::Text("highpass".into())).unwrap();
+        let r_hp = gain_at(&mut b, 8_000.0);
+        assert!(r_hp > 0.85, "retuned highpass must pass 8 kHz: {r_hp:.3}");
+
+        assert!(matches!(
+            b.set_param("type", ParamValue::Text("nope".into())),
+            Err(ParamError::InvalidValue(_))
+        ));
+        assert!(matches!(
+            b.set_param("type", ParamValue::Float(3.0)),
+            Err(ParamError::TypeMismatch { .. })
+        ));
+        assert!(matches!(
+            b.set_param("bogus", ParamValue::Float(1.0)),
+            Err(ParamError::Unknown(_))
+        ));
+        b.set_param("freq_hz", ParamValue::Float(99_999.0)).unwrap();
+        assert_eq!(b.freq_hz, 20_000.0);
+        b.set_param("q", ParamValue::Int(2)).unwrap(); // int coercion
+        assert_eq!(b.q, 2.0);
+        assert_eq!(b.params().len(), 4);
     }
 }

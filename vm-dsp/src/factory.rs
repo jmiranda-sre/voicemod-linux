@@ -66,5 +66,11 @@ pub fn mvp_factory() -> NodeFactory {
     f.register("reverb", |_| Box::new(super::nodes::Reverb::default()));
     f.register("tube", |_| Box::new(super::nodes::Tube::default()));
     f.register("oscillator", |_| Box::new(super::nodes::Oscillator::default()));
+    // Dynamics section (Fase 7 — mic-improvement chains).
+    f.register("gate", |_| Box::new(super::dynamics::Gate::default()));
+    f.register("compressor", |_| Box::new(super::dynamics::Compressor::default()));
+    f.register("limiter", |_| Box::new(super::dynamics::Limiter::default()));
+    f.register("de-esser", |_| Box::new(super::dynamics::DeEsser::default()));
+    f.register("denoise", |_| Box::new(super::denoise::Denoise::default()));
     f
 }

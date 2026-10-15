@@ -17,6 +17,9 @@ pub enum ParamError {
     Unknown(String),
     TypeMismatch { name: String },
     OutOfRange { name: String },
+    /// Well-typed but outside the param's domain (e.g. an unknown
+    /// filter `type` name).
+    InvalidValue(String),
 }
 
 impl std::fmt::Display for ParamError {
@@ -25,6 +28,7 @@ impl std::fmt::Display for ParamError {
             Self::Unknown(n) => write!(f, "unable to find param {n}"),
             Self::TypeMismatch { name } => write!(f, "invalid variant type for param {name}"),
             Self::OutOfRange { name } => write!(f, "param {name} out of range"),
+            Self::InvalidValue(v) => write!(f, "invalid value for param: {v}"),
         }
     }
 }
