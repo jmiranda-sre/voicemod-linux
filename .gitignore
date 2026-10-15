@@ -1,0 +1,17 @@
+# Rust
+/target
+**/target
+*.pkg.tar.zst
+Cargo.lock.bak
+
+# AppImage / Flatpak build byproducts
+squashfs-root
+*.AppImage
+.flatpak-builder
+build-dir/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

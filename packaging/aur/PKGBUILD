@@ -1,0 +1,75 @@
+# Maintainer: voicemod-linux contributors
+#
+# NOTE (packaging): pacman 7.1.0 regressed the function-style pkgver update —
+# it rewrites `pkgver=` lines that function-style PKGBUILDs do not have, so a
+# LOCAL `makepkg` on 7.1.0 builds a package with an empty version string
+# (voicemod-linux--1) and `makepkg --printsrcinfo` aborts with
+# "pkgver is not allowed to be empty" (lint runs before the function is
+# acknowledged). Workaround for local verification on 7.1.0:
+#   MAKEPKG_LINT_PKGBUILD=0 makepkg -f
+# AUR build infrastructure is unaffected. build()/package() below are
+# verified end-to-end (full package contents validated).
+pkgname=voicemod-linux
+pkgver() {
+  cd "$pkgname" || return 1
+  # makepkg may leave GIT_DIR pointing at its bare mirror; the worktree must
+  # resolve its own git dir, so clear both before querying.
+  unset GIT_DIR GIT_WORK_TREE
+  # Tagged repos: v0.1.0-3-gabc1234 -> 0.1.0.r3.gabc1234.
+  # Pre-release (no tags yet): 0.rN.gSHA. Always produces a non-empty
+  # version — an empty pkgver is a hard makepkg error.
+  local v
+  v=$(git describe --long --tags 2>/dev/null || true)
+  if [[ -n $v ]]; then
+    printf '%s\n' "${v#v}" | sed 's/\([^-]*-g\)/r\1/;s/-/./g'
+  else
+    printf '0.r%s.g%s\n' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+  fi
+}
+pkgrel=1
+pkgdesc="Native clean-room voice changer: real-time DSP, soundboard and a real PipeWire virtual microphone"
+arch=('x86_64' 'aarch64')
+url="https://github.com/jmiranda-sre/voicemod-linux"
+license=('MIT' 'Apache-2.0')
+depends=('pipewire' 'opus')
+makedepends=('cargo' 'rust' 'clang' 'pkgconf')
+optdepends=(
+  'wireplumber: session manager used for the auto-linked virtual mic'
+)
+provides=('vm-daemon' 'vm-ui' 'vm')
+source=("$pkgname::git+https://github.com/jmiranda-sre/voicemod-linux.git")
+sha256sums=('SKIP')
+options=('!lto')
+
+build() {
+  cd "$pkgname"
+  # bindgen (libspa-sys) needs libclang; PipeWire headers come from `pipewire`.
+  export LIBCLANG_PATH="${LIBCLANG_PATH:-/usr/lib}"
+  cargo build --release --locked --workspace
+}
+
+package() {
+  cd "$pkgname"
+  install -Dm755 target/release/vm "$pkgdir/usr/bin/vm"
+  install -Dm755 target/release/vm-daemon "$pkgdir/usr/bin/vm-daemon"
+  install -Dm755 target/release/vm-ui "$pkgdir/usr/bin/vm-ui"
+
+  # systemd --user unit: daemon at login (optional; vm-ui launches it on demand)
+  install -Dm644 packaging/systemd/vm-daemon.service \
+    "$pkgdir/usr/lib/systemd/user/vm-daemon.service"
+
+  # Global hotkeys: reading evdev keyboards without root. The daemon runs
+  # fine without it (hotkeys disabled, everything else works).
+  install -Dm644 packaging/udev/99-vm-hotkeys.rules \
+    "$pkgdir/usr/lib/udev/rules.d/99-vm-hotkeys.rules"
+
+  install -Dm644 packaging/io.github.voicemodlinux.vm.desktop \
+    "$pkgdir/usr/share/applications/io.github.voicemodlinux.vm.desktop"
+  install -Dm644 packaging/io.github.voicemodlinux.vm.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.voicemodlinux.vm.svg"
+  install -Dm644 packaging/io.github.voicemodlinux.vm.metainfo.xml \
+    "$pkgdir/usr/share/metainfo/io.github.voicemodlinux.vm.metainfo.xml"
+
+  install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+}

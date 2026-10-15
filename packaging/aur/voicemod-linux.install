@@ -1,0 +1,28 @@
+post_install() {
+  cat <<'EOF'
+
+  ==> Voicemod Linux installed. Two optional steps for the full experience:
+
+  1) Real-time audio (removes xruns under load):
+       sudo usermod -aG audio $USER
+     (log out and back in afterwards)
+
+  2) Global hotkeys without root:
+       sudo usermod -aG input $USER
+     then: sudo udevadm control --reload-rules && sudo udevadm trigger
+
+  The daemon can run either as a user service at login:
+       systemctl --user enable --now vm-daemon
+  or on demand from the UI ("Launch daemon" in vm-ui). Both use the same
+  real PipeWire backend (vm-daemon --live).
+
+EOF
+}
+
+post_upgrade() {
+  post_install
+}
+
+post_remove() {
+  systemctl --user disable --now vm-daemon 2>/dev/null || true
+}

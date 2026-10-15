@@ -1,0 +1,36 @@
+{
+  "name": "widget-showcase",
+  "description": "Demo preset exercising every UI widget: toggle, int, text and sliders.",
+  "rate": 48000,
+  "nodes": [
+    {
+      "id": "gate",
+      "type": "mute",
+      "params": {
+        "muted": { "value": false, "public": true }
+      }
+    },
+    {
+      "id": "echo",
+      "type": "delay",
+      "params": {
+        "delay_ms": { "value": 250, "range": [0.0, 2000.0, 250.0], "public": true },
+        "feedback": { "value": 0.3, "range": [0.0, 0.95, 0.3], "public": true },
+        "mix": { "value": 0.5, "range": [0.0, 1.0, 0.5], "public": true }
+      }
+    },
+    {
+      "id": "drive",
+      "type": "gain",
+      "params": {
+        "gain": { "value": 1.5, "range": [0.0, 4.0, 1.0], "public": true },
+        "note": { "value": "hello from clean-room", "public": true }
+      }
+    }
+  ],
+  "edges": [
+    { "from": "gate", "from_ch": 0, "to": "echo", "to_ch": 0 },
+    { "from": "echo", "from_ch": 0, "to": "drive", "to_ch": 0 }
+  ],
+  "public_params": ["gate.muted", "echo.delay_ms", "drive.gain"]
+}

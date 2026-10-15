@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.voicemodlinux.vm</id>
+  <name>Voicemod Linux</name>
+  <summary>Native clean-room voice changer for Linux</summary>
+  <description>
+    <p>
+      A from-scratch, open-source (MIT/Apache-2.0) reimplementation of the
+      voice-changer concept for Linux: real-time DSP voice effects, a
+      multi-format soundboard and a real PipeWire virtual microphone — no
+      Windows drivers, no proprietary code.
+    </p>
+    <p>
+      The headless daemon (<code>vm-daemon</code>) owns the real-time audio
+      pipeline; the native interface (<code>vm-ui</code>) drives it over a
+      local WebSocket Control API that third-party tools (e.g. Stream Deck
+      plugins) can also use.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.voicemodlinux.vm.desktop</launchable>
+  <provides>
+    <binary>vm-ui</binary>
+    <binary>vm-daemon</binary>
+    <binary>vm</binary>
+  </provides>
+  <metadata_license>MIT</metadata_license>
+  <developer id="io.github.voicemodlinux">
+    <name>voicemod-linux contributors</name>
+  </developer>
+  <url type="homepage">https://github.com/jmiranda-sre/voicemod-linux</url>
+  <releases>
+    <release version="0.1.0" date="2026-10-15">
+      <description>
+        <p>First public release: real-time DSP voice effects, multi-format
+        soundboard and a real PipeWire virtual microphone, with a native
+        egui client and a WebSocket Control API for third-party tools.</p>
+      </description>
+    </release>
+  </releases>
+  <content_rating type="oars-1.1" />
+</component>

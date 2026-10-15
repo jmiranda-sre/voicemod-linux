@@ -1,0 +1,4 @@
+# Allow members of the `input` group to read hotkey keyboards without root.
+# The daemon degrades gracefully (hotkeys disabled, everything else works)
+# when permissions are missing.
+KERNEL=="event*", GROUP="input", MODE="0640"

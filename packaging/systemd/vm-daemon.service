@@ -1,0 +1,20 @@
+[Unit]
+Description=Voicemod Linux headless voice pipeline (clean-room port)
+Documentation=https://github.com/jmiranda-sre/voicemod-linux
+After=pipewire.service pipewire-pulse.service wireplumber.service
+Wants=wireplumber.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/vm-daemon --live
+Restart=on-failure
+RestartSec=3
+# Real-time audio: the daemon raises SCHED_FIFO on its own audio threads
+# using the limits granted to the `audio` group (rtprio 99 / memlock).
+# A --user unit cannot grant those limits itself, so only memlock is
+# requested here; rtprio comes from the group limits.
+LimitMEMLOCK=infinity
+Environment=VM_CONFIG_DIR=%h/.config/vm
+
+[Install]
+WantedBy=default.target

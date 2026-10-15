@@ -1,0 +1,10 @@
+[package]
+name = "vm-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc = "0.2"
+pipewire = { version = "0.10", features = ["v1_2_0"] }
+rtrb = "0.3"

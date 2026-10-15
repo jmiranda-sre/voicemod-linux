@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Voicemod Linux
+GenericName=Voice changer
+Comment=Native clean-room voice changer: real-time effects, soundboard and virtual microphone (PipeWire)
+Exec=vm-ui %U
+Icon=io.github.voicemodlinux.vm
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+Keywords=voice;changer;microphone;pitch;effects;soundboard;pipewire;
+StartupWMClass=vm-ui
+SingleMainWindow=true

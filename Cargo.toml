@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "vm-audio",
+    "vm-dsp",
+    "vm-soundboard",
+    "vm-preset",
+    "vm-control",
+    "vm-cli",
+    "vm-daemon",
+    "vm-ui",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "signal"] }
