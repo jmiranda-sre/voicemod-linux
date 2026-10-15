@@ -21,6 +21,7 @@ pub enum Action {
     FadeSound { sound: String, fade_out_secs: f32 },
     StartAudioStreaming,
     GetAudioStreamStatus,
+    GetHealth,
     GetBitmap { resource: String },
     SetSoundboardMasterVolume { per_mille: u16 },
     SelectInput { uid: String },

@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 semantic versioning.
 
+## [Unreleased]
+
+### Added (F-A: RT health + watchdog)
+
+- Per-node DSP telemetry: `Graph` times every node per quantum
+  (vDSO clock, EMA α=1/16 + latched peak + call count, pre-sized —
+  zero RT allocation) and exposes it via `telemetry()`.
+- Graph-side xrun counter: a quantum that finds the graph locked
+  (preset swap in flight) passes audio through and counts instead of
+  blocking the RT thread.
+- New Control API action `getHealth`: voice, link state, graph xruns,
+  per-node µs table, per-stream stats (capture/playback/monitor) and
+  watchdog state (`restarts`, `lastReason`, `lastRestartUnix`).
+- Watchdog: 2 s tick runs a pure, unit-tested policy — restart the
+  pipeline (stop → reopen stored topology → start) on `NeedsRestart`
+  link or xrun storm (≥20 xruns/tick), with a 10 s attempt cooldown so
+  a dead backend costs one `open()` per cooldown, never a hot loop.
+- UI *Health* tab: node µs table, stream rows with red xrun
+  highlighting, watchdog restarts + last reason.
+- Control server logs each busy candidate port before falling through
+  (second instance no longer dies silently — backlog item closed).
+
 ## [0.2.0] — 2026-10-15
 
 ### Added

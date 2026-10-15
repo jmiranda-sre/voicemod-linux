@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use vm_audio::{AudioBackend, DeviceRole, StreamProcessor, StreamStopReason, StreamTopology, SAMPLE_RATE};
@@ -22,13 +22,21 @@ use vm_dsp::{Graph, NodeConstructorContext, NodeFactory, NodeId, ProcessContext}
 struct GraphProcessor {
     graph: Arc<Mutex<Graph>>,
     voice_enabled: Arc<AtomicBool>,
+    /// Lock-contention counter: a quantum that finds the graph locked
+    /// (preset swap in flight) passes the previous buffer through and
+    /// counts as a graph-side xrun instead of blocking the RT thread.
+    graph_xruns: Arc<AtomicU64>,
     lane_in: Vec<Vec<f32>>,
     lane_out: Vec<Vec<f32>>,
 }
 
 impl GraphProcessor {
-    fn new(graph: Arc<Mutex<Graph>>, voice_enabled: Arc<AtomicBool>) -> Self {
-        Self { graph, voice_enabled, lane_in: Vec::new(), lane_out: Vec::new() }
+    fn new(
+        graph: Arc<Mutex<Graph>>,
+        voice_enabled: Arc<AtomicBool>,
+        graph_xruns: Arc<AtomicU64>,
+    ) -> Self {
+        Self { graph, voice_enabled, graph_xruns, lane_in: Vec::new(), lane_out: Vec::new() }
     }
 }
 
@@ -69,6 +77,8 @@ impl StreamProcessor for GraphProcessor {
         let ctx = ProcessContext { rate, frames };
         if let Ok(mut graph) = self.graph.try_lock() {
             graph.process(&ctx, &self.lane_in, &mut self.lane_out);
+        } else {
+            self.graph_xruns.fetch_add(1, Ordering::Relaxed);
         }
         for (dst, src) in outputs.iter_mut().zip(self.lane_out.iter()) {
             dst.copy_from_slice(&src[..frames.min(dst.len()).min(src.len())]);
@@ -91,6 +101,67 @@ struct DaemonState {
     preset_dir: PathBuf,
     /// Last successfully opened topology (for runtime input switching).
     topology: Mutex<Option<StreamTopology>>,
+    /// Graph-side xrun counter, shared with the RT processor.
+    graph_xruns: Arc<AtomicU64>,
+    /// Watchdog bookkeeping (restarts, cooldown, last reason).
+    watchdog: Mutex<WatchdogState>,
+}
+
+/// Watchdog state: restart counter + cooldown bookkeeping. The policy
+/// itself is the pure [`decide_watchdog`] below (unit-tested); this
+/// struct only carries the inputs it needs across ticks.
+#[derive(Debug, Default)]
+struct WatchdogState {
+    restarts: u64,
+    last_reason: String,
+    last_restart_unix: u64,
+    last_xruns: u64,
+    consecutive_failures: u64,
+}
+
+/// Minimum seconds between restart attempts (a persistently failing
+/// backend must not spin `open()` in a hot loop).
+const WATCHDOG_COOLDOWN_SECS: u64 = 10;
+/// Backend xruns within one tick (~2 s) that count as a storm.
+const WATCHDOG_STORM_XRUNS: u64 = 20;
+
+/// Point-in-time link picture the watchdog policy decides on.
+struct LinkSnapshot {
+    link: vm_audio::StreamLinkState,
+    xruns_total: u64,
+    has_topology: bool,
+}
+
+/// Pure watchdog policy: `Some(reason)` means "restart the pipeline
+/// now". Rules, in order: nothing to restart before first `open`;
+/// cooldown wins over everything else; a dead link restarts; an xrun
+/// storm restarts. A merely `Down` link with no topology is the
+/// pre-streaming state, not a failure.
+fn decide_watchdog(
+    snap: &LinkSnapshot,
+    prev_xruns: u64,
+    cooldown_ok: bool,
+) -> Option<String> {
+    if !snap.has_topology {
+        return None;
+    }
+    if !cooldown_ok {
+        return None;
+    }
+    if snap.link == vm_audio::StreamLinkState::NeedsRestart {
+        return Some("link needs restart".to_string());
+    }
+    if snap.xruns_total.saturating_sub(prev_xruns) >= WATCHDOG_STORM_XRUNS {
+        return Some("xrun storm".to_string());
+    }
+    None
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl DaemonState {
@@ -115,6 +186,74 @@ impl DaemonState {
         audio.start().map_err(|e| format!("start: {e}"))?;
         *self.topology.lock().map_err(|_| "topology lock poisoned".to_string())? = Some(next);
         Ok(())
+    }
+
+    /// Watchdog restart: stop → reopen the stored topology → start.
+    /// Mirrors the reference `TryRestartOnInternalError`: same pipeline,
+    /// no state reset (the graph keeps running; only the backend
+    /// reopens). Records success/failure for the health readout.
+    fn restart_pipeline(&self) -> Result<(), String> {
+        let topo = self
+            .topology
+            .lock()
+            .map_err(|_| "topology lock poisoned".to_string())?
+            .clone()
+            .ok_or_else(|| "pipeline never opened".to_string())?;
+        {
+            let mut audio = self.audio.lock().map_err(|_| "audio lock poisoned".to_string())?;
+            audio.stop(StreamStopReason::InternalError).map_err(|e| format!("stop: {e}"))?;
+            audio.open(&topo).map_err(|e| format!("open: {e}"))?;
+            audio.start().map_err(|e| format!("start: {e}"))?;
+        }
+        *self.topology.lock().map_err(|_| "topology lock poisoned".to_string())? = Some(topo);
+        Ok(())
+    }
+
+    /// One watchdog tick: snapshot the link, run the pure policy, and
+    /// restart on decision. Runs on the 2 s housekeeping tick (never on
+    /// the RT path). Attempt timestamps feed the cooldown even on
+    /// failure, so a dead backend costs one `open()` per cooldown, not
+    /// one per tick.
+    fn watchdog_tick(&self) {
+        use vm_audio::StreamKind as K;
+        let (link, xruns) = {
+            let audio = self.audio.lock().unwrap();
+            let xruns = [K::FullDuplexCapture, K::HalfDuplexPlayback, K::Monitor]
+                .iter()
+                .map(|k| audio.stats(*k).xruns)
+                .sum();
+            (audio.link_state(), xruns)
+        };
+        let has_topology = self.topology.lock().unwrap().is_some();
+        let now = unix_now();
+        let decision = {
+            let wd = self.watchdog.lock().unwrap();
+            let cooldown_ok = now.saturating_sub(wd.last_restart_unix) >= WATCHDOG_COOLDOWN_SECS;
+            let snap = LinkSnapshot { link, xruns_total: xruns, has_topology };
+            decide_watchdog(&snap, wd.last_xruns, cooldown_ok)
+        };
+        let Some(reason) = decision else {
+            self.watchdog.lock().unwrap().last_xruns = xruns;
+            return;
+        };
+        match self.restart_pipeline() {
+            Ok(()) => {
+                println!("watchdog: restarted pipeline ({reason})");
+                let mut wd = self.watchdog.lock().unwrap();
+                wd.restarts += 1;
+                wd.last_reason = reason;
+                wd.last_restart_unix = now;
+                wd.last_xruns = xruns;
+                wd.consecutive_failures = 0;
+            }
+            Err(e) => {
+                eprintln!("watchdog: restart failed ({reason}): {e}");
+                let mut wd = self.watchdog.lock().unwrap();
+                wd.last_restart_unix = now;
+                wd.last_xruns = xruns;
+                wd.consecutive_failures += 1;
+            }
+        }
     }
 
     fn json_param(value: &serde_json::Value) -> Result<vm_dsp::ParamValue, String> {        match value {
@@ -315,6 +454,67 @@ impl ControlHandler for DaemonState {
                     Vec::new(),
                 )
             }
+            Action::GetHealth => {
+                let (link, cap, play, mon) = {
+                    let audio = self.audio.lock().unwrap();
+                    use vm_audio::StreamKind as K;
+                    let stat = |k: K| {
+                        let s = audio.stats(k);
+                        serde_json::json!({
+                            "invocations": s.invocations,
+                            "avgUs": s.avg_duration_us,
+                            "maxUs": s.max_duration_us,
+                            "xruns": s.xruns,
+                            "watchdogTrips": s.watchdog_trips,
+                            "lastFrames": s.last_frames,
+                        })
+                    };
+                    let link = audio.link_state();
+                    (link, stat(K::FullDuplexCapture), stat(K::HalfDuplexPlayback), stat(K::Monitor))
+                };
+                // Join graph telemetry (keyed by NodeId) with preset node
+                // ids; unnamed nodes fall back to `node<N>`. Sorted for a
+                // deterministic wire order.
+                let ids = self.node_ids.lock().unwrap();
+                let tele = self.graph.lock().map(|g| g.telemetry()).unwrap_or_default();
+                let mut nodes: Vec<serde_json::Value> = tele
+                    .into_iter()
+                    .map(|(id, t)| {
+                        let name = ids
+                            .iter()
+                            .find_map(|(k, v)| (*v == id).then(|| k.clone()))
+                            .unwrap_or_else(|| format!("node{}", id.0));
+                        serde_json::json!({
+                            "node": name,
+                            "avgUs": t.avg_us,
+                            "maxUs": t.max_us,
+                            "calls": t.calls,
+                        })
+                    })
+                    .collect();
+                nodes.sort_by(|a, b| a["node"].as_str().cmp(&b["node"].as_str()));
+                drop(ids);
+                let wd = self.watchdog.lock().unwrap();
+                (
+                    ControlReply::ok_data(serde_json::json!({
+                        "active": !matches!(link, vm_audio::StreamLinkState::Down),
+                        "voice": self.voice_name.lock().unwrap().clone(),
+                        "link": format!("{link:?}"),
+                        "graphXruns": self.graph_xruns.load(Ordering::Relaxed),
+                        "nodes": nodes,
+                        "capture": cap,
+                        "playback": play,
+                        "monitor": mon,
+                        "watchdog": {
+                            "restarts": wd.restarts,
+                            "lastReason": wd.last_reason,
+                            "lastRestartUnix": wd.last_restart_unix,
+                            "consecutiveFailures": wd.consecutive_failures,
+                        },
+                    })),
+                    Vec::new(),
+                )
+            }
             Action::GetAudioDevices => {
                 let mut audio = self.audio.lock().unwrap();
                 match audio.enumerate() {
@@ -479,6 +679,8 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
         audio: Arc::new(Mutex::new(build_backend(live)?)),
         preset_dir: preset_dir.clone(),
         topology: Mutex::new(None),
+        graph_xruns: Arc::new(AtomicU64::new(0)),
+        watchdog: Mutex::new(WatchdogState::default()),
     });
     // Default voice.
     {
@@ -487,9 +689,11 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
         state.apply_preset(&preset).map_err(|e| format!("preset: {e}"))?;
     }
     // Graph processor shares the live graph + bypass flag.
+    let graph_xruns = state.graph_xruns.clone();
     let processor: Arc<Mutex<dyn StreamProcessor>> = Arc::new(Mutex::new(GraphProcessor::new(
         state.graph.clone(),
         state.voice_enabled.clone(),
+        graph_xruns,
     )));
     // Preload sounds (decode+resample now; never on the trigger path).
     {
@@ -601,24 +805,31 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
-                let mut audio = state.audio.lock().unwrap();
-                for ev in audio.poll_hotplug() {
-                    println!("hotplug: {ev:?} (link: {:?})", audio.link_state());
+                {
+                    let mut audio = state.audio.lock().unwrap();
+                    for ev in audio.poll_hotplug() {
+                        println!("hotplug: {ev:?} (link: {:?})", audio.link_state());
+                    }
                 }
+                // Watchdog (F-A): auto-restart a dead link / xrun storm.
+                state.watchdog_tick();
                 tick += 1;
-                if tick % 5 == 0 {
-                    use vm_audio::StreamKind as K;
-                    let c = audio.stats(K::FullDuplexCapture);
-                    let v = audio.stats(K::HalfDuplexPlayback);
-                    let m = audio.stats(K::Monitor);
-                    let (cr, cc, or, oc) = audio.negotiated();
-                    println!(
-                        "stats link={:?} fmt=cap{cc}ch@{cr}/out{oc}ch@{or} cap{{n={} avg={:.0}us xr={}}} vad{{n={} avg={:.0}us xr={} cont={} fr={}}} mon{{n={} avg={:.0}us xr={}}}",
-                        audio.link_state(),
-                        c.invocations, c.avg_duration_us, c.xruns,
-                        v.invocations, v.avg_duration_us, v.xruns, v.watchdog_trips, v.last_frames,
-                        m.invocations, m.avg_duration_us, m.xruns,
-                    );
+                {
+                    let audio = state.audio.lock().unwrap();
+                    if tick % 5 == 0 {
+                        use vm_audio::StreamKind as K;
+                        let c = audio.stats(K::FullDuplexCapture);
+                        let v = audio.stats(K::HalfDuplexPlayback);
+                        let m = audio.stats(K::Monitor);
+                        let (cr, cc, or, oc) = audio.negotiated();
+                        println!(
+                            "stats link={:?} fmt=cap{cc}ch@{cr}/out{oc}ch@{or} cap{{n={} avg={:.0}us xr={}}} vad{{n={} avg={:.0}us xr={} cont={} fr={}}} mon{{n={} avg={:.0}us xr={}}}",
+                            audio.link_state(),
+                            c.invocations, c.avg_duration_us, c.xruns,
+                            v.invocations, v.avg_duration_us, v.xruns, v.watchdog_trips, v.last_frames,
+                            m.invocations, m.avg_duration_us, m.xruns,
+                        );
+                    }
                 }
             }
         }
@@ -685,6 +896,8 @@ fn test_state() -> Arc<DaemonState> {
         audio: Arc::new(Mutex::new(build_backend(false).unwrap())),
         preset_dir: dir.join("presets"),
         topology: Mutex::new(None),
+        graph_xruns: Arc::new(AtomicU64::new(0)),
+        watchdog: Mutex::new(WatchdogState::default()),
     });
     // Seed example preset + one wav sound.
     let text = serde_json::to_string_pretty(&vm_preset::example_drive()).unwrap();
@@ -830,7 +1043,11 @@ mod tests {
         assert!(!state.voice_enabled.load(Ordering::Relaxed));
         assert!(matches!(evts[0], ControlEvent::VoiceChangerToggled { enabled: false }));
         // Bypass actually passes audio through.
-        let mut proc = GraphProcessor::new(state.graph.clone(), state.voice_enabled.clone());
+        let mut proc = GraphProcessor::new(
+            state.graph.clone(),
+            state.voice_enabled.clone(),
+            state.graph_xruns.clone(),
+        );
         let input = vec![vec![0.3f32; 64]];
         let mut out = vec![vec![0.0f32; 64]];
         let ins: Vec<&[f32]> = input.iter().map(Vec::as_slice).collect();
@@ -851,6 +1068,127 @@ mod tests {
         assert!(reply.ok);
         let (reply, _) = state.handle(&Action::GetBitmap { resource: "x".into() });
         assert!(!reply.ok);
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    fn open_stub_topology(state: &Arc<DaemonState>) {
+        let topo = vm_audio::StreamTopology {
+            input: vm_audio::DeviceUid::new("stub:input:0"),
+            virtual_out: vm_audio::DeviceUid::new("stub:virtual:vm-mic"),
+            monitor: None,
+        };
+        {
+            let mut audio = state.audio.lock().unwrap();
+            audio.enumerate().unwrap();
+            audio.open(&topo).unwrap();
+            audio.start().unwrap();
+        }
+        *state.topology.lock().unwrap() = Some(topo);
+    }
+
+    #[test]
+    fn health_reports_nodes_streams_and_watchdog() {
+        let state = test_state();
+        let (reply, _) = state.handle(&Action::SelectVoice { voice: "example-drive".into() });
+        assert!(reply.ok, "{:?}", reply.error);
+        // Run a few quanta so telemetry has calls.
+        let mut proc = GraphProcessor::new(
+            state.graph.clone(),
+            state.voice_enabled.clone(),
+            state.graph_xruns.clone(),
+        );
+        for _ in 0..4 {
+            let input = vec![vec![0.1f32; 64]; 2];
+            let mut out = vec![vec![0.0f32; 64]; 2];
+            let ins: Vec<&[f32]> = input.iter().map(Vec::as_slice).collect();
+            let mut outs: Vec<&mut [f32]> = out.iter_mut().map(Vec::as_mut_slice).collect();
+            proc.process(48_000, &ins, &mut outs);
+        }
+        let (reply, _) = state.handle(&Action::GetHealth);
+        assert!(reply.ok, "{:?}", reply.error);
+        let data = reply.data.unwrap();
+        assert_eq!(data["voice"], "example-drive");
+        assert_eq!(data["graphXruns"], 0);
+        let nodes = data["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2);
+        // Deterministic wire order + preset ids joined.
+        assert_eq!(nodes[0]["node"], "drive");
+        assert_eq!(nodes[1]["node"], "smooth");
+        for n in nodes {
+            assert_eq!(n["calls"], 4, "node {}", n["node"]);
+            assert!(n["avgUs"].as_f64().unwrap() >= 0.0);
+        }
+        // Stream blocks present even on the stub (all zeros).
+        assert_eq!(data["capture"]["xruns"], 0);
+        assert_eq!(data["watchdog"]["restarts"], 0);
+    }
+
+    #[test]
+    fn graph_lock_contention_counts_xrun() {
+        let state = test_state();
+        let (reply, _) = state.handle(&Action::SelectVoice { voice: "example-drive".into() });
+        assert!(reply.ok);
+        let mut proc = GraphProcessor::new(
+            state.graph.clone(),
+            state.voice_enabled.clone(),
+            state.graph_xruns.clone(),
+        );
+        // Hold the graph lock: the RT path must skip, not block.
+        let _held = state.graph.lock().unwrap();
+        let input = vec![vec![0.1f32; 64]; 2];
+        let mut out = vec![vec![0.0f32; 64]; 2];
+        let ins: Vec<&[f32]> = input.iter().map(Vec::as_slice).collect();
+        let mut outs: Vec<&mut [f32]> = out.iter_mut().map(Vec::as_mut_slice).collect();
+        proc.process(48_000, &ins, &mut outs);
+        drop(_held);
+        assert_eq!(state.graph_xruns.load(Ordering::Relaxed), 1);
+        let (reply, _) = state.handle(&Action::GetHealth);
+        assert_eq!(reply.data.unwrap()["graphXruns"], 1);
+    }
+
+    #[test]
+    fn watchdog_policy_matrix() {
+        let snap = |link, xruns, topo| LinkSnapshot {
+            link,
+            xruns_total: xruns,
+            has_topology: topo,
+        };
+        use vm_audio::StreamLinkState as L;
+        // Never opened: nothing to restart (boot owns bring-up).
+        assert!(decide_watchdog(&snap(L::Down, 0, false), 0, true).is_none());
+        // Cooldown suppresses even a dead link (no open() hot loop).
+        assert!(decide_watchdog(&snap(L::NeedsRestart, 0, true), 0, false).is_none());
+        // Dead link restarts.
+        let r = decide_watchdog(&snap(L::NeedsRestart, 5, true), 5, true).unwrap();
+        assert!(r.contains("needs restart"), "{r}");
+        // Xrun storm restarts.
+        let r = decide_watchdog(&snap(L::Streaming, 100, true), 80, true).unwrap();
+        assert!(r.contains("storm"), "{r}");
+        // A few xruns are normal operation, not a storm.
+        assert!(decide_watchdog(&snap(L::Streaming, 84, true), 80, true).is_none());
+        // Quiet link: nothing to do.
+        assert!(decide_watchdog(&snap(L::Streaming, 80, true), 80, true).is_none());
+    }
+
+    #[test]
+    fn watchdog_tick_is_quiet_on_stub_and_restart_reopens() {
+        let state = test_state();
+        // No topology yet: tick must be a no-op (boot owns bring-up).
+        state.watchdog_tick();
+        assert_eq!(state.watchdog.lock().unwrap().restarts, 0);
+        // Open the stub pipeline: link stays Down (stub default) with no
+        // xruns -> still quiet, no spurious restarts.
+        open_stub_topology(&state);
+        state.watchdog_tick();
+        assert_eq!(state.watchdog.lock().unwrap().restarts, 0);
+        // Direct restart path reopens the same topology.
+        state.restart_pipeline().expect("stub reopen");
+        let topo = state.topology.lock().unwrap().clone().unwrap();
+        assert_eq!(topo.input.0, "stub:input:0");
     }
 }
 
@@ -912,7 +1250,11 @@ mod osc_chain_tests {
             public_params: vec![],
         };
         state.apply_preset(&preset).expect("apply");
-        let mut proc = GraphProcessor::new(state.graph.clone(), state.voice_enabled.clone());
+        let mut proc = GraphProcessor::new(
+            state.graph.clone(),
+            state.voice_enabled.clone(),
+            state.graph_xruns.clone(),
+        );
         // Run 1 s through the processor in 960-frame blocks.
         let mut out_all = Vec::new();
         for _ in 0..50 {
@@ -970,9 +1312,13 @@ mod osc_chain_tests {
             noise.push((((st >> 32) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0) * 0.1);
         }
         let rms = |x: &[f32]| (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt();
-        let mut proc = GraphProcessor::new(state.graph.clone(), state.voice_enabled.clone());
+        let mut proc = GraphProcessor::new(
+            state.graph.clone(),
+            state.voice_enabled.clone(),
+            state.graph_xruns.clone(),
+        );
         let mut out_all = Vec::new();
-        for chunk in noise.chunks_exact(960) {
+        for chunk in noise.as_chunks::<960>().0 {
             let input = [chunk.to_vec(), chunk.to_vec()];
             let mut out = vec![vec![0.0f32; chunk.len()]; 2];
             let ins: Vec<&[f32]> = input.iter().map(Vec::as_slice).collect();

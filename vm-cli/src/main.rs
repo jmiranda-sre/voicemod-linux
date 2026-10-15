@@ -101,6 +101,7 @@ async fn main() {
                 "fadeSound",
                 "startAudioStreaming",
                 "getAudioStreamStatus",
+                "getHealth",
                 "getBitmap",
                 "setSoundboardMasterVolume",
                 "selectInput",

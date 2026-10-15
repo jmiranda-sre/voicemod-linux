@@ -15,6 +15,7 @@ enum Tab {
     Voices,
     Soundboard,
     Devices,
+    Health,
 }
 
 struct VmApp {
@@ -159,7 +160,7 @@ impl eframe::App for VmApp {
                 }
                 ui.label(format!(":{}", snap.port));
                 ui.separator();
-                for (tab, name) in [(Tab::Voices, "Voices"), (Tab::Soundboard, "Soundboard"), (Tab::Devices, "Devices")] {
+                for (tab, name) in [(Tab::Voices, "Voices"), (Tab::Soundboard, "Soundboard"), (Tab::Devices, "Devices"), (Tab::Health, "Health")] {
                     ui.selectable_value(&mut self.tab, tab, name);
                 }
                 ui.separator();
@@ -211,6 +212,7 @@ impl eframe::App for VmApp {
             Tab::Voices => self.voices_tab(ui, &snap),
             Tab::Soundboard => self.soundboard_tab(ui, &snap),
             Tab::Devices => self.devices_tab(ui, &snap),
+            Tab::Health => self.health_tab(ui, &snap),
         });
     }
 }
@@ -440,6 +442,87 @@ impl VmApp {
             }
             if ui.button("Refresh").clicked() {
                 self.link.refresh();
+            }
+        });
+    }
+
+    fn health_tab(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
+        let h = &snap.health;
+        ui.heading(format!("Pipeline — voice '{}'", h.voice));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(format!("link={} active={}", h.link, h.active));
+            ui.separator();
+            if h.graph_xruns > 0 {
+                ui.colored_label(
+                    egui::Color32::RED,
+                    format!("graph xruns={}", h.graph_xruns),
+                );
+            } else {
+                ui.label("graph xruns=0");
+            }
+            ui.separator();
+            ui.label(format!(
+                "watchdog restarts={}{}",
+                h.restarts,
+                if h.last_reason.is_empty() {
+                    String::new()
+                } else {
+                    let age = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                        .saturating_sub(h.last_restart_unix);
+                    format!(" (last: {} {}s ago)", h.last_reason, age)
+                }
+            ));
+            if ui.button("Refresh").clicked() {
+                self.link.refresh();
+            }
+        });
+        ui.separator();
+        ui.heading("DSP nodes (µs per quantum)");
+        egui::Grid::new("node_health").num_columns(4).spacing([12.0, 4.0]).show(ui, |ui| {
+            ui.strong("node");
+            ui.strong("avg µs");
+            ui.strong("max µs");
+            ui.strong("calls");
+            ui.end_row();
+            for n in &h.nodes {
+                ui.label(&n.node);
+                ui.label(format!("{:.1}", n.avg_us));
+                ui.label(format!("{}", n.max_us));
+                ui.label(format!("{}", n.calls));
+                ui.end_row();
+            }
+        });
+        if h.nodes.is_empty() {
+            ui.label("no telemetry yet — is a voice loaded and streaming?");
+        }
+        ui.separator();
+        ui.heading("Streams");
+        egui::Grid::new("stream_health").num_columns(7).spacing([12.0, 4.0]).show(ui, |ui| {
+            ui.strong("stream");
+            ui.strong("calls");
+            ui.strong("avg µs");
+            ui.strong("max µs");
+            ui.strong("xruns");
+            ui.strong("trips");
+            ui.strong("frames");
+            ui.end_row();
+            for (name, s) in [("capture", &h.capture), ("playback", &h.playback), ("monitor", &h.monitor)] {
+                ui.label(name);
+                ui.label(format!("{}", s.invocations));
+                ui.label(format!("{:.1}", s.avg_us));
+                ui.label(format!("{}", s.max_us));
+                if s.xruns > 0 {
+                    ui.colored_label(egui::Color32::RED, format!("{}", s.xruns));
+                } else {
+                    ui.label("0");
+                }
+                ui.label(format!("{}", s.trips));
+                ui.label(format!("{}", s.last_frames));
+                ui.end_row();
             }
         });
     }

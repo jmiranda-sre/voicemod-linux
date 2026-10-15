@@ -108,7 +108,13 @@ impl ControlApiServer {
                     chosen = *port;
                     break;
                 }
-                Err(_) => continue,
+                // Backlog item (v0.1.0): a second instance died silently
+                // on bind. Say exactly which port was busy and that we
+                // move on — the effective port is still reported below.
+                Err(e) => {
+                    eprintln!("control api: port {port} busy ({e}); trying next candidate");
+                    continue;
+                }
             }
         }
         let listener = listener.ok_or(ServerError::NoPort)?;
@@ -267,6 +273,20 @@ mod tests {
             .expect("event");
         assert!(evt.contains("streamStatus") || evt.contains("StreamStatus"));
         ws.close(None).await.ok();
+    }
+
+    #[tokio::test]
+    async fn busy_first_port_falls_through_to_next() {
+        // Occupy the first candidate: serve must skip it loudly and bind
+        // the second (backlog: second instance used to die silently).
+        let _guard =
+            std::net::TcpListener::bind("127.0.0.1:18768").expect("occupy first candidate");
+        let server = ControlApiServer::new(
+            ServerConfig { bind: "127.0.0.1".parse().unwrap(), ports: vec![18768, 18778], require_auth: false, expected_token: None },
+            Arc::new(Canned),
+        );
+        let port = server.serve().await.expect("serve");
+        assert_eq!(port, 18778);
     }
 
     #[tokio::test]

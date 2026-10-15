@@ -117,6 +117,12 @@ A demo preset with every UI widget (bool/int/text/slider) is included:
 Parameters support `float`, `int`, `bool` and `text`; edit them live in the
 UI's *Voices* tab or over the Control API (`setVoiceParameter`).
 
+The UI's *Health* tab shows per-node DSP cost (µs per quantum), stream
+xruns and watchdog restarts — the same data `getHealth` returns over
+the Control API. If the link dies or xruns storm, the daemon's watchdog
+reopens the pipeline automatically (10 s attempt cooldown) and records
+the reason there.
+
 ### Ready-made mic preset
 
 On first boot the daemon seeds `mic-npr-voice` into

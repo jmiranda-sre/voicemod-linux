@@ -608,6 +608,25 @@ Escopo: 7 itens do brainstorm (numeração original entre parênteses).
 Foco: usabilidade + desempenho + integração. Nada implementado — frentes
 abaixo são o plano proposto p/ aprovação.
 
+### F-A — EM ANDAMENTO (telemetria + watchdog)
+(Ordem aprovada: instrumentação primeiro.)
+- `vm-dsp` `Graph`: `NodeTelemetry` por nó (avg EMA α=1/16 + max + calls,
+  `Instant::now` vDSO, vec pré-dimensionado no `add` — zero alloc no RT),
+  `telemetry()` p/ o control plane, `is_empty()` (fecha o lint do clippy).
+- `vm-daemon`: `graph_xruns` (contenção de `try_lock`), ação `GetHealth`
+  (voice/link/graphXruns/nodes[]/capture/playback/monitor/watchdog{}),
+  `WatchdogState` + política pura `decide_watchdog` (sem topologia → nada;
+  cooldown 10s; `NeedsRestart` → restart; storm ≥20 xruns/tick → restart)
+  + `restart_pipeline` (stop→open→start, grafo intacto) no tick de 2s.
+- `vm-control`: ação `GetHealth` no catálogo; `serve()` loga cada porta
+  ocupada antes de cair p/ a próxima (fecha backlog 8).
+- `vm-cli`: `vm actions` lista `getHealth` (17 ações).
+- `vm-ui`: structs `HealthInfo/NodeHealth/StreamHealth`, `getHealth` no
+  bootstrap + refresh, aba *Health* (tabela µs por nó, streams c/ xrun
+  em vermelho, restarts + último motivo).
+- Testes novos: telemetria (calls/picos), health shape, contenção conta
+  xrun, matriz da política, tick quieto no stub + reopen direto.
+
 ### Ordem de execução sugerida (com motivo)
 1. **(11) Dashboard de saúde RT + watchdog** — PRIMEIRO porque é a
    instrumentação que todos os outros usam p/ se validar (xruns, CPU/nó,

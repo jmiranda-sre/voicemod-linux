@@ -26,12 +26,46 @@ pub struct StatusInfo {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct NodeHealth {
+    pub node: String,
+    pub avg_us: f64,
+    pub max_us: u64,
+    pub calls: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StreamHealth {
+    pub invocations: u64,
+    pub avg_us: f64,
+    pub max_us: u64,
+    pub xruns: u64,
+    pub trips: u64,
+    pub last_frames: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HealthInfo {
+    pub voice: String,
+    pub link: String,
+    pub active: bool,
+    pub graph_xruns: u64,
+    pub nodes: Vec<NodeHealth>,
+    pub capture: StreamHealth,
+    pub playback: StreamHealth,
+    pub monitor: StreamHealth,
+    pub restarts: u64,
+    pub last_reason: String,
+    pub last_restart_unix: u64,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     pub connected: bool,
     pub port: u16,
     pub devices: Vec<DeviceInfo>,
     pub sounds: Vec<String>,
     pub status: StatusInfo,
+    pub health: HealthInfo,
     pub tier: String,
     pub voice_enabled: bool,
     pub selected_voice: String,
@@ -118,6 +152,7 @@ async fn link_main(
                     serde_json::json!({"action": "getAudioDevices"}),
                     serde_json::json!({"action": "getAllSoundboard"}),
                     serde_json::json!({"action": "getAudioStreamStatus"}),
+                    serde_json::json!({"action": "getHealth"}),
                     serde_json::json!({"action": "getUserLicense"}),
                 ] {
                     if !request(&mut ws, &snap, &repaint, &token, boot).await {
@@ -131,14 +166,26 @@ async fn link_main(
                             request(&mut ws, &snap, &repaint, &token, a).await
                         }
                         Ok(ToLink::Refresh) | Err(mpsc::RecvTimeoutError::Timeout) => {
-                            request(
+                            let ok = request(
                                 &mut ws,
                                 &snap,
                                 &repaint,
                                 &token,
                                 serde_json::json!({"action": "getAudioStreamStatus"}),
                             )
-                            .await
+                            .await;
+                            if ok {
+                                request(
+                                    &mut ws,
+                                    &snap,
+                                    &repaint,
+                                    &token,
+                                    serde_json::json!({"action": "getHealth"}),
+                                )
+                                .await
+                            } else {
+                                false
+                            }
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     };
@@ -305,7 +352,129 @@ fn apply_reply(
                     avg_us: data.and_then(|d| d.get("avgCallbackUs")).and_then(|x| x.as_f64()).unwrap_or(0.0),
                 };
             }
+            "getHealth" => {
+                s.health = parse_health(data);
+            }
             _ => {}
         }
     });
+}
+
+fn num(v: Option<&serde_json::Value>) -> u64 {
+    v.and_then(|x| x.as_u64()).unwrap_or(0)
+}
+
+fn fnum(v: Option<&serde_json::Value>) -> f64 {
+    v.and_then(|x| x.as_f64()).unwrap_or(0.0)
+}
+
+fn str_of(data: Option<&serde_json::Value>, key: &str) -> String {
+    data.and_then(|d| d.get(key)).and_then(|x| x.as_str()).unwrap_or("").to_string()
+}
+
+fn parse_stream(data: Option<&serde_json::Value>) -> StreamHealth {
+    let g = |key: &str| data.and_then(|d| d.get(key));
+    StreamHealth {
+        invocations: num(g("invocations")),
+        avg_us: fnum(g("avgUs")),
+        max_us: num(g("maxUs")),
+        xruns: num(g("xruns")),
+        trips: num(g("watchdogTrips")),
+        last_frames: num(g("lastFrames")) as usize,
+    }
+}
+
+/// Map a `getHealth` data payload into snapshot state. Missing keys
+/// degrade to zeros (older daemons simply have no `getHealth`).
+fn parse_health(data: Option<&serde_json::Value>) -> HealthInfo {
+    let nodes = data
+        .and_then(|d| d.get("nodes"))
+        .and_then(|n| n.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|n| NodeHealth {
+                    node: n.get("node").and_then(|x| x.as_str()).unwrap_or("?").to_string(),
+                    avg_us: fnum(n.get("avgUs")),
+                    max_us: num(n.get("maxUs")),
+                    calls: num(n.get("calls")),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let wd = data.and_then(|d| d.get("watchdog"));
+    HealthInfo {
+        voice: str_of(data, "voice"),
+        link: str_of(data, "link"),
+        active: data.and_then(|d| d.get("active")).and_then(|x| x.as_bool()).unwrap_or(false),
+        graph_xruns: num(data.and_then(|d| d.get("graphXruns"))),
+        nodes,
+        capture: parse_stream(data.and_then(|d| d.get("capture"))),
+        playback: parse_stream(data.and_then(|d| d.get("playback"))),
+        monitor: parse_stream(data.and_then(|d| d.get("monitor"))),
+        restarts: num(wd.and_then(|w| w.get("restarts"))),
+        last_reason: wd
+            .and_then(|w| w.get("lastReason"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        last_restart_unix: num(wd.and_then(|w| w.get("lastRestartUnix"))),
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    fn snap_link() -> Arc<Mutex<Snapshot>> {
+        Arc::new(Mutex::new(Snapshot::default()))
+    }
+    fn snap_repaint() -> Arc<dyn Fn()> {
+        Arc::new(|| {})
+    }
+
+    #[test]
+    fn health_payload_maps_into_snapshot() {
+        let snap = snap_link();
+        let action = serde_json::json!({"action": "getHealth"});
+        let reply = serde_json::json!({
+            "ok": true,
+            "data": {
+                "active": true,
+                "voice": "mic-npr-voice",
+                "link": "Streaming",
+                "graphXruns": 3,
+                "nodes": [
+                    {"node": "denoise", "avgUs": 410.5, "maxUs": 900, "calls": 50}
+                ],
+                "capture": {"invocations": 50, "avgUs": 6.0, "maxUs": 20, "xruns": 0, "watchdogTrips": 0, "lastFrames": 960},
+                "watchdog": {"restarts": 2, "lastReason": "xrun storm", "lastRestartUnix": 42, "consecutiveFailures": 0}
+            }
+        });
+        apply_reply(&snap, &snap_repaint(), &action, &reply);
+        let s = snap.lock().unwrap();
+        assert_eq!(s.health.voice, "mic-npr-voice");
+        assert_eq!(s.health.link, "Streaming");
+        assert!(s.health.active);
+        assert_eq!(s.health.graph_xruns, 3);
+        assert_eq!(s.health.nodes.len(), 1);
+        assert_eq!(s.health.nodes[0].node, "denoise");
+        assert!((s.health.nodes[0].avg_us - 410.5).abs() < 1e-9);
+        assert_eq!(s.health.nodes[0].max_us, 900);
+        assert_eq!(s.health.capture.invocations, 50);
+        assert_eq!(s.health.playback.xruns, 0); // missing block degrades to zero
+        assert_eq!(s.health.restarts, 2);
+        assert_eq!(s.health.last_reason, "xrun storm");
+        assert_eq!(s.health.last_restart_unix, 42);
+    }
+
+    #[test]
+    fn failed_reply_sets_error_and_keeps_health() {
+        let snap = snap_link();
+        let action = serde_json::json!({"action": "getHealth"});
+        let reply = serde_json::json!({"ok": false, "error": "boom"});
+        apply_reply(&snap, &snap_repaint(), &action, &reply);
+        let s = snap.lock().unwrap();
+        assert_eq!(s.last_error, "boom");
+        assert!(s.health.nodes.is_empty());
+    }
 }

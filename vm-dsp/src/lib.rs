@@ -25,6 +25,6 @@ pub mod spectral;
 
 pub use buffer::ResizableFrameBuffer;
 pub use factory::{NodeConstructorContext, NodeFactory};
-pub use graph::{Edge, Graph, NodeId};
+pub use graph::{Edge, Graph, NodeId, NodeTelemetry};
 pub use node::{AudioNode, ParamError, ProcessContext};
 pub use param::{Modulation, ParamValue, PublicParam, RangedParam};
