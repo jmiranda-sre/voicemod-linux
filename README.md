@@ -85,10 +85,26 @@ keep working. In Discord/OBS/etc. pick the input usually shown as **`vm-mic`**
 ### Global hotkeys (evdev)
 
 The daemon watches readable evdev keyboards (`vm keyboards` lists them) and
-funnels matched binds through the same action path as the UI. Two pieces are
-**infrastructure only in 0.1.0**: there are no default bindings yet and there
-is no API action to add them (binding persistence is a post-release item —
-see `STATUS.md`). What works today is the permission plumbing:
+funnels matched binds through the same action path as the UI. Binds are
+managed over the Control API and persisted in `$VM_CONFIG_DIR/config.json`
+(schema version 1), so they survive daemon restarts:
+
+```bash
+# Push-To-Talk on Right-Ctrl (evdev KEY_RIGHTCTRL = 97)
+{"action":"addHotkey","codes":[97],"target":"PushToTalk","enabled":true}
+# Momentary mic mute on F9 (evdev KEY_F9 = 67) ... or toggle mute instead
+{"action":"addHotkey","codes":[67],"target":"PushToMute","enabled":true}
+{"action":"listHotkeys"}
+{"action":"removeHotkey","hotkey_id":0}
+```
+
+Targets: `ToggleVoiceChanger`, `ToggleMute`, `PushToTalk` (changer on
+while held), `PushToMute` (silence while held, DSP stays live),
+`{"PlaySound": name}`, `{"SelectVoice": name}`, `StopAllSounds`.
+`setMuted` + the `mutedChanged` event expose the same state for
+StreamDeck-style clients.
+
+What still needs the permission plumbing:
 
 ```bash
 sudo usermod -aG input "$USER"
@@ -96,7 +112,9 @@ sudo udevadm control --reload-rules && sudo udevadm trigger   # 99-vm-hotkeys.ru
 ```
 
 Without those the daemon logs `hotkeys: no readable keyboards` and everything
-else keeps working.
+else keeps working. Inside the Flatpak sandbox (`/.flatpak-info` present)
+hotkeys are unavailable by design — the daemon says so plainly and keeps
+serving the Control API.
 
 ### Presets and soundboard
 

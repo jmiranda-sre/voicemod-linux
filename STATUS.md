@@ -627,6 +627,28 @@ abaixo são o plano proposto p/ aprovação.
 - Testes novos: telemetria (calls/picos), health shape, contenção conta
   xrun, matriz da política, tick quieto no stub + reopen direto.
 
+### F-B — FECHADA (hotkeys, PTT/mute, persistência) — 2026-10-15
+- `vm-control`: alvos momentâneos `PushToTalk`/`PushToMute` +
+  `is_momentary`; `watch_device` entrega `(target, pressed)` (release só
+  p/ chords momentâneos que deixam de casar); `StoredBind` + `export`/
+  `import` (ids estáveis); `save/load_config` (versão 1, falha fechada);
+  `validate_bind`; `sandbox_note` (Flatpak → mensagem própria).
+- `vm-daemon`: flag `muted` (zera saída, DSP quente); `SetMuted` +
+  evento `MutedChanged`; `Add/Remove/ListHotkeys` com persistência
+  atômica (snapshot → aplica → salva → rollback); `config.json` c/
+  quarentena `.bak`; `hotkey_action(target, pressed)`; boot carrega
+  binds antes das threads evdev.
+- Bug real achado no smoke: campo `id` do `removeHotkey` colidia com o
+  `id` de correlação (serde prioriza o envelope → parse falhava sem eco
+  → cliente estrito travava; a UI sempre envia id). Renomeado p/
+  `hotkey_id` + teste anti-colisão genérico p/ as 21 ações.
+- Verificado ao vivo (release, stub): add/list/remove/setMuted,
+  `config.json` em disco, reboot → bind id 1 sobrevive, corrompido →
+  `.bak` + boot segue sem binds.
+- Testes: roundtrip add/list/remove c/ arquivo, rejeições,
+  reload pós-"reboot" (ids 0,1 → próximo 2), quarentena, mute
+  bit-exato + evento, matriz de bordas, formato JSON no fio.
+
 ### Ordem de execução sugerida (com motivo)
 1. **(11) Dashboard de saúde RT + watchdog** — PRIMEIRO porque é a
    instrumentação que todos os outros usam p/ se validar (xruns, CPU/nó,

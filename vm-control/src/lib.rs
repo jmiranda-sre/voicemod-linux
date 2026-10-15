@@ -10,5 +10,8 @@ pub mod hotkeys;
 pub mod server;
 
 pub use actions::{Action, ControlEvent, ControlHandler, ControlMessage, ControlReply};
-pub use hotkeys::{HotkeyManager, HotkeyTarget, Keybind};
+pub use hotkeys::{
+    HotkeyManager, HotkeyTarget, Keybind, StoredBind, CONFIG_VERSION, is_momentary, load_config,
+    save_config, sandbox_note, validate_bind,
+};
 pub use server::{dispatch, ControlApiServer, ServerConfig};

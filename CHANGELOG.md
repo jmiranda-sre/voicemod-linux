@@ -6,6 +6,22 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added (F-B: hotkeys, PTT/mute, persistence)
+
+- Control API: `addHotkey{codes,target,enabled}` (validated: 1–8 codes
+  in evdev range, non-empty target names), `removeHotkey{id}`,
+  `listHotkeys`, `setMuted{muted}` + `mutedChanged` event; `vm actions`
+  lists all 21 actions.
+- Momentary targets `PushToTalk` (changer on while held) and
+  `PushToMute` (silence while held); evdev watcher now delivers
+  press/release edges, releasing only chords that stop matching.
+  `ToggleMute` is real (master mute zeroes output, DSP stays live).
+- Binds persist in `$VM_CONFIG_DIR/config.json` (schema version 1,
+  ids stable across restarts); mutate-then-save is atomic with
+  in-memory rollback, corrupt files are quarantined to `.bak`.
+- Flatpak sandbox detected (`FLATPAK_ID`/`/.flatpak-info`) with a plain
+  message instead of the generic permissions hint.
+
 ### Added (F-A: RT health + watchdog)
 
 - Per-node DSP telemetry: `Graph` times every node per quantum

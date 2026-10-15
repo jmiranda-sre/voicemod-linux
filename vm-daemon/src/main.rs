@@ -13,7 +13,7 @@ use std::sync::{
 use vm_audio::{AudioBackend, DeviceRole, StreamProcessor, StreamStopReason, StreamTopology, SAMPLE_RATE};
 use vm_control::{
     Action, ControlApiServer, ControlEvent, ControlHandler, ControlReply, HotkeyManager,
-    HotkeyTarget, ServerConfig,
+    HotkeyTarget, Keybind, ServerConfig,
 };
 use vm_dsp::{Graph, NodeConstructorContext, NodeFactory, NodeId, ProcessContext};
 
@@ -22,6 +22,9 @@ use vm_dsp::{Graph, NodeConstructorContext, NodeFactory, NodeId, ProcessContext}
 struct GraphProcessor {
     graph: Arc<Mutex<Graph>>,
     voice_enabled: Arc<AtomicBool>,
+    /// Master mute: output goes silent while the DSP state stays live
+    /// (reverb tails don't burst on unmute).
+    muted: Arc<AtomicBool>,
     /// Lock-contention counter: a quantum that finds the graph locked
     /// (preset swap in flight) passes the previous buffer through and
     /// counts as a graph-side xrun instead of blocking the RT thread.
@@ -34,9 +37,10 @@ impl GraphProcessor {
     fn new(
         graph: Arc<Mutex<Graph>>,
         voice_enabled: Arc<AtomicBool>,
+        muted: Arc<AtomicBool>,
         graph_xruns: Arc<AtomicU64>,
     ) -> Self {
-        Self { graph, voice_enabled, graph_xruns, lane_in: Vec::new(), lane_out: Vec::new() }
+        Self { graph, voice_enabled, muted, graph_xruns, lane_in: Vec::new(), lane_out: Vec::new() }
     }
 }
 
@@ -72,6 +76,12 @@ impl StreamProcessor for GraphProcessor {
             for (dst, src) in outputs.iter_mut().zip(self.lane_in.iter()) {
                 dst.copy_from_slice(&src[..frames.min(dst.len()).min(src.len())]);
             }
+            if self.muted.load(Ordering::Relaxed) {
+                for dst in outputs.iter_mut() {
+                    let n = frames.min(dst.len());
+                    dst[..n].fill(0.0);
+                }
+            }
             return;
         }
         let ctx = ProcessContext { rate, frames };
@@ -82,6 +92,12 @@ impl StreamProcessor for GraphProcessor {
         }
         for (dst, src) in outputs.iter_mut().zip(self.lane_out.iter()) {
             dst.copy_from_slice(&src[..frames.min(dst.len()).min(src.len())]);
+        }
+        if self.muted.load(Ordering::Relaxed) {
+            for dst in outputs.iter_mut() {
+                let n = frames.min(dst.len());
+                dst[..n].fill(0.0);
+            }
         }
     }
 }
@@ -105,6 +121,12 @@ struct DaemonState {
     graph_xruns: Arc<AtomicU64>,
     /// Watchdog bookkeeping (restarts, cooldown, last reason).
     watchdog: Mutex<WatchdogState>,
+    /// Master mute flag, shared with the RT processor.
+    muted: Arc<AtomicBool>,
+    /// Live keybind store, shared with the evdev watch threads.
+    hotkeys: Arc<Mutex<HotkeyManager>>,
+    /// `$VM_CONFIG_DIR/config.json` (bind persistence).
+    config_path: PathBuf,
 }
 
 /// Watchdog state: restart counter + cooldown bookkeeping. The policy
@@ -165,6 +187,13 @@ fn unix_now() -> u64 {
 }
 
 impl DaemonState {
+    /// Persist the live keybind store to `config.json`.
+    fn save_hotkeys(&self, mgr: &HotkeyManager) -> Result<(), String> {
+        let text = vm_control::save_config(&mgr.export());
+        std::fs::write(&self.config_path, text)
+            .map_err(|e| format!("write {}: {e}", self.config_path.display()))
+    }
+
     /// Runtime input switch: stop → reopen on the new input (same virtual
     /// output) → start. Drops in-flight audio; the graph keeps running.
     fn switch_input(&self, uid: &str) -> Result<(), String> {
@@ -423,6 +452,76 @@ impl ControlHandler for DaemonState {
                     vec![ControlEvent::VoiceChangerToggled { enabled: *enabled }],
                 )
             }
+            Action::SetMuted { muted } => {
+                self.muted.store(*muted, Ordering::Relaxed);
+                (
+                    ControlReply::ok(),
+                    vec![ControlEvent::MutedChanged { muted: *muted }],
+                )
+            }
+            Action::AddHotkey { codes, target, enabled } => {
+                let bind =
+                    Keybind { codes: codes.clone(), target: target.clone(), enabled: *enabled };
+                if let Err(e) = vm_control::validate_bind(&bind) {
+                    return (ControlReply::err(e), Vec::new());
+                }
+                // Atomic mutate-then-persist: snapshot, apply, save,
+                // roll back the in-memory store when the disk write fails
+                // (a live-but-unpersisted bind would lie to listHotkeys).
+                let mut mgr = self.hotkeys.lock().unwrap();
+                let backup = mgr.export();
+                let id = mgr.add(bind);
+                match self.save_hotkeys(&mgr) {
+                    Ok(()) => (ControlReply::ok_data(serde_json::json!({ "id": id })), Vec::new()),
+                    Err(e) => {
+                        mgr.import(backup);
+                        (
+                            ControlReply::err(format!(
+                                "bind applied but not saved, rolled back: {e}"
+                            )),
+                            Vec::new(),
+                        )
+                    }
+                }
+            }
+            Action::RemoveHotkey { hotkey_id } => {
+                let mut mgr = self.hotkeys.lock().unwrap();
+                let backup = mgr.export();
+                if !mgr.remove(*hotkey_id) {
+                    return (
+                        ControlReply::err(format!("unknown hotkey id {hotkey_id}")),
+                        Vec::new(),
+                    );
+                }
+                match self.save_hotkeys(&mgr) {
+                    Ok(()) => (ControlReply::ok(), Vec::new()),
+                    Err(e) => {
+                        mgr.import(backup);
+                        (
+                            ControlReply::err(format!(
+                                "bind removed but not saved, rolled back: {e}"
+                            )),
+                            Vec::new(),
+                        )
+                    }
+                }
+            }
+            Action::ListHotkeys => {
+                let mgr = self.hotkeys.lock().unwrap();
+                let binds: Vec<serde_json::Value> = mgr
+                    .list()
+                    .into_iter()
+                    .map(|(id, b)| {
+                        serde_json::json!({
+                            "id": id,
+                            "codes": b.codes,
+                            "target": b.target,
+                            "enabled": b.enabled,
+                        })
+                    })
+                    .collect();
+                (ControlReply::ok_data(serde_json::json!({ "hotkeys": binds })), Vec::new())
+            }
             Action::StartAudioStreaming => {
                 let mut audio = self.audio.lock().unwrap();
                 match audio.start() {
@@ -605,16 +704,26 @@ fn action_value(action: &Action) -> serde_json::Value {
     }
 }
 
-fn hotkey_action(target: &HotkeyTarget, state: &DaemonState) -> Option<Action> {
+fn hotkey_action(target: &HotkeyTarget, pressed: bool, state: &DaemonState) -> Option<Action> {
     match target {
-        HotkeyTarget::ToggleVoiceChanger => {
+        HotkeyTarget::ToggleVoiceChanger if pressed => {
             let cur = state.voice_enabled.load(Ordering::Relaxed);
             Some(Action::ToggleVoiceChanger { enabled: !cur })
         }
-        HotkeyTarget::ToggleMute => None, // master mute lands with the settings work
-        HotkeyTarget::PlaySound(name) => Some(Action::PlaySound { sound: name.clone() }),
-        HotkeyTarget::SelectVoice(name) => Some(Action::SelectVoice { voice: name.clone() }),
-        HotkeyTarget::StopAllSounds => Some(Action::StopAllSounds),
+        // ToggleMute is real now (master mute flag); PTT/PTM below are
+        // the momentary edges that ride on the same two actions.
+        HotkeyTarget::ToggleMute if pressed => {
+            let cur = state.muted.load(Ordering::Relaxed);
+            Some(Action::SetMuted { muted: !cur })
+        }
+        HotkeyTarget::PushToTalk => Some(Action::ToggleVoiceChanger { enabled: pressed }),
+        HotkeyTarget::PushToMute => Some(Action::SetMuted { muted: pressed }),
+        HotkeyTarget::PlaySound(name) if pressed => Some(Action::PlaySound { sound: name.clone() }),
+        HotkeyTarget::SelectVoice(name) if pressed => {
+            Some(Action::SelectVoice { voice: name.clone() })
+        }
+        HotkeyTarget::StopAllSounds if pressed => Some(Action::StopAllSounds),
+        _ => None,
     }
 }
 
@@ -656,6 +765,28 @@ fn seed_builtin_presets(preset_dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Load persisted binds. Missing file = first boot (empty store, no
+/// error). A corrupt file is quarantined to `config.json.bak` instead of
+/// being overwritten — hand edits are never silently eaten.
+fn load_hotkeys_file(path: &std::path::Path) -> Result<Vec<vm_control::StoredBind>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    match vm_control::load_config(&text) {
+        Ok(b) => Ok(b),
+        Err(e) => {
+            let bak = path.with_extension("json.bak");
+            if std::fs::rename(path, &bak).is_ok() {
+                Err(format!("{e} (moved to {})", bak.display()))
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
 async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
     let (preset_dir, sound_dir) = config_dirs();
     std::fs::create_dir_all(&preset_dir)?;
@@ -669,6 +800,23 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Ship the ready-made mic presets (Fase 7); user edits always win.
     seed_builtin_presets(&preset_dir)?;
 
+    // Hotkey binds (F-B): load persisted store before the state exists
+    // so both the API and the evdev threads share one manager.
+    let config_path = preset_dir
+        .parent()
+        .map(|p| p.join("config.json"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/vm-config.json"));
+    let mut hotkeys = HotkeyManager::new();
+    match load_hotkeys_file(&config_path) {
+        Ok(stored) => {
+            if !stored.is_empty() {
+                println!("hotkeys: loaded {} binds from {}", stored.len(), config_path.display());
+            }
+            hotkeys.import(stored);
+        }
+        Err(e) => eprintln!("hotkeys: {e} (starting with no binds)"),
+    }
+
     let state = Arc::new(DaemonState {
         graph: Arc::new(Mutex::new(Graph::new())),
         node_ids: Mutex::new(HashMap::new()),
@@ -681,6 +829,9 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
         topology: Mutex::new(None),
         graph_xruns: Arc::new(AtomicU64::new(0)),
         watchdog: Mutex::new(WatchdogState::default()),
+        muted: Arc::new(AtomicBool::new(false)),
+        hotkeys: Arc::new(Mutex::new(hotkeys)),
+        config_path: config_path.clone(),
     });
     // Default voice.
     {
@@ -693,6 +844,7 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
     let processor: Arc<Mutex<dyn StreamProcessor>> = Arc::new(Mutex::new(GraphProcessor::new(
         state.graph.clone(),
         state.voice_enabled.clone(),
+        state.muted.clone(),
         graph_xruns,
     )));
     // Preload sounds (decode+resample now; never on the trigger path).
@@ -769,11 +921,16 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
     let port = server.serve().await.map_err(|e| format!("control api: {e}"))?;
     println!("control api listening (effective port {port})");
 
-    // Hotkeys (best-effort: empty without input permissions).
+    // Hotkeys (F-B): the API-owned store is shared with the evdev
+    // watch threads. Sandboxed (Flatpak) means no /dev/input by design:
+    // say so plainly instead of the generic permissions hint.
+    if let Some(note) = vm_control::sandbox_note() {
+        eprintln!("{note}");
+    }
     {
-        let manager = Arc::new(Mutex::new(HotkeyManager::new()));
+        let manager = state.hotkeys.clone();
         let keyboards = HotkeyManager::scan_keyboards();
-        if keyboards.is_empty() {
+        if keyboards.is_empty() && vm_control::sandbox_note().is_none() {
             eprintln!("hotkeys: no readable keyboards (need input group/udev rule)");
         }
         for path in keyboards {
@@ -786,8 +943,8 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
             std::thread::Builder::new()
                 .name("vm-hotkey".into())
                 .spawn(move || {
-                    vm_control::hotkeys::watch_device(path, manager, move |target| {
-                        if let Some(action) = hotkey_action(&target, &state) {
+                    vm_control::hotkeys::watch_device(path, manager, move |target, pressed| {
+                        if let Some(action) = hotkey_action(&target, pressed, &state) {
                             let (reply, _evts) = state.handle(&action);
                             if !reply.ok {
                                 eprintln!("hotkey action failed: {:?}", reply.error);
@@ -898,6 +1055,9 @@ fn test_state() -> Arc<DaemonState> {
         topology: Mutex::new(None),
         graph_xruns: Arc::new(AtomicU64::new(0)),
         watchdog: Mutex::new(WatchdogState::default()),
+        muted: Arc::new(AtomicBool::new(false)),
+        hotkeys: Arc::new(Mutex::new(HotkeyManager::new())),
+        config_path: dir.join("config.json"),
     });
     // Seed example preset + one wav sound.
     let text = serde_json::to_string_pretty(&vm_preset::example_drive()).unwrap();
@@ -1046,6 +1206,7 @@ mod tests {
         let mut proc = GraphProcessor::new(
             state.graph.clone(),
             state.voice_enabled.clone(),
+            state.muted.clone(),
             state.graph_xruns.clone(),
         );
         let input = vec![vec![0.3f32; 64]];
@@ -1099,6 +1260,7 @@ mod health_tests {
         let mut proc = GraphProcessor::new(
             state.graph.clone(),
             state.voice_enabled.clone(),
+            state.muted.clone(),
             state.graph_xruns.clone(),
         );
         for _ in 0..4 {
@@ -1135,6 +1297,7 @@ mod health_tests {
         let mut proc = GraphProcessor::new(
             state.graph.clone(),
             state.voice_enabled.clone(),
+            state.muted.clone(),
             state.graph_xruns.clone(),
         );
         // Hold the graph lock: the RT path must skip, not block.
@@ -1189,6 +1352,181 @@ mod health_tests {
         state.restart_pipeline().expect("stub reopen");
         let topo = state.topology.lock().unwrap().clone().unwrap();
         assert_eq!(topo.input.0, "stub:input:0");
+    }
+}
+
+#[cfg(test)]
+mod hotkey_api_tests {
+    use super::*;
+    use vm_control::HotkeyTarget;
+
+    fn add_bind(
+        state: &Arc<DaemonState>,
+        codes: &[u16],
+        target: HotkeyTarget,
+    ) -> serde_json::Value {
+        let (reply, _) = state.handle(&Action::AddHotkey {
+            codes: codes.to_vec(),
+            target,
+            enabled: true,
+        });
+        assert!(reply.ok, "{:?}", reply.error);
+        reply.data.unwrap()
+    }
+
+    #[test]
+    fn add_list_remove_roundtrip_with_file() {
+        let state = test_state();
+        assert!(!state.config_path.exists(), "fresh temp dir has no config");
+        let data = add_bind(&state, &[29, 42], HotkeyTarget::PushToTalk);
+        assert_eq!(data["id"], 0);
+        let (reply, _) = state.handle(&Action::ListHotkeys);
+        assert!(reply.ok);
+        let binds = reply.data.unwrap()["hotkeys"].as_array().unwrap().clone();
+        assert_eq!(binds.len(), 1);
+        assert_eq!(binds[0]["id"], 0);
+        assert_eq!(binds[0]["codes"], serde_json::json!([29, 42]));
+        assert_eq!(binds[0]["target"], "PushToTalk");
+        assert_eq!(binds[0]["enabled"], true);
+        // Persisted to config.json with schema version.
+        let text = std::fs::read_to_string(&state.config_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["hotkeys"].as_array().unwrap().len(), 1);
+
+        let (reply, _) = state.handle(&Action::RemoveHotkey { hotkey_id: 0 });
+        assert!(reply.ok, "{:?}", reply.error);
+        let (reply, _) = state.handle(&Action::ListHotkeys);
+        assert_eq!(reply.data.unwrap()["hotkeys"].as_array().unwrap().len(), 0);
+        // Unknown id errors cleanly.
+        let (reply, _) = state.handle(&Action::RemoveHotkey { hotkey_id: 0 });
+        assert!(!reply.ok);
+    }
+
+    #[test]
+    fn add_rejects_invalid_binds() {
+        let state = test_state();
+        for (codes, target) in [
+            (vec![], HotkeyTarget::PushToTalk),
+            (vec![0x300], HotkeyTarget::PushToTalk),
+            (vec![29], HotkeyTarget::SelectVoice(String::new())),
+        ] {
+            let (reply, _) = state.handle(&Action::AddHotkey {
+                codes,
+                target,
+                enabled: true,
+            });
+            assert!(!reply.ok, "invalid bind must be rejected");
+        }
+        // Nothing persisted from rejected adds.
+        assert!(!state.config_path.exists());
+        let (reply, _) = state.handle(&Action::ListHotkeys);
+        assert_eq!(reply.data.unwrap()["hotkeys"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn persisted_binds_reload_like_a_reboot() {
+        let state = test_state();
+        add_bind(&state, &[29], HotkeyTarget::PushToTalk);
+        add_bind(&state, &[56], HotkeyTarget::ToggleMute);
+        // Simulate a reboot: fresh manager from the same file.
+        let stored = load_hotkeys_file(&state.config_path).expect("reload");
+        assert_eq!(stored.len(), 2);
+        let mut mgr = HotkeyManager::new();
+        mgr.import(stored);
+        let listed = mgr.list();
+        assert_eq!(listed[0].0, 0);
+        assert_eq!(listed[1].0, 1);
+        assert!(matches!(listed[1].1.target, HotkeyTarget::ToggleMute));
+        // Ids keep growing past the max (no reuse after reboot).
+        let next = mgr.add(vm_control::Keybind {
+            codes: vec![57],
+            target: HotkeyTarget::StopAllSounds,
+            enabled: true,
+        });
+        assert_eq!(next, 2);
+    }
+
+    #[test]
+    fn corrupt_config_is_quarantined_not_eaten() {
+        let state = test_state();
+        std::fs::write(&state.config_path, "{oops").unwrap();
+        let err = load_hotkeys_file(&state.config_path).expect_err("must fail");
+        assert!(err.contains(".bak"), "{err}");
+        assert!(!state.config_path.exists(), "corrupt file moved away");
+        assert!(state.config_path.with_extension("json.bak").exists());
+    }
+
+    #[test]
+    fn set_muted_zeroes_output_and_emits_event() {
+        let state = test_state();
+        let (reply, _) = state.handle(&Action::SelectVoice { voice: "example-drive".into() });
+        assert!(reply.ok);
+        let run_block = |muted: bool| {
+            state.muted.store(muted, Ordering::Relaxed);
+            let mut proc = GraphProcessor::new(
+                state.graph.clone(),
+                state.voice_enabled.clone(),
+                state.muted.clone(),
+                state.graph_xruns.clone(),
+            );
+            let input = vec![vec![0.4f32; 64]; 2];
+            let mut out = vec![vec![9.9f32; 64]; 2];
+            let ins: Vec<&[f32]> = input.iter().map(Vec::as_slice).collect();
+            let mut outs: Vec<&mut [f32]> = out.iter_mut().map(Vec::as_mut_slice).collect();
+            proc.process(48_000, &ins, &mut outs);
+            out
+        };
+        // Via the API action (event for StreamDeck-style clients).
+        let (reply, evts) = state.handle(&Action::SetMuted { muted: true });
+        assert!(reply.ok);
+        assert!(matches!(evts[0], ControlEvent::MutedChanged { muted: true }));
+        let out = run_block(true);
+        assert!(out.iter().all(|lane| lane.iter().all(|s| *s == 0.0)), "muted must be bit-exact silence");
+        let (reply, evts) = state.handle(&Action::SetMuted { muted: false });
+        assert!(reply.ok);
+        assert!(matches!(evts[0], ControlEvent::MutedChanged { muted: false }));
+        let out = run_block(false);
+        assert!(out[0].iter().any(|s| *s != 0.0), "unmuted chain passes signal");
+    }
+
+    #[test]
+    fn hotkey_edge_mapping() {
+        let state = test_state();
+        // Momentary: both edges map.
+        assert_eq!(
+            hotkey_action(&HotkeyTarget::PushToTalk, true, &state),
+            Some(Action::ToggleVoiceChanger { enabled: true })
+        );
+        assert_eq!(
+            hotkey_action(&HotkeyTarget::PushToTalk, false, &state),
+            Some(Action::ToggleVoiceChanger { enabled: false })
+        );
+        assert_eq!(
+            hotkey_action(&HotkeyTarget::PushToMute, true, &state),
+            Some(Action::SetMuted { muted: true })
+        );
+        assert_eq!(
+            hotkey_action(&HotkeyTarget::PushToMute, false, &state),
+            Some(Action::SetMuted { muted: false })
+        );
+        // Toggles fire on press only, flipping live state.
+        assert_eq!(
+            hotkey_action(&HotkeyTarget::ToggleMute, true, &state),
+            Some(Action::SetMuted { muted: true })
+        );
+        assert_eq!(hotkey_action(&HotkeyTarget::ToggleMute, false, &state), None);
+        assert!(hotkey_action(&HotkeyTarget::ToggleVoiceChanger, false, &state).is_none());
+        assert!(hotkey_action(
+            &HotkeyTarget::PlaySound("x".into()),
+            false,
+            &state
+        )
+        .is_none());
+        assert_eq!(
+            hotkey_action(&HotkeyTarget::StopAllSounds, true, &state),
+            Some(Action::StopAllSounds)
+        );
     }
 }
 
@@ -1253,6 +1591,7 @@ mod osc_chain_tests {
         let mut proc = GraphProcessor::new(
             state.graph.clone(),
             state.voice_enabled.clone(),
+            state.muted.clone(),
             state.graph_xruns.clone(),
         );
         // Run 1 s through the processor in 960-frame blocks.
@@ -1315,6 +1654,7 @@ mod osc_chain_tests {
         let mut proc = GraphProcessor::new(
             state.graph.clone(),
             state.voice_enabled.clone(),
+            state.muted.clone(),
             state.graph_xruns.clone(),
         );
         let mut out_all = Vec::new();

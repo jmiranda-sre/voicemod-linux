@@ -13,6 +13,10 @@ use std::collections::HashMap;
 pub enum HotkeyTarget {
     ToggleVoiceChanger,
     ToggleMute,
+    /// Momentary: voice changer on while held, off on release.
+    PushToTalk,
+    /// Momentary: master mute on while held, off on release.
+    PushToMute,
     PlaySound(String),
     SelectVoice(String),
     StopAllSounds,
@@ -27,8 +31,8 @@ pub struct Keybind {
     pub enabled: bool,
 }
 
-/// In-memory keybind store. Persistence (JSON next to presets) lands
-/// with the settings work in Fase 3b.
+/// In-memory keybind store with JSON persistence (`config.json`, owned
+/// by the daemon; see [`save_config`]/[`load_config`]).
 #[derive(Debug, Default)]
 pub struct HotkeyManager {
     binds: HashMap<u32, Keybind>,
@@ -62,7 +66,10 @@ impl HotkeyManager {
     }
 
     pub fn list(&self) -> Vec<(u32, Keybind)> {
-        self.binds.iter().map(|(id, b)| (*id, b.clone())).collect()
+        let mut out: Vec<(u32, Keybind)> =
+            self.binds.iter().map(|(id, b)| (*id, b.clone())).collect();
+        out.sort_by_key(|(id, _)| *id);
+        out
     }
 
     /// Match currently-held codes against enabled binds.
@@ -74,6 +81,102 @@ impl HotkeyManager {
             .collect()
     }
 
+    /// Export the full store (ids included) for persistence.
+    pub fn export(&self) -> Vec<StoredBind> {
+        let mut out: Vec<StoredBind> = self
+            .binds
+            .iter()
+            .map(|(id, bind)| StoredBind { id: *id, bind: bind.clone() })
+            .collect();
+        out.sort_by_key(|s| s.id);
+        out
+    }
+
+    /// Replace the store with persisted binds; `next_id` resumes past
+    /// the highest stored id so ids stay stable across restarts
+    /// (StreamDeck-style clients can reference them).
+    pub fn import(&mut self, binds: Vec<StoredBind>) {
+        self.binds.clear();
+        let mut next = 0u32;
+        for s in binds {
+            next = next.max(s.id.saturating_add(1));
+            self.binds.insert(s.id, s.bind);
+        }
+        self.next_id = next;
+    }
+}
+
+/// A persisted bind: id included so references stay stable across
+/// restarts (see [`HotkeyManager::import`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredBind {
+    pub id: u32,
+    pub bind: Keybind,
+}
+
+/// On-disk config file shape (`$VM_CONFIG_DIR/config.json`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConfigFile {
+    version: u32,
+    hotkeys: Vec<StoredBind>,
+}
+
+/// Current config schema version. Bump when the shape changes; old
+/// files fail closed with a clear error instead of silent misparse.
+pub const CONFIG_VERSION: u32 = 1;
+
+/// Serialize binds to the config file text.
+pub fn save_config(binds: &[StoredBind]) -> String {
+    serde_json::to_string_pretty(&ConfigFile { version: CONFIG_VERSION, hotkeys: binds.to_vec() })
+        .unwrap_or_else(|_| String::from("{\"version\":1,\"hotkeys\":[]}"))
+}
+
+/// Parse config file text. Unknown versions fail closed (never silently
+/// reinterpreted); unknown *targets* also fail (a typo'd bind must not
+/// boot as a different action).
+pub fn load_config(text: &str) -> Result<Vec<StoredBind>, String> {
+    let cfg: ConfigFile =
+        serde_json::from_str(text).map_err(|e| format!("bad hotkey config: {e}"))?;
+    if cfg.version != CONFIG_VERSION {
+        return Err(format!(
+            "unsupported hotkey config version {} (want {CONFIG_VERSION})",
+            cfg.version
+        ));
+    }
+    Ok(cfg.hotkeys)
+}
+
+/// Validate an API-supplied bind before it enters the store.
+pub fn validate_bind(bind: &Keybind) -> Result<(), String> {
+    if bind.codes.is_empty() || bind.codes.len() > 8 {
+        return Err("codes must hold 1..=8 evdev key codes".to_string());
+    }
+    if bind.codes.iter().any(|c| *c > 0x2ff) {
+        return Err("code out of evdev range (0..=0x2ff)".to_string());
+    }
+    match &bind.target {
+        HotkeyTarget::PlaySound(n) | HotkeyTarget::SelectVoice(n) if n.is_empty() => {
+            Err("target name must not be empty".to_string())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Flatpak-sandbox explanation, or `None` when not sandboxed. Hotkeys
+/// need `/dev/input`, which the sandbox never grants — say so plainly
+/// instead of the generic "no readable keyboards".
+pub fn sandbox_note() -> Option<&'static str> {
+    if std::env::var("FLATPAK_ID").is_ok() || std::path::Path::new("/.flatpak-info").exists() {
+        Some(
+            "hotkeys: Flatpak sandbox has no /dev/input access — hotkeys are unavailable \
+             here (use the native AppImage/AUR build, or drive the Control API instead)",
+        )
+    } else {
+        None
+    }
+}
+
+impl HotkeyManager {
     /// List readable evdev keyboard devices (best-effort; empty without
     /// input permissions — see module docs).
     pub fn scan_keyboards() -> Vec<String> {
@@ -95,11 +198,18 @@ impl HotkeyManager {
     }
 }
 
+/// Momentary targets (PTT/PTM) follow press AND release; everything
+/// else fires on press only.
+pub fn is_momentary(t: &HotkeyTarget) -> bool {
+    matches!(t, HotkeyTarget::PushToTalk | HotkeyTarget::PushToMute)
+}
+
 /// Blocking evdev read loop for one keyboard device. Runs on its own
-/// thread; calls `on_trigger` on press edges whose held set matches an
-/// enabled bind. Best-effort: returns if the device can't be opened
-/// (permissions) or disappears.
-pub fn watch_device(path: String, manager: std::sync::Arc<std::sync::Mutex<HotkeyManager>>, on_trigger: impl Fn(HotkeyTarget) + Send + 'static) {
+/// thread; calls `on_edge(target, pressed)` for press edges whose held
+/// set matches an enabled bind, plus release edges for momentary binds
+/// (PTT/PTM) whose chord stops matching. Best-effort: returns if the
+/// device can't be opened (permissions) or disappears.
+pub fn watch_device(path: String, manager: std::sync::Arc<std::sync::Mutex<HotkeyManager>>, on_edge: impl Fn(HotkeyTarget, bool) + Send + 'static) {
     use std::collections::HashSet;
     let mut dev = match evdev::Device::open(&path) {
         Ok(d) => d,
@@ -108,8 +218,7 @@ pub fn watch_device(path: String, manager: std::sync::Arc<std::sync::Mutex<Hotke
             return;
         }
     };
-    let mut held: HashSet<u16> = HashSet::new();
-    loop {
+    let mut held: HashSet<u16> = HashSet::new();    loop {
         let batch = match dev.fetch_events() {
             Ok(b) => b,
             Err(e) => {
@@ -128,15 +237,158 @@ pub fn watch_device(path: String, manager: std::sync::Arc<std::sync::Mutex<Hotke
                     let held_vec: Vec<u16> = held.iter().copied().collect();
                     if let Ok(mgr) = manager.lock() {
                         for target in mgr.match_held(&held_vec) {
-                            on_trigger(target);
+                            on_edge(target, true);
                         }
                     }
                 }
                 0 => {
+                    // Release edge: a momentary chord that stops matching
+                    // flips off (toggles/sounds are press-only by design).
+                    let held_vec: Vec<u16> = held.iter().copied().collect();
+                    let before: Vec<HotkeyTarget> = manager
+                        .lock()
+                        .map(|mgr| mgr.match_held(&held_vec))
+                        .unwrap_or_default();
                     held.remove(&code);
+                    let held_vec: Vec<u16> = held.iter().copied().collect();
+                    if let Ok(mgr) = manager.lock() {
+                        let after = mgr.match_held(&held_vec);
+                        for target in before {
+                            if is_momentary(&target) && !after.contains(&target) {
+                                on_edge(target, false);
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod hotkey_tests {
+    use super::*;
+
+    fn bind(codes: &[u16], target: HotkeyTarget) -> Keybind {
+        Keybind { codes: codes.to_vec(), target, enabled: true }
+    }
+
+    #[test]
+    fn momentary_classification() {
+        assert!(is_momentary(&HotkeyTarget::PushToTalk));
+        assert!(is_momentary(&HotkeyTarget::PushToMute));
+        assert!(!is_momentary(&HotkeyTarget::ToggleMute));
+        assert!(!is_momentary(&HotkeyTarget::StopAllSounds));
+    }
+
+    #[test]
+    fn match_held_needs_full_chord_and_enabled() {
+        let mut mgr = HotkeyManager::new();
+        mgr.add(bind(&[29, 42], HotkeyTarget::PushToTalk));
+        let mut off = bind(&[56], HotkeyTarget::ToggleMute);
+        off.enabled = false;
+        mgr.add(off);
+        assert_eq!(mgr.match_held(&[29, 42]), vec![HotkeyTarget::PushToTalk]);
+        assert_eq!(mgr.match_held(&[29]), Vec::new(), "partial chord must not fire");
+        assert_eq!(mgr.match_held(&[56]), Vec::new(), "disabled bind must not fire");
+        // Extra held keys don't break the chord.
+        assert_eq!(mgr.match_held(&[29, 42, 56]), vec![HotkeyTarget::PushToTalk]);
+    }
+
+    #[test]
+    fn export_import_keeps_ids_stable() {
+        let mut mgr = HotkeyManager::new();
+        let a = mgr.add(bind(&[29], HotkeyTarget::PushToTalk));
+        let b = mgr.add(bind(&[56], HotkeyTarget::ToggleMute));
+        mgr.remove(a);
+        let exported = mgr.export();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].id, b);
+        // Fresh manager resumes past the highest id (no reuse).
+        let mut mgr2 = HotkeyManager::new();
+        mgr2.import(exported);
+        let c = mgr2.add(bind(&[57], HotkeyTarget::StopAllSounds));
+        assert!(c > b, "ids must not be reused after import");
+        assert_eq!(mgr2.list().len(), 2);
+    }
+
+    #[test]
+    fn config_roundtrip_and_version_gate() {
+        let mut mgr = HotkeyManager::new();
+        mgr.add(bind(&[29, 42], HotkeyTarget::PushToTalk));
+        mgr.add(bind(&[56], HotkeyTarget::SelectVoice("mic-npr-voice".into())));
+        let text = save_config(&mgr.export());
+        let back = load_config(&text).expect("roundtrip");
+        assert_eq!(back.len(), 2);
+        assert!(matches!(back[0].bind.target, HotkeyTarget::PushToTalk));
+        // Wrong version fails closed.
+        let bad = text.replace("\"version\": 1", "\"version\": 99");
+        assert!(load_config(&bad).is_err());
+        // Garbage fails with a clear error, never an empty store.
+        assert!(load_config("not json").is_err());
+        // Unknown target fails (typo must not boot as another action).
+        assert!(load_config(r#"{"version":1,"hotkeys":[{"id":0,"bind":{"codes":[29],"target":"Frobnicator","enabled":true}}]}"#).is_err());
+    }
+
+    #[test]
+    fn validate_bind_rejects_nonsense() {
+        assert!(validate_bind(&bind(&[29], HotkeyTarget::PushToTalk)).is_ok());
+        assert!(validate_bind(&bind(&[], HotkeyTarget::PushToTalk)).is_err());
+        assert!(validate_bind(&bind(&[0x300], HotkeyTarget::PushToTalk)).is_err());
+        assert!(validate_bind(&bind(&[29], HotkeyTarget::SelectVoice(String::new()))).is_err());
+        assert!(validate_bind(&bind(&[29; 9], HotkeyTarget::PushToTalk)).is_err());
+    }
+
+    #[test]
+    fn sandbox_note_absent_outside_flatpak() {
+        // CI/dev machines are not sandboxed; the Flatpak branch is
+        // covered by inspection (FLATPAK_ID env / /.flatpak-info check).
+        if std::env::var("FLATPAK_ID").is_err()
+            && !std::path::Path::new("/.flatpak-info").exists()
+        {
+            assert!(sandbox_note().is_none());
+        }
+    }
+
+    #[test]
+    fn addhotkey_wire_shape_parses() {
+        use crate::actions::{Action, ControlMessage};
+        // Unit target: bare string.
+        let msg: ControlMessage = serde_json::from_str(
+            r#"{"action":"addHotkey","codes":[29,42],"target":"PushToTalk","enabled":true,"id":7}"#,
+        )
+        .expect("unit target parses");
+        assert_eq!(
+            msg.action,
+            Action::AddHotkey {
+                codes: vec![29, 42],
+                target: HotkeyTarget::PushToTalk,
+                enabled: true,
+            }
+        );
+        assert_eq!(msg.id, Some(serde_json::json!(7)));
+        // Data target: externally-tagged map.
+        let msg: ControlMessage = serde_json::from_str(
+            r#"{"action":"addHotkey","codes":[56],"target":{"SelectVoice":"mic-npr-voice"},"enabled":true}"#,
+        )
+        .expect("data target parses");
+        assert!(matches!(
+            msg.action,
+            Action::AddHotkey { target: HotkeyTarget::SelectVoice(_), .. }
+        ));
+        // Unknown target fails at parse (never boots as another action).
+        assert!(serde_json::from_str::<ControlMessage>(
+            r#"{"action":"addHotkey","codes":[29],"target":"Frobnicator","enabled":true}"#
+        )
+        .is_err());
+        // removeHotkey's bind id must NOT collide with the request
+        // correlation id (a strict client always sends both).
+        let msg: ControlMessage = serde_json::from_str(
+            r#"{"action":"removeHotkey","hotkey_id":0,"id":6}"#,
+        )
+        .expect("bind id and request id coexist");
+        assert_eq!(msg.action, Action::RemoveHotkey { hotkey_id: 0 });
+        assert_eq!(msg.id, Some(serde_json::json!(6)));
     }
 }

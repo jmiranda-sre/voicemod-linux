@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::hotkeys::HotkeyTarget;
+
 /// Full action catalogue (Fase 2 ③ inventory, extended in Fase 3b).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "camelCase")]
@@ -22,6 +24,14 @@ pub enum Action {
     StartAudioStreaming,
     GetAudioStreamStatus,
     GetHealth,
+    /// Register a hotkey bind. `target` uses the [`HotkeyTarget`] shape,
+    /// e.g. `"ToggleMute"` or `{"SelectVoice": "mic-npr-voice"}`.
+    AddHotkey { codes: Vec<u16>, target: HotkeyTarget, enabled: bool },
+    RemoveHotkey { hotkey_id: u32 },
+    ListHotkeys,
+    /// Master mute (momentary PTM rides on this; output goes silent
+    /// while the DSP state stays live).
+    SetMuted { muted: bool },
     GetBitmap { resource: String },
     SetSoundboardMasterVolume { per_mille: u16 },
     SelectInput { uid: String },
@@ -73,6 +83,7 @@ pub enum ControlEvent {
     SoundStarted { sound: String },
     SoundStopped { sound: String },
     VoiceChangerToggled { enabled: bool },
+    MutedChanged { muted: bool },
     StreamStatus { active: bool },
     DevicesChanged,
 }
@@ -82,4 +93,55 @@ pub enum ControlEvent {
 /// never block on the RT path (use `try_lock`, report contention).
 pub trait ControlHandler: Send + Sync {
     fn handle(&self, action: &Action) -> (ControlReply, Vec<ControlEvent>);
+}
+
+#[cfg(test)]
+mod action_shape_tests {
+    use super::*;
+    use crate::hotkeys::HotkeyTarget;
+
+    /// No action field may be named `id` or `token`: `ControlMessage`
+    /// flattens the action alongside its own correlation `id` / auth
+    /// `token`, and serde gives the outer fields priority — an action
+    /// field with the same name would silently vanish on parse
+    /// (removeHotkey did exactly this; now covered forever).
+    #[test]
+    fn no_action_field_collides_with_envelope() {
+        let all = vec![
+            Action::SelectVoice { voice: String::new() },
+            Action::ToggleVoiceChanger { enabled: true },
+            Action::StopAllSounds,
+            Action::PlaySound { sound: String::new() },
+            Action::GetAllSoundboard,
+            Action::SetVoiceParameter { param: String::new(), value: serde_json::Value::Null },
+            Action::ResetVoiceParameters,
+            Action::SetDefaultMicrophone { uid: String::new() },
+            Action::GetAudioDevices,
+            Action::GetUserLicense,
+            Action::FadeSound { sound: String::new(), fade_out_secs: 0.0 },
+            Action::StartAudioStreaming,
+            Action::GetAudioStreamStatus,
+            Action::GetHealth,
+            Action::GetBitmap { resource: String::new() },
+            Action::SetSoundboardMasterVolume { per_mille: 0 },
+            Action::SelectInput { uid: String::new() },
+            Action::AddHotkey {
+                codes: vec![],
+                target: HotkeyTarget::PushToTalk,
+                enabled: true,
+            },
+            Action::RemoveHotkey { hotkey_id: 0 },
+            Action::ListHotkeys,
+            Action::SetMuted { muted: false },
+        ];
+        assert_eq!(all.len(), 21, "keep this list in sync with the catalogue");
+        for a in &all {
+            let o = serde_json::to_value(a).unwrap();
+            let o = o.as_object().unwrap();
+            assert!(
+                !o.contains_key("id") && !o.contains_key("token"),
+                "envelope collision in {a:?}"
+            );
+        }
+    }
 }
