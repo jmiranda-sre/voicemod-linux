@@ -181,11 +181,17 @@ events. Replies echo an optional request `id` for strict correlation:
 Actions: `selectVoice`, `toggleVoiceChanger`, `stopAllSounds`, `playSound`,
 `getAllSoundboard`, `setVoiceParameter`, `resetVoiceParameters`,
 `setDefaultMicrophone`, `getAudioDevices`, `getUserLicense`, `fadeSound`,
-`startAudioStreaming`, `getAudioStreamStatus`, `getBitmap`,
-`setSoundboardMasterVolume`, `selectInput`.
+`startAudioStreaming`, `getAudioStreamStatus`, `getHealth`, `addHotkey`,
+`removeHotkey`, `listHotkeys`, `setMuted`, `getVoices`, `getBitmap`,
+`setSoundboardMasterVolume`, `selectInput` (22 total — `vm actions`).
 
 Events: `voiceChanged`, `voiceParameterChanged`, `soundStarted`,
-`soundStopped`, `voiceChangerToggled`, `streamStatus`.
+`soundStopped`, `voiceChangerToggled`, `mutedChanged`, `streamStatus`,
+`devicesChanged`.
+
+Hardware buttons (Stream Deck / Bitfocus Companion) speak this API
+directly — action map, payload examples and a module sketch live in
+[`docs/streamdeck-companion.md`](docs/streamdeck-companion.md).
 
 Auth is opt-in: set `VM_CONTROL_TOKEN` before starting the daemon and send
 `"token"` alongside each message. Without it the API trusts the loopback

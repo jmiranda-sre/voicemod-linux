@@ -422,8 +422,18 @@ impl ControlHandler for DaemonState {
                 }
             }
             Action::StopAllSounds => {
+                // Snapshot the playing ids first: SoundStopped per sound
+                // keeps physical buttons in sync (the enum existed since
+                // Fase 3b but nothing ever emitted it).
+                let playing = self.mixer.lock().unwrap().playing();
                 self.mixer.lock().unwrap().stop_all();
-                (ControlReply::ok(), Vec::new())
+                let map = self.sound_ids.lock().unwrap();
+                let evts = playing
+                    .into_iter()
+                    .filter_map(|id| map.iter().find_map(|(n, i)| (*i == id).then(|| n.clone())))
+                    .map(|sound| ControlEvent::SoundStopped { sound })
+                    .collect();
+                (ControlReply::ok(), evts)
             }
             Action::FadeSound { sound, fade_out_secs } => {
                 let id = {
@@ -610,9 +620,31 @@ impl ControlHandler for DaemonState {
                             "lastRestartUnix": wd.last_restart_unix,
                             "consecutiveFailures": wd.consecutive_failures,
                         },
+                        // Button-init snapshot: a freshly connected client
+                        // learns changer + mute state without toggling.
+                        "enabled": self.voice_enabled.load(Ordering::Relaxed),
+                        "muted": self.muted.load(Ordering::Relaxed),
                     })),
                     Vec::new(),
                 )
+            }
+            Action::GetVoices => {
+                let mut voices: Vec<String> = std::fs::read_dir(&self.preset_dir)
+                    .map(|entries| {
+                        entries
+                            .filter_map(|e| e.ok())
+                            .map(|e| e.path())
+                            .filter(|p| {
+                                p.extension().and_then(|x| x.to_str()) == Some("json")
+                            })
+                            .filter_map(|p| {
+                                p.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                voices.sort();
+                (ControlReply::ok_data(serde_json::json!({ "voices": voices })), Vec::new())
             }
             Action::GetAudioDevices => {
                 let mut audio = self.audio.lock().unwrap();
@@ -1158,9 +1190,40 @@ mod tests {
         // Unknown sound errors.
         let (reply, _) = state.handle(&Action::PlaySound { sound: "nope".into() });
         assert!(!reply.ok);
-        // stopAll on empty is fine.
-        let (reply, _) = state.handle(&Action::StopAllSounds);
+        // stopAll on empty is fine (and emits nothing).
+        let (reply, evts) = state.handle(&Action::StopAllSounds);
         assert!(reply.ok);
+        assert!(evts.is_empty());
+    }
+
+    #[test]
+    fn stop_all_sounds_emits_per_sound_events() {
+        let state = test_state();
+        load_test_sound(&state, "blip");
+        let (reply, _) = state.handle(&Action::PlaySound { sound: "blip".into() });
+        assert!(reply.ok);
+        let (reply, evts) = state.handle(&Action::StopAllSounds);
+        assert!(reply.ok, "{:?}", reply.error);
+        assert_eq!(evts.len(), 1);
+        assert!(matches!(&evts[0], ControlEvent::SoundStopped { sound } if sound == "blip"));
+        assert!(state.mixer.lock().unwrap().playing().is_empty());
+    }
+
+    #[test]
+    fn get_voices_lists_preset_dir() {
+        let state = test_state();
+        // test_state seeds example-drive.json only.
+        let (reply, _) = state.handle(&Action::GetVoices);
+        assert!(reply.ok, "{:?}", reply.error);
+        assert_eq!(reply.data.unwrap()["voices"], serde_json::json!(["example-drive"]));
+        // Sorted stems, json extension only.
+        std::fs::write(state.preset_dir.join("mic-npr-voice.json"), "{}").unwrap();
+        std::fs::write(state.preset_dir.join("notes.txt"), "x").unwrap();
+        let (reply, _) = state.handle(&Action::GetVoices);
+        assert_eq!(
+            reply.data.unwrap()["voices"],
+            serde_json::json!(["example-drive", "mic-npr-voice"])
+        );
     }
 
     #[test]
@@ -1287,6 +1350,9 @@ mod health_tests {
         // Stream blocks present even on the stub (all zeros).
         assert_eq!(data["capture"]["xruns"], 0);
         assert_eq!(data["watchdog"]["restarts"], 0);
+        // Button-init snapshot: changer + mute state without toggling.
+        assert_eq!(data["enabled"], true);
+        assert_eq!(data["muted"], false);
     }
 
     #[test]
@@ -1742,5 +1808,119 @@ mod widget_matrix_tests {
             value: serde_json::json!(1.5),
         });
         assert!(!reply.ok);
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+
+    /// Full bidirectional loop over a real socket with the real daemon
+    /// handler: action in, reply + broadcast event out. This is the exact
+    /// flow a Stream Deck / Companion module drives.
+    #[tokio::test]
+    async fn websocket_control_and_feedback_loop() {
+        let state = test_state();
+        let server = ControlApiServer::new(
+            ServerConfig {
+                bind: "127.0.0.1".parse().unwrap(),
+                ports: vec![18780, 18781, 18782],
+                require_auth: false,
+                expected_token: None,
+            },
+            state.clone(),
+        );
+        let port = server.serve().await.expect("serve");
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+                .await
+                .expect("connect");
+
+        async fn roundtrip(
+            ws: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            text: &str,
+            id: u64,
+        ) -> (serde_json::Value, Vec<serde_json::Value>) {
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(text.into()))
+                .await
+                .expect("send");
+            let mut evts = Vec::new();
+            let reply = loop {
+                let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+                    .await
+                    .expect("reply timeout")
+                    .expect("stream")
+                    .expect("msg");
+                let v: serde_json::Value =
+                    serde_json::from_str(msg.to_text().unwrap()).unwrap();
+                if v.get("event").is_some() {
+                    evts.push(v);
+                    continue;
+                }
+                assert_eq!(v["id"], id, "reply echoes the request id");
+                break v;
+            };
+            // Broadcasts fan out through a channel, so they land after
+            // the direct reply: drain everything still in flight.
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_millis(500), ws.next()).await
+                {
+                    Ok(Some(Ok(msg))) => {
+                        let v: serde_json::Value =
+                            serde_json::from_str(msg.to_text().unwrap()).unwrap();
+                        if v.get("event").is_some() {
+                            evts.push(v);
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            (reply, evts)
+        }
+
+        // selectVoice -> ok + voiceChanged broadcast.
+        let (reply, evts) = roundtrip(
+            &mut ws,
+            r#"{"action":"selectVoice","voice":"example-drive","id":1}"#,
+            1,
+        )
+        .await;
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(evts.len(), 1);
+        assert_eq!(evts[0]["event"], "voiceChanged");
+        assert_eq!(evts[0]["voice"], "example-drive");
+
+        // setMuted -> ok + mutedChanged broadcast (button lights up).
+        let (reply, evts) = roundtrip(&mut ws, r#"{"action":"setMuted","muted":true,"id":2}"#, 2).await;
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(evts.len(), 1);
+        assert_eq!(evts[0]["event"], "mutedChanged");
+        assert_eq!(evts[0]["muted"], true);
+
+        // toggleVoiceChanger -> ok + voiceChangerToggled broadcast.
+        let (reply, evts) = roundtrip(
+            &mut ws,
+            r#"{"action":"toggleVoiceChanger","enabled":false,"id":3}"#,
+            3,
+        )
+        .await;
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(evts.len(), 1);
+        assert_eq!(evts[0]["event"], "voiceChangerToggled");
+
+        // getHealth reflects the muted/toggled state (button init).
+        let (reply, _) = roundtrip(&mut ws, r#"{"action":"getHealth","id":4}"#, 4).await;
+        assert_eq!(reply["data"]["muted"], true);
+        assert_eq!(reply["data"]["enabled"], false);
+        assert_eq!(reply["data"]["voice"], "example-drive");
+
+        // getVoices lists the seeded preset.
+        let (reply, _) = roundtrip(&mut ws, r#"{"action":"getVoices","id":5}"#, 5).await;
+        assert_eq!(reply["data"]["voices"], serde_json::json!(["example-drive"]));
+
+        ws.close(None).await.ok();
     }
 }

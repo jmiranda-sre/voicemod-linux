@@ -32,6 +32,9 @@ pub enum Action {
     /// Master mute (momentary PTM rides on this; output goes silent
     /// while the DSP state stays live).
     SetMuted { muted: bool },
+    /// List loadable voice preset names (sorted stems of
+    /// `$VM_CONFIG_DIR/presets/*.json`) — feeds Companion dropdowns.
+    GetVoices,
     GetBitmap { resource: String },
     SetSoundboardMasterVolume { per_mille: u16 },
     SelectInput { uid: String },
@@ -133,8 +136,9 @@ mod action_shape_tests {
             Action::RemoveHotkey { hotkey_id: 0 },
             Action::ListHotkeys,
             Action::SetMuted { muted: false },
+            Action::GetVoices,
         ];
-        assert_eq!(all.len(), 21, "keep this list in sync with the catalogue");
+        assert_eq!(all.len(), 22, "keep this list in sync with the catalogue");
         for a in &all {
             let o = serde_json::to_value(a).unwrap();
             let o = o.as_object().unwrap();

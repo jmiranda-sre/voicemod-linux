@@ -106,6 +106,7 @@ async fn main() {
                 "removeHotkey",
                 "listHotkeys",
                 "setMuted",
+                "getVoices",
                 "getBitmap",
                 "setSoundboardMasterVolume",
                 "selectInput",

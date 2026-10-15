@@ -6,6 +6,21 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added (F-8: Stream Deck / Companion surface)
+
+- `GetVoices` action (sorted preset stems for Companion dropdowns).
+- `GetHealth` now also returns `enabled` + `muted`: a freshly connected
+  client initialises all button states without toggling anything.
+- `StopAllSounds` emits `SoundStopped` per playing sound (the event
+  existed since Fase 3b but nothing ever emitted it).
+- `docs/streamdeck-companion.md`: action map, event→button-state table,
+  payload examples, Companion module sketch, reconnect guidance.
+- E2E test replays the Companion loop over a real socket
+  (select → voiceChanged, mute → mutedChanged, toggle → event, health
+  snapshot, voices list) with strict id correlation.
+- Anti-collision test now covers all 22 actions (envelope `id`/`token`
+  can never be shadowed by an action field again).
+
 ### Added (F-B: hotkeys, PTT/mute, persistence)
 
 - Control API: `addHotkey{codes,target,enabled}` (validated: 1–8 codes

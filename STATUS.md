@@ -649,6 +649,19 @@ abaixo são o plano proposto p/ aprovação.
   reload pós-"reboot" (ids 0,1 → próximo 2), quarentena, mute
   bit-exato + evento, matriz de bordas, formato JSON no fio.
 
+### F-8 — FECHADA (Stream Deck / Companion) — 2026-10-15
+- `GetVoices` (stems ordenados p/ dropdowns); `GetHealth` += `enabled` +
+  `muted` (init de botões sem togglar); `StopAllSounds` emite
+  `SoundStopped` por som tocando (evento existia desde a Fase 3b, nunca
+  emitido); `vm actions` = 22.
+- `docs/streamdeck-companion.md`: mapa ação→botão, tabela evento→estado,
+  exemplos de payload, sketch de módulo Companion, sessão de exemplo;
+  README linka o doc e as listas de ações/eventos foram atualizadas
+  (estavam defasadas desde a F-A/F-B).
+- Testes: E2E socket real c/ handler real (select→voiceChanged,
+  mute→mutedChanged, toggle→evento, health, voices, ids estritos);
+  anti-colisão 22/22 ações.
+
 ### Ordem de execução sugerida (com motivo)
 1. **(11) Dashboard de saúde RT + watchdog** — PRIMEIRO porque é a
    instrumentação que todos os outros usam p/ se validar (xruns, CPU/nó,
