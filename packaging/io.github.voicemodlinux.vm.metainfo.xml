@@ -29,6 +29,13 @@
   </developer>
   <url type="homepage">https://github.com/jmiranda-sre/voicemod-linux</url>
   <releases>
+    <release version="0.2.0" date="2026-10-15">
+      <description>
+        <p>Ready-to-use factory mic preset (mic-npr-voice) seeded on first
+        boot: noise reduction, gate, 5-band EQ, compressor, de-esser and
+        limiter, with new real-time DSP nodes for each stage.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-10-15">
       <description>
         <p>First public release: real-time DSP voice effects, multi-format

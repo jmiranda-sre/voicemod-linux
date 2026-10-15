@@ -36,10 +36,10 @@
         {
           "type": "git",
           "url": "https://github.com/jmiranda-sre/voicemod-linux.git",
-          "tag": "v0.1.0",
+          "tag": "v0.2.0",
           "x-checker-data": {
             "type": "json",
-            "url": "https://api.github.com/repos/voicemodlinux/app/releases/latest",
+            "url": "https://api.github.com/repos/jmiranda-sre/voicemod-linux/releases/latest",
             "tag-attr": "tag_name",
             "version-attr": "tag_name"
           }
