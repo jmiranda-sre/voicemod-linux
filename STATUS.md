@@ -485,3 +485,23 @@ Publicação:
 11. CI: matrix de build + publish AppImage no release.
 12. pacman ≥7.1: revalidar pkgver local quando a regressão for corrigida
     (remover nota do PKGBUILD se o upstream consertar).
+
+## PUBLICADO — v0.1.0 no ar (2026-10-15)
+- Autenticação: `gh auth login` (HTTPS + credential helper do gh) como
+  **jmiranda-sre**; sem chave SSH na máquina (rota SSH abandonada).
+- Org `voicemodlinux` NÃO existe e usuário não pertence a nenhuma org →
+  repo criado na conta pessoal: **github.com/jmiranda-sre/voicemod-linux**
+  (público). ID canônico do Flatpak (`io.github.voicemodlinux.vm`) mantido;
+  se no futuro criar a org, transfer mantém redirects e só as referências
+  de URL precisam ser atualizadas.
+- URLs trocadas em 7 arquivos (CHANGELOG/RELEASE/STATUS/PKGBUILD/flatpak
+  manifest/metainfo/systemd unit) — metainfo passa a validar 100%
+  (appstreamcli ✔ sem avisos; antes só avisava URL inexistente).
+- Commit de release re-amendado (6c5955c) + tag v0.1.0 recriada;
+  push main + tag OK (`git ls-remote --tags origin` confirma).
+- Release criada: github.com/jmiranda-sre/voicemod-linux/releases/tag/v0.1.0
+  (não-draft, não-prerelease) com VoicemodLinux-0.1.0-x86_64.AppImage
+  (16.431.608 bytes) anexado + notas do CHANGELOG.
+- Próximo (do usuário): PR no Flathub (manifest pronto, tag resolve),
+  AUR (PKGBUILD pronto, .SRCINFO com MAKEPKG_LINT_PKGBUILD=0),
+  Issue tracker para o backlog do STATUS.md.
