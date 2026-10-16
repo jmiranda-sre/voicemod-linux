@@ -6,6 +6,36 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added (F-0.4.A: new-generation DSP)
+
+- `rnnoise` node: Xiph RNNoise denoiser via the pure-Rust
+  `nnnoiseless` port — weights embedded (no files, no downloads),
+  exact 10 ms frames, `mix` param. The neural alternative to the
+  spectral `denoise`; the shipped `mic-npr-voice` keeps the spectral
+  node (faithful to its EasyEffects reference).
+- `deepfilter` node (opt-in `neural` cargo feature): DeepFilterNet3
+  runtime over ONNX bundles via tract — ERB masking + complex deep
+  filtering, hyperparameters read from the bundle's own `config.ini`,
+  fail-loud on missing/corrupt models, pass-through without one
+  (20 ms latency).
+- `autogain` node: EBU R128 loudness rider (libebur128 K-weighting,
+  400 ms gated blocks, dB follower) — `target_lufs`, `max_gain_db`,
+  `adapt_ms`; zero latency; freezes on silence instead of winding up.
+- `autotune` node: YIN pitch detection + phase-vocoder correction —
+  `key`, `scale` (major/minor/chromatic), `mix`, `speed_ms`; hard
+  T-Pain snap or gentle nudge through the same engine as `pitch-fft`.
+- `convolver` node: uniform partitioned convolution (1024-sample
+  partitions, exact 21 ms wet delay) against WAV IRs (PCM16/24/32,
+  float32; any rate; 4 s cap) — `ir_path`, `mix`.
+- Control-plane node preparation (`AudioNode::prepare`): the graph
+  builder reports the real lane count at selectVoice, so the
+  DeepFilter sessions (ONNX parse + tract plan + warm-up) are built
+  off the RT thread — live-measured first-hop worst case drops from
+  ~81 ms to ~5 ms (avg ~3.4 ms per 20 ms quantum).
+- Preset schema knows all five types; daemon E2E covers
+  preset→selectVoice→audio for each, plus a `KNOWN_NODE_TYPES` ↔
+  factory drift guard. Clippy clean on both feature sets.
+
 ### Added (F-0.4.D: full CLI + device profiles)
 
 - `vm call '<action-json>'`: 100% of the Control API from shell

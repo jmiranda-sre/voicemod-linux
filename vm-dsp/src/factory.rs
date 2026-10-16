@@ -37,10 +37,16 @@ impl NodeFactory {
         name: &str,
         ctx: &NodeConstructorContext,
     ) -> Result<Box<dyn AudioNode>, String> {
-        self.items
-            .get(name)
-            .map(|ctor| ctor(ctx))
-            .ok_or_else(|| format!("unknown node type: {name}"))
+        if let Some(ctor) = self.items.get(name) {
+            return Ok(ctor(ctx));
+        }
+        #[cfg(not(feature = "neural"))]
+        if name == "deepfilter" {
+            return Err(
+                "deepfilter needs the 'neural' cargo feature (DeepFilterNet runtime)".into(),
+            );
+        }
+        Err(format!("unknown node type: {name}"))
     }
 
     pub fn names(&self) -> Vec<&'static str> {
@@ -72,5 +78,16 @@ pub fn mvp_factory() -> NodeFactory {
     f.register("limiter", |_| Box::new(super::dynamics::Limiter::default()));
     f.register("de-esser", |_| Box::new(super::dynamics::DeEsser::default()));
     f.register("denoise", |_| Box::new(super::denoise::Denoise::default()));
+    // Neural section (F-0.4.A): RNNoise always available (weights
+    // embedded); DeepFilterNet lives behind the `neural` feature.
+    f.register("rnnoise", |_| Box::new(super::neural::Rnnoise::new()));
+    #[cfg(feature = "neural")]
+    f.register("deepfilter", |_| Box::new(super::deepfilter::DeepFilter::new()));
+    // Broadcast section (F-0.4.A): loudness leveling.
+    f.register("autogain", |_| Box::new(super::broadcast::Autogain::default()));
+    // Musical section (F-0.4.A): pitch correction.
+    f.register("autotune", |_| Box::new(super::musical::Autotune::default()));
+    // Room section (F-0.4.A): convolution reverb.
+    f.register("convolver", |_| Box::new(super::room::Convolver::default()));
     f
 }

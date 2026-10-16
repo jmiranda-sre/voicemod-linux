@@ -44,6 +44,14 @@ pub trait AudioNode: Send {
     fn name(&self) -> &'static str;
     fn process(&mut self, ctx: &ProcessContext, inputs: &[&[f32]], outputs: &mut [&mut [f32]]);
     fn set_param(&mut self, name: &str, value: ParamValue) -> Result<(), ParamError>;
+    /// Control-plane preparation hint: the graph builder reports the
+    /// lane count the chain will run with, so per-channel resources
+    /// (model sessions, large buffers) are built here — before the
+    /// graph goes live, never on the RT thread. Errors abort the voice
+    /// switch (fail-loud on the control plane).
+    fn prepare(&mut self, _channels: usize) -> Result<(), ParamError> {
+        Ok(())
+    }
     /// Read back a live value (calibration capture, e.g. a denoise
     /// noise profile). Default is "no readable params" — nodes opt in.
     fn get_param(&self, _name: &str) -> Option<ParamValue> {

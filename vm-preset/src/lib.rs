@@ -132,6 +132,11 @@ pub const KNOWN_NODE_TYPES: &[&str] = &[
     "limiter",
     "de-esser",
     "denoise",
+    "rnnoise",
+    "deepfilter",
+    "autogain",
+    "autotune",
+    "convolver",
 ];
 
 /// Parse + validate a preset. Validation mirrors loader strictness:

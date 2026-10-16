@@ -16,6 +16,12 @@ cargo test --workspace            # 104/104 on v0.3.0
 cargo build --release
 appstreamcli validate packaging/io.github.voicemodlinux.vm.metainfo.xml
 
+# Optional: neural DeepFilterNet variant (opt-in feature; sharpens the
+# AppImage only if shipped — the default build keeps `deepfilter` off
+# with a clear error at preset load):
+cargo build --release -p vm-daemon --features vm-dsp/neural
+
+
 # 1. Version bump (workspace Cargo.toml + Flatpak tag + metainfo entry;
 #    PKGBUILD derives pkgver from `git describe`, no edit needed):
 #    - Cargo.toml: version = "X.Y.Z"

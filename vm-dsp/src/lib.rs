@@ -14,7 +14,13 @@
 //! here is N-channel native.
 
 pub mod buffer;
+pub mod broadcast;
 pub mod denoise;
+#[cfg(feature = "neural")]
+pub mod deepfilter;
+pub mod musical;
+pub mod neural;
+pub mod room;
 pub mod dynamics;
 pub mod factory;
 pub mod graph;

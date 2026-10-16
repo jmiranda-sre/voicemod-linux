@@ -824,7 +824,7 @@ E2E. Teste F-3 de `strength` agora lê o valor do preset embarcado
 (nunca mais hardcoded). Seed avisa no boot quando o arquivo difere
 da fábrica (nunca sobrescreve): deletar o arquivo recebe a update.
 
-## v0.4.0 — ROADMAP APROVADO (planejamento, 2026-10-16 — SEM CÓDIGO)
+## v0.4.0 — ROADMAP APROVADO (planejamento, 2026-10-16)
 14 itens do brainstorm em 4 pilares → 4 frentes. Ordem sugerida:
 **D → A → C → B** (infra de automação primeiro p/ testar o resto;
 DSP pesado em seguida; roteamento; UX coroa o ciclo; itens do B são
@@ -834,12 +834,28 @@ paralelizáveis a qualquer momento).
 - Item 42: CLI 100% da Control API (base p/ scripts/testes de tudo).
 - Item 45: perfis por dispositivo físico (cadeia por mic, troca no plug).
 
-### F-0.4.A — DSP de nova geração (Pilar 1)
-- Item 2: denoisers neurais ONNX (RNNoise/DeepFilterNet locais,
-  selecionáveis; espectral vira fallback).
-- Item 8: autogain EBU R128 (alimenta o wizard do B).
-- Item 3: autotune key+escala (sobre o phase-vocoder).
-- Item 5: convolver com IRs (salas/cabinets).
+### F-0.4.A — FECHADA (DSP de nova geração) — 2026-10-16
+- Item 2: `rnnoise` (nnnoiseless, pesos embutidos, `mix`, 10 ms) sempre
+  disponível + `deepfilter` (DF3 ONNX via tract) atrás da feature
+  `neural`: bundle do usuário (dir/.tar.gz), hiperparâmetros lidos do
+  `config.ini` do modelo, falha alto sem modelo, passthrough sem
+  `model_path`.
+- Item 8: `autogain` EBU R128 (K-weighting libebur128, blocos 400 ms
+  com gate absoluto+relativo, follower em dB, freeze em silêncio;
+  0 latência; `target_lufs`/`max_gain_db`/`adapt_ms`).
+- Item 3: `autotune` YIN + phase-vocoder (`key`/`scale`/`mix`/
+  `speed_ms`; chromatic ou maior/menor; 43 ms; nota em escala intacta).
+- Item 5: `convolver` particionado uniforme (1024 amostras, 21 ms de
+  wet exato, IR WAV PCM16/24/32/f32 de qualquer rate, cap 4 s,
+  normaliza pico).
+- Integração: E2E do daemon `f04a` (autogain lift ×2–12, autotune
+  audível, rnnoise <0.3×, tap de IR a 1 s ecoa com gap exatamente
+  zero, deepfilter falha alto sem modelo) + guarda anti-drift
+  `KNOWN_NODE_TYPES` ↔ factory; params Text/Int provados ponta a ponta.
+- Suíte: 131 testes workspace, clippy zero (default e `neural`);
+  teste ERB-only do DF3 reescrito com barras medidas (warm-up rosa p/
+  lsnr em faixa; DF desligado via `df_thresh=-15`; ratio ≈0.42).
+- Docs: README (seção "Studio-grade DSP nodes" + tabela), CHANGELOG.
 
 ### F-0.4.C — Roteamento e integrações (Pilar 3)
 - Item 15: monitor mix independente (hear-myself sem atraso).

@@ -161,8 +161,9 @@ Runtime data lives in `$VM_CONFIG_DIR` (default `~/.config/vm`):
 ~/.config/vm/presets/*.json     # voice presets (nodes: gain, biquad, delay,
                                 # pitch-fft, formant-pitch-shifter, reverb,
                                 # tube, oscillator, mute, mix…, plus the mic
-                                # section: denoise, gate, compressor,
-                                # de-esser, limiter)
+                                # section: denoise, rnnoise, deepfilter,
+                                # gate, compressor, de-esser, limiter,
+                                # autogain, autotune, convolver)
 ~/.config/vm/sounds/            # .ogg (Opus), .wav — used by the soundboard
 ```
 
@@ -199,10 +200,13 @@ The chain is a clean-room port of the popular EasyEffects *Masc NPR Voice
 | Sibilance | De-esser 4 kHz, −22 dB, 3:1 | `de-esser` |
 | Safety ceiling | Limiter −1.5 dB | `limiter` |
 
-Differences worth knowing: our denoiser is spectral (not neural), so it
-costs ~21 ms of latency and needs about a second to learn the room; the
-EasyEffects `wet`/`dry`/`lookahead` options are not modeled (our limiter
-is lookahead-free with instant attack).
+Differences worth knowing: the shipped chain keeps the spectral
+denoiser (portable, zero model files) — the neural `rnnoise` and
+`deepfilter` nodes are now drop-in alternatives (see *Studio-grade DSP
+nodes* below). The spectral denoiser costs ~21 ms of latency and needs
+about a second to learn the room; the EasyEffects `wet`/`dry`/`lookahead`
+options are not modeled (our limiter is lookahead-free with instant
+attack).
 
 Once the room is learned, snapshot it into the preset with
 `{"action":"captureNoiseProfile","node":"denoise"}` — the `profile`
@@ -217,6 +221,42 @@ a switch drops live channel state while carrying the learned floor
 across (re-capture the profile afterwards anyway for the exact room).
 The *Health* tab proves the gain: per-node `lat ms` plus the chain
 total, next to the µs CPU cost.
+
+### Studio-grade DSP nodes
+
+v0.4.0 adds five new-generation nodes to the factory — write them into
+any preset (`vm check-preset` validates first):
+
+| Node | Role | Params | Latency |
+| --- | --- | --- | --- |
+| `rnnoise` | Xiph RNNoise neural denoiser (pure-Rust `nnnoiseless`; weights embedded — no files, no downloads) | `mix` | 10 ms |
+| `deepfilter` | DeepFilterNet3 (ONNX via tract) over user-supplied model bundles | `model_path`, `atten_db`, `erb_thresh`, `df_thresh`, `postfilter_beta`, `mix` | 20 ms |
+| `autogain` | EBU R128 loudness rider — whispers come up, shouts come down, silence stays frozen | `target_lufs` (−40..−10), `max_gain_db`, `adapt_ms` | 0 |
+| `autotune` | Real-time pitch correction (YIN + phase-vocoder): hard T-Pain snap or gentle nudge | `key`, `scale` (major/minor/chromatic), `mix`, `speed_ms` | 43 ms |
+| `convolver` | True convolution reverb from any WAV impulse response (rooms, cabinets) | `ir_path`, `mix` | 21 ms |
+
+Swap RNNoise into your copy of `mic-npr-voice.json` (replace the
+`denoise` node with
+`{"id":"rn","type":"rnnoise","params":{"mix":{"value":1.0}}}` and drop
+`strength`/`reduction_db`/`profile`) for a file-free neural chain.
+
+`deepfilter` is opt-in twice over: build the binaries with the feature,
+and point the node at a DeepFilterNet3 bundle (a directory or `.tar.gz`
+with `enc.onnx`, `erb_dec.onnx`, `df_dec.onnx` and `config.ini` — e.g.
+from the `deepfilternet3-onnx` release). Hyperparameters are read from
+the bundle's own `config.ini`; a missing or corrupt model fails at
+`selectVoice` time (fail loud, never a silent mic); without
+`model_path` the node passes audio through.
+
+```bash
+cargo build --release -p vm-daemon --features vm-dsp/neural
+```
+
+`convolver` reads mono/stereo WAV IRs (PCM16/24/32-int or float32, any
+sample rate — resampled and peak-normalized) up to 4 s long; the wet
+path is delayed exactly one 1024-sample partition (21 ms), so latency
+stays quantum-independent and the dry path (via `mix`) stays
+sample-exact.
 
 ### Factory persona voices
 

@@ -444,6 +444,7 @@ impl DaemonState {
                 };
                 node.set_param(pname, v).map_err(|e| format!("param {pname}: {e}"))?;
             }
+            node.prepare(nctx.max_channels).map_err(|e| format!("prepare: {e}"))?;
             ids.insert(spec.id.clone(), graph.add(node));
         }
         for edge in &preset.edges {
@@ -1244,7 +1245,7 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
                 tick += 1;
                 {
                     let audio = state.audio.lock().unwrap();
-                    if tick % 5 == 0 {
+                    if tick.is_multiple_of(5) {
                         use vm_audio::StreamKind as K;
                         let c = audio.stats(K::FullDuplexCapture);
                         let v = audio.stats(K::HalfDuplexPlayback);
@@ -1512,8 +1513,8 @@ mod tests {
             state.muted.clone(),
             state.graph_xruns.clone(),
         );
-        let input = vec![vec![0.3f32; 64]];
-        let mut out = vec![vec![0.0f32; 64]];
+        let input = [vec![0.3f32; 64]];
+        let mut out = [vec![0.0f32; 64]];
         let ins: Vec<&[f32]> = input.iter().map(Vec::as_slice).collect();
         let mut outs: Vec<&mut [f32]> = out.iter_mut().map(Vec::as_mut_slice).collect();
         proc.process(48_000, &ins, &mut outs);
@@ -2406,6 +2407,211 @@ mod device_profile_tests {
 }
 
 #[cfg(test)]
+mod f04a_node_tests {
+    use super::*;
+
+    /// Guard against catalogue drift: every node type the preset
+    /// validator accepts must be constructible by the daemon's factory
+    /// (deepfilter fails exactly when the `neural` feature is off).
+    #[test]
+    fn every_known_node_type_maps_to_a_factory_constructor() {
+        let f = vm_dsp::factory::mvp_factory();
+        let ctx = NodeConstructorContext { rate: 48_000, max_channels: 2 };
+        for name in vm_preset::KNOWN_NODE_TYPES {
+            match f.create(name, &ctx) {
+                Ok(_) => {}
+                Err(e) if *name == "deepfilter" => {
+                    assert!(
+                        e.contains("'neural' cargo feature"),
+                        "deepfilter must fail only when the feature is missing: {e}"
+                    );
+                }
+                Err(e) => {
+                    panic!("preset accepts '{name}' but the factory cannot build it: {e}")
+                }
+            }
+        }
+    }
+
+    /// Minimal mono PCM16 48 kHz WAV writer (test-local).
+    fn write_wav16(path: &std::path::Path, samples: &[f32]) {
+        let data_len = samples.len() * 2;
+        let mut b = Vec::with_capacity(44 + data_len);
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&((36 + data_len) as u32).to_le_bytes());
+        b.extend_from_slice(b"WAVEfmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        b.extend_from_slice(&1u16.to_le_bytes()); // mono
+        b.extend_from_slice(&48_000u32.to_le_bytes());
+        b.extend_from_slice(&(48_000u32 * 2).to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&16u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&(data_len as u32).to_le_bytes());
+        for s in samples {
+            b.extend_from_slice(&((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
+        }
+        std::fs::write(path, b).unwrap();
+    }
+
+    /// Deterministic white noise (LCG), same generator as the other E2E tests.
+    fn noise(len: usize, amp: f32) -> Vec<f32> {
+        let mut st = 0x2545_f491_4f6c_dd1du64;
+        (0..len)
+            .map(|_| {
+                st = st
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (((st >> 32) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0) * amp
+            })
+            .collect()
+    }
+
+    fn sine(freq: f32, len: usize, amp: f32) -> Vec<f32> {
+        (0..len)
+            .map(|i| amp * (2.0 * std::f32::consts::PI * freq * i as f32 / 48_000.0).sin())
+            .collect()
+    }
+
+    fn rms(x: &[f32]) -> f32 {
+        (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt()
+    }
+
+    fn process(state: &Arc<DaemonState>, input: &[f32]) -> Vec<f32> {
+        let mut proc = GraphProcessor::new(
+            state.graph.clone(),
+            state.voice_enabled.clone(),
+            state.muted.clone(),
+            state.graph_xruns.clone(),
+        );
+        let mut out_all = Vec::new();
+        for chunk in input.as_chunks::<960>().0 {
+            let cin = [chunk.to_vec(), chunk.to_vec()];
+            let mut out = vec![vec![0.0f32; chunk.len()]; 2];
+            let ins: Vec<&[f32]> = cin.iter().map(Vec::as_slice).collect();
+            let mut outs: Vec<&mut [f32]> = out.iter_mut().map(Vec::as_mut_slice).collect();
+            proc.process(48_000, &ins, &mut outs);
+            out_all.extend_from_slice(&out[0]);
+        }
+        out_all
+    }
+
+    /// F-0.4.A end-to-end: presets with the new node types (Text/Int
+    /// params included) load through the daemon, wire one node, and
+    /// process audio with the expected gross behavior.
+    #[test]
+    fn f04a_presets_load_and_process() {
+        let state = test_state();
+        let write = |name: &str, json: &str| {
+            std::fs::write(state.preset_dir.join(format!("{name}.json")), json).unwrap();
+        };
+        let select = |name: &str| {
+            let (reply, _) = state.handle(&Action::SelectVoice { voice: name.into() });
+            assert!(reply.ok, "{name}: {:?}", reply.error);
+            assert_eq!(state.node_ids.lock().unwrap().len(), 1, "{name} wires one node");
+        };
+
+        // autogain alone: -40 dBFS tone must come out audibly lifted.
+        write(
+            "f04a-ag",
+            r#"{"name":"f04a-ag","nodes":[{"id":"ag","type":"autogain","params":{
+               "target_lufs":{"value":-23.0},"max_gain_db":{"value":20.0},
+               "adapt_ms":{"value":400.0}}}],"edges":[]}"#,
+        );
+        select("f04a-ag");
+        let quiet = sine(440.0, 96_000, 0.01);
+        let out = process(&state, &quiet);
+        assert!(out.iter().all(|s| s.is_finite()));
+        let (in_r, out_r) = (rms(&quiet[72_000..]), rms(&out[72_000..]));
+        assert!(out_r > in_r * 2.0, "autogain must lift: in {in_r:.4}, out {out_r:.4}");
+        assert!(out_r < in_r * 12.0, "lift stays capped (max_gain_db)");
+
+        // autotune alone: detuned tone survives the vocoder (pitch
+        // correctness is unit-tested; here the daemon path is on trial).
+        write(
+            "f04a-at",
+            r#"{"name":"f04a-at","nodes":[{"id":"at","type":"autotune","params":{
+               "key":{"value":9},"scale":{"value":"chromatic"},"mix":{"value":1.0},
+               "speed_ms":{"value":40.0}}}],"edges":[]}"#,
+        );
+        select("f04a-at");
+        let detuned = sine(216.2, 96_000, 0.4); // ~30 cents flat of A3
+        let out = process(&state, &detuned);
+        assert!(out.iter().all(|s| s.is_finite()));
+        let (in_r, out_r) = (rms(&detuned[48_000..]), rms(&out[48_000..]));
+        assert!(out_r > in_r * 0.2, "autotune must not destroy the voice: out {out_r:.4}");
+
+        // rnnoise alone: pink room noise crushed (weights are embedded,
+        // no files, no feature — this is the always-available neural).
+        write(
+            "f04a-rn",
+            r#"{"name":"f04a-rn","nodes":[{"id":"rn","type":"rnnoise",
+               "params":{"mix":{"value":1.0}}}],"edges":[]}"#,
+        );
+        select("f04a-rn");
+        let mut lp = 0.0f32;
+        let pink: Vec<f32> = noise(96_000, 0.06)
+            .into_iter()
+            .map(|w| {
+                lp += 0.08 * (w - lp);
+                lp
+            })
+            .collect();
+        let out = process(&state, &pink);
+        assert!(out.iter().all(|s| s.is_finite()));
+        let (in_r, out_r) = (rms(&pink[48_000..]), rms(&out[48_000..]));
+        assert!(out_r < in_r * 0.3, "rnnoise must crush room noise: in {in_r:.4}, out {out_r:.4}");
+
+        // convolver with a real WAV IR (peak at 0, taps at 100 ms and
+        // 1.0 s): a 300 ms noise burst must reappear at the 1 s tap.
+        let mut ir = vec![0.0f32; 52_800];
+        ir[0] = 1.0;
+        ir[4_800] = 0.6;
+        ir[48_000] = 0.5;
+        let ir_path = state.preset_dir.join("f04a-ir.wav");
+        write_wav16(&ir_path, &ir);
+        write(
+            "f04a-cv",
+            &format!(
+                r#"{{"name":"f04a-cv","nodes":[{{"id":"cv","type":"convolver","params":{{
+                   "ir_path":{{"value":"{}"}},"mix":{{"value":1.0}}}}}}],"edges":[]}}"#,
+                ir_path.display()
+            ),
+        );
+        select("f04a-cv");
+        let mut burst = noise(14_400, 0.3);
+        burst.resize(96_000, 0.0);
+        let out = process(&state, &burst);
+        assert!(out.iter().all(|s| s.is_finite()));
+        let echo = rms(&out[49_000..62_000]);
+        // All taps of the 100 ms echo (burst end + 4.8k tap + partition
+        // latency) land by sample ~20_224; from 24_000 up to the 1 s tap
+        // the convolution is exactly zero.
+        let gap = rms(&out[24_000..40_000]);
+        assert!(echo > 0.01, "IR tap at 1 s must echo the burst: {echo:.5}");
+        assert!(gap < echo * 0.05, "no content where the IR has no taps: {gap:.5}");
+
+        // deepfilter preset without the feature (or without a usable
+        // model): selectVoice must fail loud — never a silent mic.
+        write(
+            "f04a-df",
+            r#"{"name":"f04a-df","nodes":[{"id":"df","type":"deepfilter","params":{
+               "model_path":{"value":"/nonexistent-df3"}}}],"edges":[]}"#,
+        );
+        let (reply, _) = state.handle(&Action::SelectVoice { voice: "f04a-df".into() });
+        assert!(!reply.ok, "deepfilter without model/feature must fail");
+        let err = reply.error.unwrap_or_default();
+        assert!(
+            err.contains("'neural' cargo feature") || err.contains("model_path"),
+            "clear failure wanted, got: {err}"
+        );
+        // The failed select must not have clobbered the live voice.
+        assert_eq!(*state.voice_name.lock().unwrap(), "f04a-cv");
+    }
+}
+
+#[cfg(test)]
 mod integration_tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
@@ -2459,17 +2665,13 @@ mod integration_tests {
             };
             // Broadcasts fan out through a channel, so they land after
             // the direct reply: drain everything still in flight.
-            loop {
-                match tokio::time::timeout(std::time::Duration::from_millis(500), ws.next()).await
-                {
-                    Ok(Some(Ok(msg))) => {
-                        let v: serde_json::Value =
-                            serde_json::from_str(msg.to_text().unwrap()).unwrap();
-                        if v.get("event").is_some() {
-                            evts.push(v);
-                        }
-                    }
-                    _ => break,
+            while let Ok(Some(Ok(msg))) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), ws.next()).await
+            {
+                let v: serde_json::Value =
+                    serde_json::from_str(msg.to_text().unwrap()).unwrap();
+                if v.get("event").is_some() {
+                    evts.push(v);
                 }
             }
             (reply, evts)
