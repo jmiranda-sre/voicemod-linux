@@ -32,10 +32,27 @@ License: **MIT OR Apache-2.0** (see `LICENSE-MIT` / `LICENSE-APACHE`).
 * **`vm-ui`** is an `egui` desktop client. It is **only** a Control API client —
   it can also spawn/lifecycle-manage a local daemon (`Launch daemon`).
 * **`vm`** is a headless CLI (`vm devices --live`, `vm check-preset file.json`,
-  `vm actions`, `vm keyboards`, …).
+  `vm actions`, `vm keyboards`, …). `vm call '<action-json>'` sends any
+  Control API action and prints the reply (exit 1 when `ok` is false),
+  so the whole API is scriptable from shell, hyprland binds and cron:
+  `vm call '{"action":"selectVoice","voice":"demon"}'`.
 * **`vm-control`** is the shared protocol crate (actions, events, server).
   Any WebSocket client — Stream Deck plugins, scripts, Home Assistant — drives
   the daemon with the same protocol.
+
+### Device profiles (per-microphone voices)
+
+Bind a device (uid, uid base without the `#id` suffix, or human name)
+to a voice — plugging it in (or `selectInput` to it) auto-selects the
+voice, and the boot input starts on its voice too:
+
+```bash
+vm call '{"action":"setDeviceProfile","device":"Fifine Microphone","voice":"mic-npr-voice"}'
+vm call '{"action":"listDeviceProfiles"}'
+```
+
+Bindings persist in `config.json`; re-plugging never fights an explicit
+`selectVoice` (same voice → no-op).
 
 ## Building from source
 
@@ -226,9 +243,10 @@ Actions: `selectVoice`, `toggleVoiceChanger`, `stopAllSounds`, `playSound`,
 `getAllSoundboard`, `setVoiceParameter`, `resetVoiceParameters`,
 `setDefaultMicrophone`, `getAudioDevices`, `getUserLicense`, `fadeSound`,
 `startAudioStreaming`, `getAudioStreamStatus`, `getHealth`, `addHotkey`,
-`removeHotkey`, `listHotkeys`, `setMuted`, `getVoices`, `getBitmap`,
-`setSoundboardMasterVolume`, `selectInput`, `getVoices`,
-`captureNoiseProfile` (23 total — `vm actions`).
+`removeHotkey`, `listHotkeys`, `setMuted`, `getVoices`,
+`captureNoiseProfile`, `setDeviceProfile`, `removeDeviceProfile`,
+`listDeviceProfiles`, `getBitmap`, `setSoundboardMasterVolume`,
+`selectInput` (26 total — `vm actions`).
 
 Events: `voiceChanged`, `voiceParameterChanged`, `soundStarted`,
 `soundStopped`, `voiceChangerToggled`, `mutedChanged`, `streamStatus`,

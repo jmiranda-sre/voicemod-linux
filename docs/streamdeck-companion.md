@@ -43,6 +43,7 @@ Wire rules (shared by every client):
 | Start stream | `{"action":"startAudioStreaming"}` | `streamStatus{active:true}` |
 | Bind PTT key | `{"action":"addHotkey","codes":[97],"target":"PushToTalk","enabled":true}` | reply `data.id` (stable bind id) |
 | Unbind | `{"action":"removeHotkey","hotkey_id":0}` | `ok:true` |
+| Bind Fifine → mic voice | `{"action":"setDeviceProfile","device":"Fifine Microphone","voice":"mic-npr-voice"}` | `ok:true` (autoswitch on plug/select/boot) |
 
 Notes:
 

@@ -853,3 +853,12 @@ paralelizáveis a qualquer momento).
 - Item 26: curva de EQ gráfica interativa.
 - Item 18: injeção por aplicação (passthrough).
 - Item 20: Instant Replay buffer 30 s.
+
+### F-0.4.D — FECHADA (CLI total + perfis por dispositivo) — 2026-10-16
+- `vm call` (api.rs): 100% da API no shell (scan de portas, pula
+  broadcasts, exit 1 em `ok:false`); testes c/ servidor real.
+- Perfis device→voz (3 ações, config v2 c/ migração v1): hotplug,
+  selectInput e boot fazem autoswitch (uid/base `#id`/nome); mesma
+  voz → no-op; arquivo ausente falha alto sem tocar estado.
+- Bug real: save por-caller travava o próprio Mutex (self-deadlock nos
+  testes!) → `transact_config` central (ordem fixa, rollback duplo).

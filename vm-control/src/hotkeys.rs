@@ -32,7 +32,7 @@ pub struct Keybind {
 }
 
 /// In-memory keybind store with JSON persistence (`config.json`, owned
-/// by the daemon; see [`save_config`]/[`load_config`]).
+/// by the daemon; see [`save_daemon_config`]/[`load_daemon_config`]).
 #[derive(Debug, Default)]
 pub struct HotkeyManager {
     binds: HashMap<u32, Keybind>,
@@ -114,36 +114,54 @@ pub struct StoredBind {
     pub bind: Keybind,
 }
 
-/// On-disk config file shape (`$VM_CONFIG_DIR/config.json`).
+/// Whole daemon config (`$VM_CONFIG_DIR/config.json`): hotkey binds +
+/// device→voice profiles.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonConfig {
+    #[serde(default)]
+    pub hotkeys: Vec<StoredBind>,
+    /// Device (uid, uid base, or device name) → voice preset name.
+    #[serde(default)]
+    pub device_profiles: HashMap<String, String>,
+}
+
+/// On-disk config file shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ConfigFile {
     version: u32,
+    #[serde(default)]
     hotkeys: Vec<StoredBind>,
+    #[serde(default)]
+    device_profiles: HashMap<String, String>,
 }
 
-/// Current config schema version. Bump when the shape changes; old
-/// files fail closed with a clear error instead of silent misparse.
-pub const CONFIG_VERSION: u32 = 1;
+/// Current config schema version. v1 files (hotkeys only) migrate
+/// forward; unknown versions fail closed with a clear error.
+pub const CONFIG_VERSION: u32 = 2;
 
-/// Serialize binds to the config file text.
-pub fn save_config(binds: &[StoredBind]) -> String {
-    serde_json::to_string_pretty(&ConfigFile { version: CONFIG_VERSION, hotkeys: binds.to_vec() })
-        .unwrap_or_else(|_| String::from("{\"version\":1,\"hotkeys\":[]}"))
+/// Serialize the daemon config to file text.
+pub fn save_daemon_config(cfg: &DaemonConfig) -> String {
+    serde_json::to_string_pretty(&ConfigFile {
+        version: CONFIG_VERSION,
+        hotkeys: cfg.hotkeys.clone(),
+        device_profiles: cfg.device_profiles.clone(),
+    })
+    .unwrap_or_else(|_| String::from("{\"version\":2,\"hotkeys\":[],\"device_profiles\":{}}"))
 }
 
 /// Parse config file text. Unknown versions fail closed (never silently
 /// reinterpreted); unknown *targets* also fail (a typo'd bind must not
 /// boot as a different action).
-pub fn load_config(text: &str) -> Result<Vec<StoredBind>, String> {
+pub fn load_daemon_config(text: &str) -> Result<DaemonConfig, String> {
     let cfg: ConfigFile =
-        serde_json::from_str(text).map_err(|e| format!("bad hotkey config: {e}"))?;
-    if cfg.version != CONFIG_VERSION {
-        return Err(format!(
-            "unsupported hotkey config version {} (want {CONFIG_VERSION})",
-            cfg.version
-        ));
+        serde_json::from_str(text).map_err(|e| format!("bad daemon config: {e}"))?;
+    match cfg.version {
+        1 => Ok(DaemonConfig { hotkeys: cfg.hotkeys, device_profiles: HashMap::new() }),
+        CONFIG_VERSION => {
+            Ok(DaemonConfig { hotkeys: cfg.hotkeys, device_profiles: cfg.device_profiles })
+        }
+        v => Err(format!("unsupported daemon config version {v} (want {CONFIG_VERSION}")),
     }
-    Ok(cfg.hotkeys)
 }
 
 /// Validate an API-supplied bind before it enters the store.
@@ -318,17 +336,28 @@ mod hotkey_tests {
         let mut mgr = HotkeyManager::new();
         mgr.add(bind(&[29, 42], HotkeyTarget::PushToTalk));
         mgr.add(bind(&[56], HotkeyTarget::SelectVoice("mic-npr-voice".into())));
-        let text = save_config(&mgr.export());
-        let back = load_config(&text).expect("roundtrip");
-        assert_eq!(back.len(), 2);
-        assert!(matches!(back[0].bind.target, HotkeyTarget::PushToTalk));
+        let cfg = DaemonConfig {
+            hotkeys: mgr.export(),
+            device_profiles: [("Fifine Microphone".to_string(), "mic-npr-voice".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let text = save_daemon_config(&cfg);
+        let back = load_daemon_config(&text).expect("roundtrip");
+        assert_eq!(back.hotkeys.len(), 2);
+        assert!(matches!(back.hotkeys[0].bind.target, HotkeyTarget::PushToTalk));
+        assert_eq!(back.device_profiles["Fifine Microphone"], "mic-npr-voice");
+        // v1 files (hotkeys only) migrate forward with empty profiles.
+        let v1 = r#"{"version":1,"hotkeys":[]}"#;
+        let migrated = load_daemon_config(v1).expect("v1 migrates");
+        assert!(migrated.hotkeys.is_empty() && migrated.device_profiles.is_empty());
         // Wrong version fails closed.
-        let bad = text.replace("\"version\": 1", "\"version\": 99");
-        assert!(load_config(&bad).is_err());
+        let bad = text.replace("\"version\": 2", "\"version\": 99");
+        assert!(load_daemon_config(&bad).is_err());
         // Garbage fails with a clear error, never an empty store.
-        assert!(load_config("not json").is_err());
+        assert!(load_daemon_config("not json").is_err());
         // Unknown target fails (typo must not boot as another action).
-        assert!(load_config(r#"{"version":1,"hotkeys":[{"id":0,"bind":{"codes":[29],"target":"Frobnicator","enabled":true}}]}"#).is_err());
+        assert!(load_daemon_config(r#"{"version":1,"hotkeys":[{"id":0,"bind":{"codes":[29],"target":"Frobnicator","enabled":true}}]}"#).is_err());
     }
 
     #[test]

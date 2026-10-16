@@ -39,6 +39,11 @@ pub enum Action {
     /// voice's preset file (`profile` param): the next load skips the
     /// ~1 s warmup. The "learn room" button for users and Companion.
     CaptureNoiseProfile { node: String },
+    /// Bind a device (uid, uid base without `#id`, or device name) to
+    /// a voice preset: plugging/selecting it auto-selects the voice.
+    SetDeviceProfile { device: String, voice: String },
+    RemoveDeviceProfile { device: String },
+    ListDeviceProfiles,
     GetBitmap { resource: String },
     SetSoundboardMasterVolume { per_mille: u16 },
     SelectInput { uid: String },
@@ -142,8 +147,11 @@ mod action_shape_tests {
             Action::SetMuted { muted: false },
             Action::GetVoices,
             Action::CaptureNoiseProfile { node: String::new() },
+            Action::SetDeviceProfile { device: String::new(), voice: String::new() },
+            Action::RemoveDeviceProfile { device: String::new() },
+            Action::ListDeviceProfiles,
         ];
-        assert_eq!(all.len(), 23, "keep this list in sync with the catalogue");
+        assert_eq!(all.len(), 26, "keep this list in sync with the catalogue");
         for a in &all {
             let o = serde_json::to_value(a).unwrap();
             let o = o.as_object().unwrap();

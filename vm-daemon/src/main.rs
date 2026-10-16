@@ -125,8 +125,26 @@ struct DaemonState {
     muted: Arc<AtomicBool>,
     /// Live keybind store, shared with the evdev watch threads.
     hotkeys: Arc<Mutex<HotkeyManager>>,
-    /// `$VM_CONFIG_DIR/config.json` (bind persistence).
+    /// `$VM_CONFIG_DIR/config.json` (bind + device-profile persistence).
     config_path: PathBuf,
+    /// Device (uid, uid base, or name) → voice preset. Autoswitches the
+    /// voice when the device appears or is selected.
+    device_profiles: Mutex<HashMap<String, String>>,
+}
+
+/// Strip a PipeWire `#node-id` suffix (`alsa:...#52` → base): node ids
+/// churn across restarts, the device part doesn't.
+fn strip_node_id(uid: &str) -> &str {
+    match uid.rsplit_once('#') {
+        Some((base, num)) if !base.is_empty() && num.chars().all(|c| c.is_ascii_digit()) => base,
+        _ => uid,
+    }
+}
+
+/// Does a bound device string match this device? Exact uid, stable base
+/// uid, or human device name — in that order of precision.
+fn device_matches(bound: &str, uid: &str, name: &str) -> bool {
+    bound == uid || bound == strip_node_id(uid) || bound == name
 }
 
 /// Watchdog state: restart counter + cooldown bookkeeping. The policy
@@ -187,11 +205,82 @@ fn unix_now() -> u64 {
 }
 
 impl DaemonState {
-    /// Persist the live keybind store to `config.json`.
-    fn save_hotkeys(&self, mgr: &HotkeyManager) -> Result<(), String> {
-        let text = vm_control::save_config(&mgr.export());
+    /// Write an already-built config to `config.json` (no locks taken).
+    fn write_config_file(&self, cfg: &vm_control::DaemonConfig) -> Result<(), String> {
+        let text = vm_control::save_daemon_config(cfg);
         std::fs::write(&self.config_path, text)
             .map_err(|e| format!("write {}: {e}", self.config_path.display()))
+    }
+
+    /// Atomically mutate persisted state then save. Both locks always in
+    /// the same order (hotkeys, then profiles — never the reverse, so
+    /// concurrent API calls can't deadlock); snapshots both stores and
+    /// rolls both back when the disk write fails, so memory and disk
+    /// can never disagree (a live-but-unpersisted entry would lie to
+    /// list calls).
+    fn transact_config<T>(
+        &self,
+        op: impl FnOnce(&mut HotkeyManager, &mut HashMap<String, String>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut mgr = self.hotkeys.lock().unwrap();
+        let mut profiles = self.device_profiles.lock().unwrap();
+        let backup_mgr = mgr.export();
+        let backup_prof = profiles.clone();
+        let out = op(&mut mgr, &mut profiles);
+        match out {
+            Ok(v) => {
+                let cfg = vm_control::DaemonConfig {
+                    hotkeys: mgr.export(),
+                    device_profiles: profiles.clone(),
+                };
+                match self.write_config_file(&cfg) {
+                    Ok(()) => Ok(v),
+                    Err(e) => {
+                        mgr.import(backup_mgr);
+                        *profiles = backup_prof;
+                        Err(format!("applied but not saved, rolled back: {e}"))
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Load a voice preset file by name and apply it. Shared by the
+    /// `SelectVoice` action, the boot default, and device autoswitch.
+    fn select_voice(&self, voice: &str) -> Result<Vec<ControlEvent>, String> {
+        let path = self.preset_dir.join(format!("{voice}.json"));
+        let text =
+            std::fs::read_to_string(&path).map_err(|_| format!("unknown voice '{voice}'"))?;
+        let preset = vm_preset::load(&text).map_err(|e| format!("bad preset: {e}"))?;
+        self.apply_preset(&preset)?;
+        Ok(vec![ControlEvent::VoiceChanged { voice: voice.to_string() }])
+    }
+
+    /// Device-profile autoswitch: if `uid`/`name` has a bound voice that
+    /// isn't already active, select it. Returns the events when a switch
+    /// happened. Never fights the user (same voice → no-op, so repeated
+    /// hotplug polls can't loop).
+    fn autoswitch_for_device(&self, uid: &str, name: &str) -> Option<Vec<ControlEvent>> {
+        let target = {
+            let profiles = self.device_profiles.lock().unwrap();
+            profiles
+                .iter()
+                .find_map(|(bound, voice)| device_matches(bound, uid, name).then(|| voice.clone()))
+        }?;
+        if *self.voice_name.lock().unwrap() == target {
+            return None;
+        }
+        match self.select_voice(&target) {
+            Ok(evts) => {
+                println!("device profile: '{uid}' ({name}) → voice '{target}'");
+                Some(evts)
+            }
+            Err(e) => {
+                eprintln!("device profile: cannot select '{target}' for '{uid}': {e}");
+                None
+            }
+        }
     }
 
     /// Write a captured noise floor into the current voice's preset
@@ -230,15 +319,16 @@ impl DaemonState {
 
     /// Runtime input switch: stop → reopen on the new input (same virtual
     /// output) → start. Drops in-flight audio; the graph keeps running.
-    fn switch_input(&self, uid: &str) -> Result<(), String> {
+    /// A bound device autoswitches its voice (events bubble to the
+    /// caller); anything else keeps the current voice.
+    fn switch_input(&self, uid: &str) -> Result<Vec<ControlEvent>, String> {
         let topo = self.topology.lock().map_err(|_| "topology lock poisoned".to_string())?;
         let base = topo.clone().ok_or_else(|| "pipeline never opened".to_string())?;
         drop(topo);
         let mut audio = self.audio.lock().map_err(|_| "audio lock poisoned".to_string())?;
         let devs = audio.enumerate().map_err(|e| format!("enumerate: {e}"))?;
-        if !devs.iter().any(|d| d.uid.0 == uid) {
-            return Err(format!("unknown input '{uid}'"));
-        }
+        let dev = devs.iter().find(|d| d.uid.0 == uid).ok_or_else(|| format!("unknown input '{uid}'"))?;
+        let name = dev.name.clone();
         let next = StreamTopology {
             input: vm_audio::DeviceUid::new(uid),
             virtual_out: base.virtual_out.clone(),
@@ -247,8 +337,9 @@ impl DaemonState {
         audio.stop(StreamStopReason::Requested).map_err(|e| format!("stop: {e}"))?;
         audio.open(&next).map_err(|e| format!("open: {e}"))?;
         audio.start().map_err(|e| format!("start: {e}"))?;
+        drop(audio);
         *self.topology.lock().map_err(|_| "topology lock poisoned".to_string())? = Some(next);
-        Ok(())
+        Ok(self.autoswitch_for_device(uid, &name).unwrap_or_default())
     }
 
     /// Watchdog restart: stop → reopen the stored topology → start.
@@ -378,29 +469,10 @@ impl DaemonState {
 impl ControlHandler for DaemonState {
     fn handle(&self, action: &Action) -> (ControlReply, Vec<ControlEvent>) {
         match action {
-            Action::SelectVoice { voice } => {
-                let path = self.preset_dir.join(format!("{voice}.json"));
-                let text = match std::fs::read_to_string(&path) {
-                    Ok(t) => t,
-                    Err(_) => {
-                        return (
-                            ControlReply::err(format!("unknown voice '{voice}'")),
-                            Vec::new(),
-                        )
-                    }
-                };
-                let preset = match vm_preset::load(&text) {
-                    Ok(p) => p,
-                    Err(e) => return (ControlReply::err(format!("bad preset: {e}")), Vec::new()),
-                };
-                match self.apply_preset(&preset) {
-                    Ok(()) => (
-                        ControlReply::ok(),
-                        vec![ControlEvent::VoiceChanged { voice: voice.clone() }],
-                    ),
-                    Err(e) => (ControlReply::err(e), Vec::new()),
-                }
-            }
+            Action::SelectVoice { voice } => match self.select_voice(voice) {
+                Ok(evts) => (ControlReply::ok(), evts),
+                Err(e) => (ControlReply::err(e), Vec::new()),
+            },
             Action::SetVoiceParameter { param, value } => {
                 let (node, name) = match param.split_once('.') {
                     Some((n, p)) => (n, p),
@@ -512,45 +584,23 @@ impl ControlHandler for DaemonState {
                 if let Err(e) = vm_control::validate_bind(&bind) {
                     return (ControlReply::err(e), Vec::new());
                 }
-                // Atomic mutate-then-persist: snapshot, apply, save,
-                // roll back the in-memory store when the disk write fails
-                // (a live-but-unpersisted bind would lie to listHotkeys).
-                let mut mgr = self.hotkeys.lock().unwrap();
-                let backup = mgr.export();
-                let id = mgr.add(bind);
-                match self.save_hotkeys(&mgr) {
-                    Ok(()) => (ControlReply::ok_data(serde_json::json!({ "id": id })), Vec::new()),
-                    Err(e) => {
-                        mgr.import(backup);
-                        (
-                            ControlReply::err(format!(
-                                "bind applied but not saved, rolled back: {e}"
-                            )),
-                            Vec::new(),
-                        )
+                match self.transact_config(|mgr, _| Ok(mgr.add(bind))) {
+                    Ok(id) => {
+                        (ControlReply::ok_data(serde_json::json!({ "id": id })), Vec::new())
                     }
+                    Err(e) => (ControlReply::err(e), Vec::new()),
                 }
             }
             Action::RemoveHotkey { hotkey_id } => {
-                let mut mgr = self.hotkeys.lock().unwrap();
-                let backup = mgr.export();
-                if !mgr.remove(*hotkey_id) {
-                    return (
-                        ControlReply::err(format!("unknown hotkey id {hotkey_id}")),
-                        Vec::new(),
-                    );
-                }
-                match self.save_hotkeys(&mgr) {
-                    Ok(()) => (ControlReply::ok(), Vec::new()),
-                    Err(e) => {
-                        mgr.import(backup);
-                        (
-                            ControlReply::err(format!(
-                                "bind removed but not saved, rolled back: {e}"
-                            )),
-                            Vec::new(),
-                        )
+                match self.transact_config(|mgr, _| {
+                    if mgr.remove(*hotkey_id) {
+                        Ok(())
+                    } else {
+                        Err(format!("unknown hotkey id {hotkey_id}"))
                     }
+                }) {
+                    Ok(()) => (ControlReply::ok(), Vec::new()),
+                    Err(e) => (ControlReply::err(e), Vec::new()),
                 }
             }
             Action::ListHotkeys => {
@@ -612,6 +662,43 @@ impl ControlHandler for DaemonState {
                     ),
                     Err(e) => (ControlReply::err(e), Vec::new()),
                 }
+            }
+            Action::SetDeviceProfile { device, voice } => {
+                if device.is_empty() || voice.is_empty() {
+                    return (
+                        ControlReply::err("device and voice must both be non-empty".to_string()),
+                        Vec::new(),
+                    );
+                }
+                match self.transact_config(|_, profiles| {
+                    profiles.insert(device.clone(), voice.clone());
+                    Ok(())
+                }) {
+                    Ok(()) => (ControlReply::ok(), Vec::new()),
+                    Err(e) => (ControlReply::err(e), Vec::new()),
+                }
+            }
+            Action::RemoveDeviceProfile { device } => {
+                match self.transact_config(|_, profiles| {
+                    profiles.remove(device.as_str()).map(|_| ()).ok_or_else(|| {
+                        format!("no profile bound to '{device}'")
+                    })
+                }) {
+                    Ok(()) => (ControlReply::ok(), Vec::new()),
+                    Err(e) => (ControlReply::err(e), Vec::new()),
+                }
+            }
+            Action::ListDeviceProfiles => {
+                let profiles = self.device_profiles.lock().unwrap();
+                let mut entries: Vec<serde_json::Value> = profiles
+                    .iter()
+                    .map(|(d, v)| serde_json::json!({ "device": d, "voice": v }))
+                    .collect();
+                entries.sort_by(|a, b| a["device"].as_str().cmp(&b["device"].as_str()));
+                (
+                    ControlReply::ok_data(serde_json::json!({ "profiles": entries })),
+                    Vec::new(),
+                )
             }
             Action::StartAudioStreaming => {
                 let mut audio = self.audio.lock().unwrap();
@@ -812,10 +899,11 @@ impl ControlHandler for DaemonState {
                 )
             }
             Action::SelectInput { uid } => match self.switch_input(uid) {
-                Ok(()) => (
-                    ControlReply::ok(),
-                    vec![ControlEvent::DevicesChanged],
-                ),
+                Ok(evts) => {
+                    let mut all = vec![ControlEvent::DevicesChanged];
+                    all.extend(evts);
+                    (ControlReply::ok(), all)
+                }
                 Err(e) => (ControlReply::err(e), Vec::new()),
             },
         }
@@ -903,16 +991,18 @@ fn seed_builtin_presets(preset_dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Load persisted binds. Missing file = first boot (empty store, no
-/// error). A corrupt file is quarantined to `config.json.bak` instead of
-/// being overwritten — hand edits are never silently eaten.
-fn load_hotkeys_file(path: &std::path::Path) -> Result<Vec<vm_control::StoredBind>, String> {
+/// Load the persisted daemon config. Missing file = first boot (empty
+/// config, no error). A corrupt file is quarantined to `config.json.bak`
+/// instead of being overwritten — hand edits are never silently eaten.
+fn load_daemon_config_file(path: &std::path::Path) -> Result<vm_control::DaemonConfig, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(vm_control::DaemonConfig::default())
+        }
         Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
-    match vm_control::load_config(&text) {
+    match vm_control::load_daemon_config(&text) {
         Ok(b) => Ok(b),
         Err(e) => {
             let bak = path.with_extension("json.bak");
@@ -938,21 +1028,35 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Ship the ready-made mic presets (Fase 7); user edits always win.
     seed_builtin_presets(&preset_dir)?;
 
-    // Hotkey binds (F-B): load persisted store before the state exists
-    // so both the API and the evdev threads share one manager.
+    // Hotkey binds + device profiles (F-B/F-0.4.D): load the persisted
+    // config before the state exists so the API, the evdev threads and
+    // the autoswitch share one store.
     let config_path = preset_dir
         .parent()
         .map(|p| p.join("config.json"))
         .unwrap_or_else(|| PathBuf::from("/tmp/vm-config.json"));
     let mut hotkeys = HotkeyManager::new();
-    match load_hotkeys_file(&config_path) {
-        Ok(stored) => {
-            if !stored.is_empty() {
-                println!("hotkeys: loaded {} binds from {}", stored.len(), config_path.display());
+    let mut device_profiles = HashMap::new();
+    match load_daemon_config_file(&config_path) {
+        Ok(cfg) => {
+            if !cfg.hotkeys.is_empty() {
+                println!(
+                    "hotkeys: loaded {} binds from {}",
+                    cfg.hotkeys.len(),
+                    config_path.display()
+                );
             }
-            hotkeys.import(stored);
+            hotkeys.import(cfg.hotkeys);
+            if !cfg.device_profiles.is_empty() {
+                println!(
+                    "device profiles: loaded {} from {}",
+                    cfg.device_profiles.len(),
+                    config_path.display()
+                );
+            }
+            device_profiles = cfg.device_profiles;
         }
-        Err(e) => eprintln!("hotkeys: {e} (starting with no binds)"),
+        Err(e) => eprintln!("config: {e} (starting empty)"),
     }
 
     let state = Arc::new(DaemonState {
@@ -970,6 +1074,7 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
         muted: Arc::new(AtomicBool::new(false)),
         hotkeys: Arc::new(Mutex::new(hotkeys)),
         config_path: config_path.clone(),
+        device_profiles: Mutex::new(device_profiles),
     });
     // Default voice.
     {
@@ -1045,6 +1150,22 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
         topo
     };
     *state.topology.lock().unwrap() = Some(topo.clone());
+    // Boot device profile: a bound input starts on its voice instead of
+    // the default (new hardware keeps sounding right across restarts).
+    {
+        let input_uid = topo.input.0.clone();
+        let input_name = {
+            let mut audio = state.audio.lock().unwrap();
+            audio
+                .enumerate()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|d| d.uid.0 == input_uid)
+                .map(|d| d.name.clone())
+                .unwrap_or_default()
+        };
+        state.autoswitch_for_device(&input_uid, &input_name);
+    }
     let _ = topo;
 
     // Control plane (auth opt-in via VM_CONTROL_TOKEN).
@@ -1102,8 +1223,20 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
             _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
                 {
                     let mut audio = state.audio.lock().unwrap();
+                    let mut arrivals = Vec::new();
                     for ev in audio.poll_hotplug() {
                         println!("hotplug: {ev:?} (link: {:?})", audio.link_state());
+                        // A (re)plugged input with a bound voice takes
+                        // over immediately (F-0.4.D device profiles).
+                        if let vm_audio::HotplugEvent::DeviceAdded(dev) = ev {
+                            if dev.role == DeviceRole::Input {
+                                arrivals.push((dev.uid.0.clone(), dev.name.clone()));
+                            }
+                        }
+                    }
+                    drop(audio);
+                    for (uid, name) in arrivals {
+                        state.autoswitch_for_device(&uid, &name);
                     }
                 }
                 // Watchdog (F-A): auto-restart a dead link / xrun storm.
@@ -1196,6 +1329,7 @@ fn test_state() -> Arc<DaemonState> {
         muted: Arc::new(AtomicBool::new(false)),
         hotkeys: Arc::new(Mutex::new(HotkeyManager::new())),
         config_path: dir.join("config.json"),
+        device_profiles: Mutex::new(HashMap::new()),
     });
     // Seed example preset + one wav sound.
     let text = serde_json::to_string_pretty(&vm_preset::example_drive()).unwrap();
@@ -1563,7 +1697,7 @@ mod hotkey_api_tests {
         // Persisted to config.json with schema version.
         let text = std::fs::read_to_string(&state.config_path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v["version"], 1);
+        assert_eq!(v["version"], 2);
         assert_eq!(v["hotkeys"].as_array().unwrap().len(), 1);
 
         let (reply, _) = state.handle(&Action::RemoveHotkey { hotkey_id: 0 });
@@ -1602,10 +1736,10 @@ mod hotkey_api_tests {
         add_bind(&state, &[29], HotkeyTarget::PushToTalk);
         add_bind(&state, &[56], HotkeyTarget::ToggleMute);
         // Simulate a reboot: fresh manager from the same file.
-        let stored = load_hotkeys_file(&state.config_path).expect("reload");
-        assert_eq!(stored.len(), 2);
+        let stored = load_daemon_config_file(&state.config_path).expect("reload");
+        assert_eq!(stored.hotkeys.len(), 2);
         let mut mgr = HotkeyManager::new();
-        mgr.import(stored);
+        mgr.import(stored.hotkeys);
         let listed = mgr.list();
         assert_eq!(listed[0].0, 0);
         assert_eq!(listed[1].0, 1);
@@ -1623,7 +1757,7 @@ mod hotkey_api_tests {
     fn corrupt_config_is_quarantined_not_eaten() {
         let state = test_state();
         std::fs::write(&state.config_path, "{oops").unwrap();
-        let err = load_hotkeys_file(&state.config_path).expect_err("must fail");
+        let err = load_daemon_config_file(&state.config_path).expect_err("must fail");
         assert!(err.contains(".bak"), "{err}");
         assert!(!state.config_path.exists(), "corrupt file moved away");
         assert!(state.config_path.with_extension("json.bak").exists());
@@ -2154,6 +2288,120 @@ mod profile_tests {
             "512 chain must still suppress stationary noise: in {in_r:.4}, out {out_r:.4}"
         );
         assert_eq!(state.graph_xruns.load(Ordering::Relaxed), 0, "no lock contention");
+    }
+}
+
+#[cfg(test)]
+mod device_profile_tests {
+    use super::*;
+
+    #[test]
+    fn match_rules_handle_node_ids() {
+        let fifine = "alsa_input.usb-MV-SILICON_fifine_Microphone_20190808-00.mono-fallback#52";
+        let base = "alsa_input.usb-MV-SILICON_fifine_Microphone_20190808-00.mono-fallback";
+        assert_eq!(strip_node_id(fifine), base);
+        assert_eq!(strip_node_id(base), base, "no suffix: untouched");
+        assert_eq!(strip_node_id("weird#name"), "weird#name", "non-numeric suffix kept");
+        assert!(device_matches(fifine, fifine, "Fifine Microphone"));
+        assert!(device_matches(base, fifine, "Fifine Microphone"), "base survives reboot renumbering");
+        assert!(device_matches("Fifine Microphone", fifine, "Fifine Microphone"));
+        assert!(!device_matches(base, "stub:input:0", "Stub Microphone"));
+        assert!(!device_matches("", fifine, "Fifine Microphone"));
+    }
+
+    #[test]
+    fn profile_crud_persists_v2() {
+        let state = test_state();
+        // Empty values rejected.
+        let (reply, _) = state.handle(&Action::SetDeviceProfile {
+            device: "".into(),
+            voice: "example-drive".into(),
+        });
+        assert!(!reply.ok);
+        let (reply, _) = state.handle(&Action::SetDeviceProfile {
+            device: "stub:input:0".into(),
+            voice: "example-drive".into(),
+        });
+        assert!(reply.ok, "{:?}", reply.error);
+        let (reply, _) = state.handle(&Action::ListDeviceProfiles);
+        assert!(reply.ok);
+        assert_eq!(
+            reply.data.unwrap()["profiles"],
+            serde_json::json!([{"device": "stub:input:0", "voice": "example-drive"}])
+        );
+        // File is schema v2 with both sections.
+        let text = std::fs::read_to_string(&state.config_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["version"], 2);
+        assert_eq!(v["device_profiles"]["stub:input:0"], "example-drive");
+        // Reload survives a reboot.
+        let cfg = load_daemon_config_file(&state.config_path).expect("reload");
+        assert_eq!(cfg.device_profiles["stub:input:0"], "example-drive");
+        // Remove unknown errors; remove known empties.
+        let (reply, _) =
+            state.handle(&Action::RemoveDeviceProfile { device: "ghost".into() });
+        assert!(!reply.ok);
+        let (reply, _) =
+            state.handle(&Action::RemoveDeviceProfile { device: "stub:input:0".into() });
+        assert!(reply.ok, "{:?}", reply.error);
+        let (reply, _) = state.handle(&Action::ListDeviceProfiles);
+        assert_eq!(reply.data.unwrap()["profiles"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn autoswitch_selects_once_and_never_fights() {
+        let state = test_state();
+        let (reply, _) = state.handle(&Action::SetDeviceProfile {
+            device: "stub:input:0".into(),
+            voice: "example-drive".into(),
+        });
+        assert!(reply.ok);
+        // Voice starts empty → switch fires with an event.
+        let evts = state.autoswitch_for_device("stub:input:0", "Stub Microphone");
+        assert!(matches!(evts, Some(ref e) if matches!(e[0], ControlEvent::VoiceChanged { .. })));
+        assert_eq!(*state.voice_name.lock().unwrap(), "example-drive");
+        // Same voice again → no-op (hotplug polls can't loop).
+        assert!(state.autoswitch_for_device("stub:input:0", "Stub Microphone").is_none());
+        // Unbound device → nothing.
+        assert!(state.autoswitch_for_device("other:9", "Other").is_none());
+        // Bound-but-missing voice file → clean None, voice untouched.
+        let (reply, _) = state.handle(&Action::SetDeviceProfile {
+            device: "other:9".into(),
+            voice: "ghost-voice".into(),
+        });
+        assert!(reply.ok);
+        assert!(state.autoswitch_for_device("other:9", "Other").is_none());
+        assert_eq!(*state.voice_name.lock().unwrap(), "example-drive");
+    }
+
+    #[test]
+    fn select_input_autoswitches_bound_device() {
+        let state = test_state();
+        let (reply, _) = state.handle(&Action::SetDeviceProfile {
+            device: "stub:input:0".into(),
+            voice: "example-drive".into(),
+        });
+        assert!(reply.ok);
+        let topo = vm_audio::StreamTopology {
+            input: vm_audio::DeviceUid::new("stub:input:0"),
+            virtual_out: vm_audio::DeviceUid::new("stub:virtual:vm-mic"),
+            monitor: None,
+        };
+        {
+            let mut audio = state.audio.lock().unwrap();
+            audio.enumerate().unwrap();
+            audio.open(&topo).unwrap();
+            audio.start().unwrap();
+        }
+        *state.topology.lock().unwrap() = Some(topo);
+        let (reply, evts) = state.handle(&Action::SelectInput { uid: "stub:input:0".into() });
+        assert!(reply.ok, "{:?}", reply.error);
+        assert!(matches!(evts[0], ControlEvent::DevicesChanged));
+        assert!(
+            matches!(evts.get(1), Some(ControlEvent::VoiceChanged { .. })),
+            "bound input must also switch the voice: {evts:?}"
+        );
+        assert_eq!(*state.voice_name.lock().unwrap(), "example-drive");
     }
 }
 

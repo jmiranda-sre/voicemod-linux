@@ -6,6 +6,19 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added (F-0.4.D: full CLI + device profiles)
+
+- `vm call '<action-json>'`: 100% of the Control API from shell
+  (port scan, broadcast-skipping replies, exit 1 on `ok:false`) —
+  scripts, hyprland binds and cron drive everything.
+- Device→voice profiles (`set/remove/listDeviceProfiles`, persisted
+  in `config.json` schema v2 with v1 migration): hotplug arrival,
+  `selectInput` and boot all autoswitch bound inputs (uid, uid base
+  without `#id`, or device name); same voice → no-op, missing files
+  fail loud without touching state.
+- Config save path hardened: one `transact_config` (fixed lock order,
+  dual rollback) replaces the per-caller save that could self-deadlock.
+
 ### Fixed (mic-npr-voice recalibration)
 
 - Denoise retuned to replace the *two* stacked neural denoisers it

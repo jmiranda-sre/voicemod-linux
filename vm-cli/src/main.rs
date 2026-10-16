@@ -3,6 +3,7 @@
 //! Talks to `vm-daemon` today via direct crate calls in-process (Fase 3b
 //! moves this onto the WebSocket Control API as its first client).
 
+mod api;
 mod autostart;
 
 use clap::{Parser, Subcommand};
@@ -34,6 +35,16 @@ enum Cmd {
     Actions,
     /// List readable evdev keyboards (needs input permissions).
     Keyboards,
+    /// Send a raw Control API action JSON, print the reply.
+    /// Covers 100% of actions with no per-action code, e.g.
+    /// `vm call '{"action":"selectVoice","voice":"robot"}'`.
+    Call {
+        /// JSON action object to send.
+        action: String,
+        /// Candidate ports, tried in order.
+        #[arg(long, default_value = "8765,8766,8767,8768,8769")]
+        ports: String,
+    },
     /// Manage login autostart (XDG entry + systemd --user unit).
     Autostart {
         #[command(subcommand)]
@@ -125,6 +136,9 @@ async fn main() {
                 "setMuted",
                 "getVoices",
                 "captureNoiseProfile",
+                "setDeviceProfile",
+                "removeDeviceProfile",
+                "listDeviceProfiles",
                 "getBitmap",
                 "setSoundboardMasterVolume",
                 "selectInput",
@@ -144,6 +158,27 @@ async fn main() {
                 AutostartOp::Disable => autostart::cmd_disable(),
             };
             println!("{out}");
+        }
+        Cmd::Call { action, ports } => {
+            let ports = match api::parse_ports(&ports) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            };
+            match api::call_action(&ports, &action).await {
+                Ok(reply) => {
+                    println!("{}", serde_json::to_string_pretty(&reply).unwrap());
+                    if reply.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }

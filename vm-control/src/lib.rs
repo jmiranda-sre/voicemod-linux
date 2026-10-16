@@ -11,7 +11,7 @@ pub mod server;
 
 pub use actions::{Action, ControlEvent, ControlHandler, ControlMessage, ControlReply};
 pub use hotkeys::{
-    HotkeyManager, HotkeyTarget, Keybind, StoredBind, CONFIG_VERSION, is_momentary, load_config,
-    save_config, sandbox_note, validate_bind,
+    HotkeyManager, HotkeyTarget, Keybind, StoredBind, DaemonConfig, CONFIG_VERSION, is_momentary,
+    load_daemon_config, save_daemon_config, sandbox_note, validate_bind,
 };
 pub use server::{dispatch, ControlApiServer, ServerConfig};
