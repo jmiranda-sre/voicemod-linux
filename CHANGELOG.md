@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 semantic versioning.
 
-## [Unreleased]
+## [0.3.0] — 2026-10-16
 
 ### Added (F-13: autostart + tray)
 
@@ -12,9 +12,12 @@ semantic versioning.
   (`vm-ui --minimized`) + `systemctl --user` wiring for the existing
   `vm-daemon.service`; honest partial-failure reports, sandbox portal
   guidance instead of acting.
-- UI system tray (StatusNotifier/AppIndicator, icon drawn in code):
+- UI system tray (StatusNotifier SNI via `ksni`, icon drawn in code):
   close-to-hide with the WS link untouched, live mute checkmark, Quit;
-  `--minimized` boots into the tray.
+  `--minimized` boots into the tray. Deliberately GTK-free (the default
+  AppIndicator backend dragged 32 MB of ICU/GTK into the AppImage:
+  45.6 MB → 17.2 MB); legacy XEmbed trays unsupported, SNI hosts
+  (Plasma, GNOME + extension) covered.
 - UI snapshot learns `muted` (`mutedChanged` + health seed) for the
   tray checkmark.
 - Sandbox: no tray, plain window; autostart delegated to the Flatpak

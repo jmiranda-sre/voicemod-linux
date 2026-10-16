@@ -708,12 +708,16 @@ abaixo são o plano proposto p/ aprovação.
   direcional ×1.5 + rejeição absoluta <0.5; telephone vaza menos grave
   que o radio).
 
-### F-13 — FECHADA (autostart + tray) — 2026-10-15
+### F-13 — FECHADA (autostart + tray) — 2026-10-15/16
 - `vm autostart`: entry XDG (`--minimized`) + unit user; falha parcial
   honesta; sandbox → guia de portal (Background permission).
-- Tray SNI (ícone em código, menu Show/mute/Quit, left-click alterna):
-  close esconde (link WS intacto), Quit sai de verdade; `--minimized`
-  nasce escondido; sem tray (sandbox/sem host) = janela normal.
+- Tray SNI via `ksni` (puro-Rust, sem GTK): ícone em código, menu
+  Show/mute/Quit, left-click alterna; close esconde (link WS intacto),
+  Quit sai de verdade; `--minimized` nasce escondido; sem tray
+  (sandbox/sem host) = janela normal.
+- Decisão de peso: backend AppIndicator default puxava ICU+GTK
+  (AppImage 45.6 MB) → `ksni` = 17.2 MB; sem XEmbed legado (hosts SNI:
+  Plasma, GNOME + extensão).
 - Snapshot UI += `muted` (evento + seed do health) p/ o checkmark.
 - Unit validada (`systemd-analyze verify` só reclama do binário, que
   não está instalado aqui); desktop renderizado passa no
