@@ -96,8 +96,13 @@ impl VmApp {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| {
                 std::env::var("XDG_CONFIG_HOME")
+                    .ok()
+                    .filter(|s| !s.is_empty())
                     .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+                    .or_else(|| {
+                        std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".config"))
+                    })
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
                     .join("vm")
             })
             .join("presets")

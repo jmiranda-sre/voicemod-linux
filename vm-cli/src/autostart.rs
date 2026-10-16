@@ -91,12 +91,11 @@ pub fn status_report(
 
 pub fn config_home() -> PathBuf {
     std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME").map(|h| PathBuf::from(h).join(".config")).unwrap_or_else(|_| {
-                PathBuf::from("/tmp")
-            })
-        })
+        .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
 fn ui_exec() -> String {
