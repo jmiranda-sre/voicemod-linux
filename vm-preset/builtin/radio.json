@@ -1,0 +1,66 @@
+{
+  "name": "radio",
+  "description": "Old-time radio: telephone-band EQ with speaker-box grit and a small room, glued together. For newsflashes from 1940.",
+  "rate": 48000,
+  "nodes": [
+    {
+      "id": "hp",
+      "type": "biquad",
+      "params": {
+        "type": { "value": "highpass", "public": false },
+        "freq_hz": { "value": 300.0, "range": [20.0, 20000.0, 1000.0], "public": true },
+        "q": { "value": 0.7, "range": [0.1, 18.0, 0.70710678], "public": true }
+      }
+    },
+    {
+      "id": "lp",
+      "type": "biquad",
+      "params": {
+        "type": { "value": "lowpass", "public": false },
+        "freq_hz": { "value": 3400.0, "range": [20.0, 20000.0, 1000.0], "public": true },
+        "q": { "value": 0.7, "range": [0.1, 18.0, 0.70710678], "public": true }
+      }
+    },
+    {
+      "id": "grit",
+      "type": "tube",
+      "params": {
+        "drive": { "value": 5.0, "range": [0.0, 10.0, 2.0], "public": true },
+        "tone_hz": { "value": 6000.0, "range": [500.0, 18000.0, 8000.0], "public": true },
+        "mix": { "value": 1.0, "range": [0.0, 1.0, 1.0], "public": true }
+      }
+    },
+    {
+      "id": "box",
+      "type": "reverb",
+      "params": {
+        "room_size": { "value": 0.15, "range": [0.0, 1.0, 0.5], "public": true },
+        "damping": { "value": 0.6, "range": [0.0, 1.0, 0.5], "public": true },
+        "wet": { "value": 0.12, "range": [0.0, 1.0, 0.33], "public": true }
+      }
+    },
+    {
+      "id": "glue",
+      "type": "compressor",
+      "params": {
+        "threshold_db": { "value": -18.0, "range": [-60.0, 0.0, -18.0], "public": true },
+        "ratio": { "value": 3.0, "range": [1.0, 20.0, 3.0], "public": true },
+        "attack_ms": { "value": 15.0, "range": [0.1, 500.0, 15.0], "public": true },
+        "release_ms": { "value": 200.0, "range": [5.0, 5000.0, 200.0], "public": true },
+        "knee_db": { "value": 6.0, "range": [0.0, 24.0, 6.0], "public": true },
+        "makeup_db": { "value": 2.0, "range": [-12.0, 24.0, 0.0], "public": true }
+      }
+    }
+  ],
+  "edges": [
+    { "from": "hp", "from_ch": 0, "to": "lp", "to_ch": 0 },
+    { "from": "lp", "from_ch": 0, "to": "grit", "to_ch": 0 },
+    { "from": "grit", "from_ch": 0, "to": "box", "to_ch": 0 },
+    { "from": "box", "from_ch": 0, "to": "glue", "to_ch": 0 }
+  ],
+  "public_params": [
+    "grit.drive",
+    "box.wet",
+    "glue.makeup_db"
+  ]
+}

@@ -696,6 +696,18 @@ abaixo são o plano proposto p/ aprovação.
 - Medição absoluta fim-a-fim em HW real segue no backlog item 1 (stub
   não gera xruns; prova aqui = budget algorítmico + CPU sã).
 
+### F-6 — FECHADA (pack de vozes-personagem) — 2026-10-15
+- 5 builtins (`robot`, `chipmunk`, `demon`, `radio`, `telephone`),
+  receitas próprias só com nós existentes; `BUILTIN_PRESETS` = 6 e o
+  seed do boot as instala sozinho (nunca sobrescreve).
+- Teste de builtins endurecido: 6 arquivos, edges = nós−1, public_params
+  pontuados; `vm check-preset` OK nos 5 via binário release.
+- Golden por persona: chipmunk 740 Hz ±5%, demon 293.7 Hz ±7%, robot
+  colore sem silenciar, radio/telefone passam 1 kHz melhor que 100 Hz
+  (tube gera harmônicos do grave — teste mede a física, não o chute:
+  direcional ×1.5 + rejeição absoluta <0.5; telephone vaza menos grave
+  que o radio).
+
 ### Ordem de execução sugerida (com motivo)
 1. **(11) Dashboard de saúde RT + watchdog** — PRIMEIRO porque é a
    instrumentação que todos os outros usam p/ se validar (xruns, CPU/nó,

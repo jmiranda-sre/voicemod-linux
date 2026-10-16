@@ -1,0 +1,31 @@
+{
+  "name": "chipmunk",
+  "description": "Chipmunk squeak: pitch and formants shifted up 9 semitones together (speedup character) with a safety limiter.",
+  "rate": 48000,
+  "nodes": [
+    {
+      "id": "squeak",
+      "type": "formant-pitch-shifter",
+      "params": {
+        "transpose_semitones": { "value": 9.0, "range": [-12.0, 12.0, 0.0], "public": true },
+        "formant_shift_semitones": { "value": 9.0, "range": [-12.0, 12.0, 0.0], "public": true },
+        "mix": { "value": 1.0, "range": [0.0, 1.0, 1.0], "public": true }
+      }
+    },
+    {
+      "id": "safe",
+      "type": "limiter",
+      "params": {
+        "threshold_db": { "value": -1.5, "range": [-24.0, 0.0, -1.5], "public": true },
+        "release_ms": { "value": 50.0, "range": [0.5, 1000.0, 50.0], "public": true }
+      }
+    }
+  ],
+  "edges": [
+    { "from": "squeak", "from_ch": 0, "to": "safe", "to_ch": 0 }
+  ],
+  "public_params": [
+    "squeak.transpose_semitones",
+    "safe.threshold_db"
+  ]
+}

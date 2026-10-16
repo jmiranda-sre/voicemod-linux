@@ -181,6 +181,16 @@ across (re-capture the profile afterwards anyway for the exact room).
 The *Health* tab proves the gain: per-node `lat ms` plus the chain
 total, next to the µs CPU cost.
 
+### Factory persona voices
+
+The first boot also seeds five character voices (same mechanism, same
+never-overwrite rule): `robot` (tube grit + raised formants + resonant
+echo), `chipmunk` (+9 semitones pitch and formants), `demon` (−7 pitch,
+dark formants, cave reverb), `radio` (telephone band + speaker grit),
+`telephone` (narrow dry handset). All built from shipped DSP nodes only,
+all validated by `vm check-preset` and golden-tested (pitch targets,
+band shape, finite output).
+
 ## Control API (WebSocket)
 
 Connect to `ws://127.0.0.1:8765`, send JSON, receive a reply plus broadcast

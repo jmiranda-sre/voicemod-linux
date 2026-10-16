@@ -173,8 +173,14 @@ pub fn validate(preset: &Preset) -> Result<(), PresetError> {
 /// `$VM_CONFIG_DIR/presets` (default `~/.config/vm/presets`) on first
 /// boot: `(file stem, JSON text)`. Seeding never overwrites — edits the
 /// user makes to a seeded file always win.
-pub const BUILTIN_PRESETS: &[(&str, &str)] =
-    &[("mic-npr-voice", include_str!("../builtin/mic-npr-voice.json"))];
+pub const BUILTIN_PRESETS: &[(&str, &str)] = &[
+    ("mic-npr-voice", include_str!("../builtin/mic-npr-voice.json")),
+    ("robot", include_str!("../builtin/robot.json")),
+    ("chipmunk", include_str!("../builtin/chipmunk.json")),
+    ("demon", include_str!("../builtin/demon.json")),
+    ("radio", include_str!("../builtin/radio.json")),
+    ("telephone", include_str!("../builtin/telephone.json")),
+];
 
 /// A neutral built-in example (own design, not a vendor pack):
 /// gentle drive → low-pass → output.
@@ -214,12 +220,17 @@ mod tests {
 
     #[test]
     fn builtin_presets_embed_and_validate() {
-        assert!(!BUILTIN_PRESETS.is_empty());
+        assert_eq!(BUILTIN_PRESETS.len(), 6, "mic chain + 5 personas");
         for (stem, text) in BUILTIN_PRESETS {
             let preset = load(text)
                 .unwrap_or_else(|e| panic!("builtin '{stem}' failed validation: {e}"));
             assert_eq!(&preset.name, stem, "builtin file stem must match preset name");
             assert!(!preset.nodes.is_empty());
+            // Sequential edges for every linear chain.
+            assert_eq!(preset.edges.len(), preset.nodes.len() - 1, "{stem}: chain must be fully linked");
+            for p in &preset.public_params {
+                assert!(p.contains('.'), "{stem}: public param '{p}' must be node.param");
+            }
         }
     }
 

@@ -6,6 +6,14 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added (F-6: factory persona voices)
+
+- Five built-in personas, shipped DSP nodes only: `robot`, `chipmunk`
+  (+9 st), `demon` (−7 st + cave), `radio` (band + grit + small room),
+  `telephone` (narrow dry band). Seeded on first boot, never overwrite.
+- Golden audio tests per persona (pitch targets ±5–7%, band-shape
+  directionals, finite output); `vm check-preset` validates all five.
+
 ### Added (F-5: low-latency mode + per-node latency)
 
 - `AudioNode::latency_samples` (default 0) with real group delays:

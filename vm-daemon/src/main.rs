@@ -2192,3 +2192,132 @@ mod integration_tests {
         ws.close(None).await.ok();
     }
 }
+
+#[cfg(test)]
+mod persona_tests {
+    use super::*;
+
+    fn render(state: &Arc<DaemonState>, input: &[f32]) -> Vec<f32> {
+        let mut proc = GraphProcessor::new(
+            state.graph.clone(),
+            state.voice_enabled.clone(),
+            state.muted.clone(),
+            state.graph_xruns.clone(),
+        );
+        let mut out_all = Vec::with_capacity(input.len());
+        for chunk in input.chunks(960) {
+            let ch = chunk.to_vec();
+            let input = [ch.clone(), ch];
+            let mut out = vec![vec![0.0f32; chunk.len()]; 2];
+            let ins: Vec<&[f32]> = input.iter().map(Vec::as_slice).collect();
+            let mut outs: Vec<&mut [f32]> = out.iter_mut().map(Vec::as_mut_slice).collect();
+            proc.process(48_000, &ins, &mut outs);
+            out_all.extend_from_slice(&out[0]);
+        }
+        out_all
+    }
+
+    fn sine(freq: f32, len: usize, amp: f32) -> Vec<f32> {
+        (0..len)
+            .map(|i| amp * (2.0 * std::f32::consts::PI * freq * i as f32 / 48_000.0).sin())
+            .collect()
+    }
+
+    fn freq_of(x: &[f32]) -> f32 {
+        let mut crossings = 0;
+        for w in x.windows(2) {
+            if (w[0] <= 0.0) != (w[1] <= 0.0) {
+                crossings += 1;
+            }
+        }
+        crossings as f32 * 48_000.0 / (2.0 * x.len() as f32)
+    }
+
+    fn rms(x: &[f32]) -> f32 {
+        (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt()
+    }
+
+    fn select_persona(state: &Arc<DaemonState>, voice: &str) {
+        seed_builtin_presets(&state.preset_dir).unwrap();
+        let (reply, _) = state.handle(&Action::SelectVoice { voice: voice.into() });
+        assert!(reply.ok, "{voice}: {:?}", reply.error);
+    }
+
+    #[test]
+    fn chipmunk_shifts_up_nine_semitones() {
+        let state = test_state();
+        select_persona(&state, "chipmunk");
+        let out = render(&state, &sine(440.0, 144_000, 0.5));
+        assert!(out.iter().all(|s| s.is_finite()));
+        // Past the 2048-sample STFT + startup: 440 * 2^(9/12) ≈ 740 Hz.
+        let f = freq_of(&out[96_000..]);
+        assert!((f - 740.0).abs() < 740.0 * 0.05, "chipmunk f = {f:.1} Hz");
+    }
+
+    #[test]
+    fn demon_shifts_down_seven_semitones() {
+        let state = test_state();
+        select_persona(&state, "demon");
+        let out = render(&state, &sine(440.0, 144_000, 0.5));
+        assert!(out.iter().all(|s| s.is_finite()));
+        // 440 * 2^(-7/12) ≈ 293.7 Hz (reverb tail keeps it finite).
+        let f = freq_of(&out[96_000..]);
+        assert!((f - 293.7).abs() < 293.7 * 0.07, "demon f = {f:.1} Hz");
+    }
+
+    #[test]
+    fn robot_colors_without_silencing() {
+        let state = test_state();
+        select_persona(&state, "robot");
+        let input = sine(440.0, 96_000, 0.5);
+        let out = render(&state, &input);
+        assert!(out.iter().all(|s| s.is_finite()));
+        let steady = &out[48_000..];
+        let in_r = rms(&input[48_000..]);
+        let out_r = rms(steady);
+        assert!(out_r > in_r * 0.2 && out_r < in_r * 3.0, "robot level {out_r:.3} vs {in_r:.3}");
+        let diff = steady
+            .iter()
+            .zip(input[48_000..].iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, |a, b| a.max(b));
+        assert!(diff > 0.05, "robot must audibly color the signal");
+    }
+
+    #[test]
+    fn radio_and_telephone_are_bands_around_1k() {
+        for (voice, stop_lo) in [("radio", 100.0), ("telephone", 100.0)] {
+            let state = test_state();
+            select_persona(&state, voice);
+            // In-band passes, an octave below the HP corner does not.
+            let hi = render(&state, &sine(1000.0, 48_000, 0.5));
+            let lo = render(&state, &sine(stop_lo, 48_000, 0.5));
+            let r_hi = rms(&hi[24_000..]) / 0.5;
+            let r_lo = rms(&lo[24_000..]) / 0.5;
+            assert!(hi.iter().all(|s| s.is_finite()) && lo.iter().all(|s| s.is_finite()));
+            // Tube harmonics of the bass probe leak back in-band, so the
+            // bar is directional (1 kHz clearly wins) plus absolute
+            // rejection (bass cut to well under half).
+            assert!(
+                r_hi > r_lo * 1.5,
+                "{voice}: 1 kHz ({r_hi:.3}) must pass better than 100 Hz ({r_lo:.3})"
+            );
+            assert!(r_lo < 0.5, "{voice}: bass must be cut ({r_lo:.3})");
+        }
+        // Telephone is the narrower of the two: less lows leak through.
+        let radio_lo = {
+            let state = test_state();
+            select_persona(&state, "radio");
+            rms(&render(&state, &sine(100.0, 48_000, 0.5))[24_000..])
+        };
+        let tele_lo = {
+            let state = test_state();
+            select_persona(&state, "telephone");
+            rms(&render(&state, &sine(100.0, 48_000, 0.5))[24_000..])
+        };
+        assert!(
+            tele_lo < radio_lo,
+            "telephone ({tele_lo:.4}) must leak less bass than radio ({radio_lo:.4})"
+        );
+    }
+}
