@@ -183,6 +183,9 @@ impl SoundboardMixer {
         (vad, mon)
     }
 
+    // Orthogonal scalars of the playback hot path; bundling them into a
+    // struct would only add indirection here.
+    #[allow(clippy::too_many_arguments)]
     fn accumulate(
         vad: &mut StereoBus,
         mon: &mut StereoBus,
@@ -290,9 +293,11 @@ mod fade_tests {
         let mut m = SoundboardMixer::new();
         // 1 s of DC at 48 kHz.
         m.add_sound(sound(7, vec![vec![1.0; 48_000]]));
-        let mut o = SoundOptions::default();
-        o.fade_in_secs = 0.1; // 4800 frames ramp
-        o.fade_out_secs = 0.1;
+        let o = SoundOptions {
+            fade_in_secs: 0.1, // 4800 frames ramp
+            fade_out_secs: 0.1,
+            ..Default::default()
+        };
         m.play(SoundHashId(7), o).unwrap();
         let (vad, _) = m.mix(48_000);
         assert!(vad.left[0] < 0.01, "fade-in starts near silence");

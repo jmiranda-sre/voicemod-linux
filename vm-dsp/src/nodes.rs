@@ -1203,7 +1203,7 @@ mod osc_tests {
         let mut o = Oscillator::default();
         o.set_param("freq_hz", ParamValue::Float(440.0)).unwrap();
         let ctx = ProcessContext { rate: 48_000, frames: 960 };
-        let mut out = vec![vec![0.0f32; 960]];
+        let mut out = [vec![0.0f32; 960]];
         let ins: Vec<&[f32]> = Vec::new();
         let mut outs: Vec<&mut [f32]> = out.iter_mut().map(Vec::as_mut_slice).collect();
         o.process(&ctx, &ins, &mut outs);
@@ -1233,9 +1233,9 @@ mod delay_tests {
         // Impulse then silence, over two quanta.
         let mut input = vec![0.0f32; 1920];
         input[0] = 1.0;
-        let mut out = vec![vec![0.0f32; 1920]];
+        let mut out = [vec![0.0f32; 1920]];
         let ins = [input.as_slice()];
-        let mut outs = [out[0].as_mut_slice()];
+        let outs = [out[0].as_mut_slice()];
         // Feed in two 960-frame calls to exercise cross-call state.
         for k in 0..2 {
             let ins_k = [&ins[0][k * 960..(k + 1) * 960]];

@@ -73,11 +73,7 @@ fn decode_symphonia(path: &Path) -> Result<DecodedPcm, SoundboardError> {
         .map_err(|e| SoundboardError::Decode(e.to_string()))?;
 
     let mut lanes: Vec<Vec<f32>> = vec![Vec::new(); channels];
-    loop {
-        let packet = match format.next_packet() {
-            Ok(p) => p,
-            Err(_) => break,
-        };
+    while let Ok(packet) = format.next_packet() {
         if packet.track_id() != track_id {
             continue;
         }

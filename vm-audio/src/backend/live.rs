@@ -47,7 +47,6 @@ struct NodeSummary {
 struct PortSummary {
     id: u32,
     node_id: u32,
-    name: String,
     /// "in" or "out" (port.direction).
     direction: String,
 }
@@ -474,7 +473,7 @@ fn worker_main(
                     let direction = props.get("port.direction").unwrap_or("").to_string();
                     if node_id != 0 && !name.is_empty() {
                         if let Ok(mut map) = ports_g.lock() {
-                            map.insert(obj.id, PortSummary { id: obj.id, node_id, name, direction });
+                            map.insert(obj.id, PortSummary { id: obj.id, node_id, direction });
                         }
                     }
                 }
@@ -1007,7 +1006,7 @@ impl Worker {
                     {
                         static BLEN2: std::sync::atomic::AtomicUsize =
                             std::sync::atomic::AtomicUsize::new(0);
-                        if BLEN2.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 200 == 0 {
+                        if BLEN2.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(200) {
                             let nd = buffer.datas_mut().len();
                             let lens: Vec<usize> = buffer
                                 .datas_mut()
@@ -1056,12 +1055,12 @@ impl Worker {
                                 if cap_ch == 1 {
                                     stage.copy_from_slice(&data.scratch_raw[..frames]);
                                 } else {
-                                    for f in 0..frames {
+                                    for (f, s) in stage.iter_mut().enumerate().take(frames) {
                                         let mut acc = 0.0;
                                         for c in 0..cap_ch {
                                             acc += data.scratch_raw[f * cap_ch + c];
                                         }
-                                        stage[f] = acc / cap_ch as f32;
+                                        *s = acc / cap_ch as f32;
                                     }
                                 }
                             }
@@ -1096,7 +1095,7 @@ impl Worker {
                             {
                                 static OPEAK: std::sync::atomic::AtomicUsize =
                                     std::sync::atomic::AtomicUsize::new(0);
-                                if OPEAK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 300 == 0 {
+                                if OPEAK.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(300) {
                                     let mx = data
                                         .scratch_out
                                         .iter()
@@ -1115,10 +1114,12 @@ impl Worker {
                             {
                                 static IPEAK: std::sync::atomic::AtomicUsize =
                                     std::sync::atomic::AtomicUsize::new(0);
-                                if IPEAK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 300 == 0 {
+                                if IPEAK.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(300) {
                                     let mx = bytes
-                                        .chunks_exact(4)
-                                        .map(|w| f32::from_le_bytes([w[0], w[1], w[2], w[3]]).abs())
+                                        .as_chunks::<4>()
+                                        .0
+                                        .iter()
+                                        .map(|w| f32::from_le_bytes(*w).abs())
                                         .fold(0.0f32, f32::max);
                                     eprintln!("IPEAK interleaved peak={mx:.4} frames={frames}");
                                 }
@@ -1169,7 +1170,13 @@ impl Worker {
                                     0.0
                                 });
                             }
-                            for (i, word) in bytes.chunks_exact_mut(4).enumerate().take(frames * ch) {
+                            for (i, word) in bytes
+                                .as_chunks_mut::<4>()
+                                .0
+                                .iter_mut()
+                                .enumerate()
+                                .take(frames * ch)
+                            {
                                 word.copy_from_slice(&data.scratch[i].to_le_bytes());
                             }
                             let chunk = data_chunk.chunk_mut();
@@ -1406,7 +1413,7 @@ mod pod_tests {
         for ch in [1u32, 2u32] {
             let pod = format_pod(ch).expect("build pod");
             let mut info = pipewire::spa::param::audio::AudioInfoRaw::new();
-            info.parse(&pod).expect("parse pod");
+            info.parse(pod).expect("parse pod");
             assert_eq!(info.rate(), 48_000, "rate for {ch}ch");
             assert_eq!(info.channels(), ch, "channels");
             assert_eq!(

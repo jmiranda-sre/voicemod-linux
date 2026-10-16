@@ -76,7 +76,6 @@ pub struct Snapshot {
     pub muted: bool,
     pub selected_voice: String,
     pub last_error: String,
-    pub master_per_mille: u16,
 }
 
 impl Snapshot {
@@ -101,7 +100,7 @@ pub struct UiLink {
 impl UiLink {
     pub fn new(repaint: impl Fn() + Send + Sync + 'static) -> Self {
         let (tx, rx) = mpsc::channel::<ToLink>();
-        let snapshot = Arc::new(Mutex::new(Snapshot { master_per_mille: 1000, ..Default::default() }));
+        let snapshot = Arc::new(Mutex::new(Snapshot::default()));
         let snap = snapshot.clone();
         let next_id = Arc::new(std::sync::atomic::AtomicU64::new(1));
         std::thread::Builder::new()
@@ -226,14 +225,6 @@ async fn connect(
     Err("no Control API port reachable".to_string())
 }
 
-async fn ws_is_closed(ws: &mut Ws) -> bool {
-    use futures_util::StreamExt as _;
-    // Peek via a zero-timeout poll is complex; instead detect on next op.
-    // True closure surfaces as an error inside `request`.
-    let _ = ws;
-    false
-}
-
 /// Send one action; consume messages until the reply (`"ok"` key) arrives.
 /// Broadcasts (`"event"` key) update the snapshot along the way.
 async fn request(
@@ -250,7 +241,7 @@ async fn request(
     }
     let text = action.to_string();
     if ws.send(Message::Text(text.into())).await.is_err() {
-        update_snap(&snap, repaint, |s| s.connected = false);
+        update_snap(snap, repaint, |s| s.connected = false);
         return false;
     }
     let want_id = action.get("id").cloned();
@@ -258,7 +249,7 @@ async fn request(
         let msg = match tokio::time::timeout(std::time::Duration::from_secs(10), ws.next()).await {
             Ok(Some(Ok(m))) => m,
             _ => {
-                update_snap(&snap, repaint, |s| s.connected = false);
+                update_snap(snap, repaint, |s| s.connected = false);
                 return false;
             }
         };
@@ -287,7 +278,7 @@ async fn request(
 }
 
 fn apply_event(snap: &Arc<Mutex<Snapshot>>, repaint: &Arc<dyn Fn()>, v: &serde_json::Value) {
-    update_snap(&snap, &repaint, |s| {
+    update_snap(snap, repaint, |s| {
         match v.get("event").and_then(|e| e.as_str()) {
             Some("voiceChanged") => {
                 s.selected_voice = v.get("voice").and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -309,7 +300,7 @@ fn apply_reply(
     action: &serde_json::Value,
     reply: &serde_json::Value,
 ) {
-    update_snap(&snap, &repaint, |s| {
+    update_snap(snap, repaint, |s| {
         if reply.get("ok").and_then(|x| x.as_bool()) != Some(true) {
             s.set_error(
                 reply.get("error").and_then(|x| x.as_str()).unwrap_or("action failed").to_string(),

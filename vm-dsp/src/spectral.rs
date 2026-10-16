@@ -91,7 +91,7 @@ impl PitchEngine {
         self.ensure_channels(inputs.len());
         // Stretch longer by β, then resample back by 1/β: net duration ×1,
         // pitch ×β. (hop_s = Ha·β is the correct direction.)
-        let beta = self.pitch.max(0.5).min(2.0);
+        let beta = self.pitch.clamp(0.5, 2.0);
         let hop_s = ((HOP_A as f32) * beta).round().max(64.0) as usize;
         // Consume the stretched stream β× faster than it is produced:
         // duration back to ×1, pitch ×β.
@@ -210,9 +210,9 @@ fn analyze_into(
         }
         // Shift OLA/norm buffers.
         ch.ola.drain(..hop_s.min(n));
-        ch.ola.extend(std::iter::repeat(0.0).take(hop_s.min(n)));
+        ch.ola.extend(std::iter::repeat_n(0.0, hop_s.min(n)));
         ch.norm.drain(..hop_s.min(n));
-        ch.norm.extend(std::iter::repeat(0.0).take(hop_s.min(n)));
+        ch.norm.extend(std::iter::repeat_n(0.0, hop_s.min(n)));
     }
 
 /// Spectral envelope via real cepstrum with low-quefrency liftering.

@@ -119,8 +119,8 @@ pub fn demux(mut data: &[u8]) -> Result<Vec<OggStream>, OggError> {
         if page_crc(page) != stored_crc {
             continue; // corrupt page: skip, keep stream state
         }
-        if !streams.contains_key(&serial) {
-            streams.insert(serial, Vec::new());
+        if let std::collections::hash_map::Entry::Vacant(e) = streams.entry(serial) {
+            e.insert(Vec::new());
             order.push(serial);
         }
         let bos = header_type & 0x02 != 0;

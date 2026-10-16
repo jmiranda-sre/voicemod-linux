@@ -46,6 +46,9 @@ async fn call_one(port: u16, text: &str) -> Result<serde_json::Value, String> {
         let v: serde_json::Value =
             serde_json::from_str(msg.to_text().unwrap_or("")).map_err(|e| format!("decode: {e}"))?;
         if v.get("ok").is_some() {
+            // Graceful close: a bare drop makes the daemon log a
+            // "connection reset without closing handshake" per call.
+            let _ = ws.close(None).await;
             return Ok(v);
         }
         // Broadcasts ("event") belong to everyone; keep waiting.

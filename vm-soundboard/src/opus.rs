@@ -32,10 +32,8 @@ fn parse_head(packet: &[u8]) -> Result<(usize, usize), SoundboardError> {
     if mapping_family != 0 && mapping_family != 1 {
         return Err(SoundboardError::Decode(format!("unsupported mapping family {mapping_family}")));
     }
-    if mapping_family == 1 {
-        if packet.len() < 21 + channels {
-            return Err(SoundboardError::Decode("truncated channel mapping".into()));
-        }
+    if mapping_family == 1 && packet.len() < 21 + channels {
+        return Err(SoundboardError::Decode("truncated channel mapping".into()));
     }
     Ok((channels, preskip))
 }
