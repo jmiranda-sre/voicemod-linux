@@ -243,11 +243,11 @@ mod tests {
         let preset = load(text).unwrap();
         let types: Vec<&str> = preset.nodes.iter().map(|n| n.r#type.as_str()).collect();
         // The EasyEffects chain maps 1:1 (rnnoise+deepfilternet →
-        // denoise; two Hi-pass stages mirror slope x2).
+        // denoise; the 80 Hz Hi-pass is a single 12 dB/oct stage).
         for want in ["denoise", "gate", "biquad", "compressor", "de-esser", "limiter"] {
             assert!(types.contains(&want), "chain missing node type {want}");
         }
-        // Sequential edges: 10 links for 11 nodes.
+        // Sequential edges: 9 links for 10 nodes.
         assert_eq!(preset.edges.len(), preset.nodes.len() - 1);
         assert!(preset.public_params.contains(&"comp.threshold_db".to_string()));
     }

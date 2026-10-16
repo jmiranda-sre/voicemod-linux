@@ -811,3 +811,45 @@ abaixo são o plano proposto p/ aprovação.
   nasce como OPT-IN com o trade-off escrito na UI, não default.
 - Hotkeys globais fora de jogo Wayland: evdev lê hardware, não
   compositor — funciona, mas testar em CachyOS/KWin antes de prometer.
+
+## RECALIBRAÇÃO mic-npr-voice (pós-0.3.0, 2026-10-16)
+Sintoma: fundo + respiração nasal audíveis. Diagnóstico: gate/comp/EQ/
+de-esser/limiter já idênticos ao EasyEffects; 2 divergências reais:
+(1) HPF duplo = 24 dB/oct contra `Slope x2 (12 dB/oct)` do spec →
+virado estágio único (cadeia 11→10 nós); (2) denoise em 2.0/−35
+fraco p/ substituir rnnoise+DFN empilhados → 3.0/−45 dB.
+Medido (sintético determinístico): estacionário ×0.134 (−17.5 dB),
+pausas ×0.003, puffs ×0.042, fala ×0.846 — barras travadas no teste
+E2E. Teste F-3 de `strength` agora lê o valor do preset embarcado
+(nunca mais hardcoded). Seed avisa no boot quando o arquivo difere
+da fábrica (nunca sobrescreve): deletar o arquivo recebe a update.
+
+## v0.4.0 — ROADMAP APROVADO (planejamento, 2026-10-16 — SEM CÓDIGO)
+14 itens do brainstorm em 4 pilares → 4 frentes. Ordem sugerida:
+**D → A → C → B** (infra de automação primeiro p/ testar o resto;
+DSP pesado em seguida; roteamento; UX coroa o ciclo; itens do B são
+paralelizáveis a qualquer momento).
+
+### F-0.4.D — Automação + dispositivos (Pilar 4)
+- Item 42: CLI 100% da Control API (base p/ scripts/testes de tudo).
+- Item 45: perfis por dispositivo físico (cadeia por mic, troca no plug).
+
+### F-0.4.A — DSP de nova geração (Pilar 1)
+- Item 2: denoisers neurais ONNX (RNNoise/DeepFilterNet locais,
+  selecionáveis; espectral vira fallback).
+- Item 8: autogain EBU R128 (alimenta o wizard do B).
+- Item 3: autotune key+escala (sobre o phase-vocoder).
+- Item 5: convolver com IRs (salas/cabinets).
+
+### F-0.4.C — Roteamento e integrações (Pilar 3)
+- Item 15: monitor mix independente (hear-myself sem atraso).
+- Item 14: ducking por sidechain (música/soundboard sob fala).
+- Item 35: dock/plugin OBS (voz por cena).
+- Item 37: MIDI learn (params/mute/pads/vozes).
+
+### F-0.4.B — Soundboard Pro + UX (Pilar 2, paralelizável)
+- Item 29: wizard de primeira execução (calibragem gate/ruído —
+  responde direto à dor que motivou a recalibração).
+- Item 26: curva de EQ gráfica interativa.
+- Item 18: injeção por aplicação (passthrough).
+- Item 20: Instant Replay buffer 30 s.

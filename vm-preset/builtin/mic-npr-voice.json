@@ -1,14 +1,14 @@
 {
   "name": "mic-npr-voice",
-  "description": "Ready-to-use clean mic chain: spectral noise reduction, noise gate, 5-band EQ (80 Hz HPF x2, -2 dB @220/350, +2 dB @3.5k, +2 dB air shelf), 3:1 compressor with +3 dB makeup, 4 kHz de-esser and a -1.5 dB limiter. Ported from the EasyEffects 'Masc NPR Voice + Noise Reduction' preset.",
+  "description": "Ready-to-use clean mic chain: spectral noise reduction, noise gate, 5-band EQ (80 Hz HPF 12 dB/oct, -2 dB @220/350, +2 dB @3.5k, +2 dB air shelf), 3:1 compressor with +3 dB makeup, 4 kHz de-esser and a -1.5 dB limiter. Ported from the EasyEffects 'Masc NPR Voice + Noise Reduction' preset.",
   "rate": 48000,
   "nodes": [
     {
       "id": "denoise",
       "type": "denoise",
       "params": {
-        "strength": { "value": 2.0, "range": [1.0, 4.0, 2.0], "public": true },
-        "reduction_db": { "value": -35.0, "range": [-60.0, 0.0, -30.0], "public": true },
+        "strength": { "value": 3.0, "range": [1.0, 4.0, 2.0], "public": true },
+        "reduction_db": { "value": -45.0, "range": [-60.0, 0.0, -30.0], "public": true },
         "frame": { "value": 1024, "range": [512.0, 1024.0, 1024.0], "public": true }
       }
     },
@@ -24,16 +24,7 @@
       }
     },
     {
-      "id": "hpf1",
-      "type": "biquad",
-      "params": {
-        "type": { "value": "highpass", "public": false },
-        "freq_hz": { "value": 80.0, "range": [20.0, 20000.0, 1000.0], "public": true },
-        "q": { "value": 0.7, "range": [0.1, 18.0, 0.70710678], "public": true }
-      }
-    },
-    {
-      "id": "hpf2",
+      "id": "hp",
       "type": "biquad",
       "params": {
         "type": { "value": "highpass", "public": false },
@@ -115,9 +106,8 @@
   ],
   "edges": [
     { "from": "denoise", "from_ch": 0, "to": "gate", "to_ch": 0 },
-    { "from": "gate", "from_ch": 0, "to": "hpf1", "to_ch": 0 },
-    { "from": "hpf1", "from_ch": 0, "to": "hpf2", "to_ch": 0 },
-    { "from": "hpf2", "from_ch": 0, "to": "eq220", "to_ch": 0 },
+    { "from": "gate", "from_ch": 0, "to": "hp", "to_ch": 0 },
+    { "from": "hp", "from_ch": 0, "to": "eq220", "to_ch": 0 },
     { "from": "eq220", "from_ch": 0, "to": "eq350", "to_ch": 0 },
     { "from": "eq350", "from_ch": 0, "to": "eq3500", "to_ch": 0 },
     { "from": "eq3500", "from_ch": 0, "to": "air", "to_ch": 0 },

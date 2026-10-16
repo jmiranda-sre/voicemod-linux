@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 semantic versioning.
 
+## [Unreleased]
+
+### Fixed (mic-npr-voice recalibration)
+
+- Denoise retuned to replace the *two* stacked neural denoisers it
+  stands in for: `strength` 2.0 → 3.0, floor −35 → −45 dB. Pauses go
+  near-silent (×0.003), breath puffs crushed (×0.042), stationary
+  noise −17.5 dB, speech preserved (×0.85) — locked by test bars.
+- Hi-pass corrected to a single 12 dB/oct stage per the EasyEffects
+  `Slope x2 (12 dB/oct)` spec (was two cascaded = 24 dB/oct).
+  Gate/compressor/EQ/de-esser/limiter values were already exact.
+- Boot now logs when a seeded file differs from the factory version
+  (seed never overwrites): delete the file to receive recalibrations.
+
 ## [0.3.0] — 2026-10-16
 
 ### Added (F-13: autostart + tray)

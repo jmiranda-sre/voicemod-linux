@@ -176,7 +176,7 @@ The chain is a clean-room port of the popular EasyEffects *Masc NPR Voice
 | --- | --- | --- |
 | Noise removal | rnnoise + DeepFilterNet (neural) | `denoise` (spectral, per-bin noise floor) |
 | Between-speech cut | gate −50 dB / −12 dB | `gate` (hysteresis 3 dB) |
-| Rumble filter | Hi-pass 80 Hz, slope ×2 | two cascaded `biquad` highpasses |
+| Rumble filter | Hi-pass 80 Hz, 12 dB/oct | one `biquad` highpass |
 | Tone shaping | Bell 220 −2, Bell 350 −2, Bell 3.5k +2, Hi-shelf 10k +2 | four `biquad` (peaking/shelf) |
 | Leveling | Compressor −18 dB, 3:1, knee 6, +3 makeup | `compressor` |
 | Sibilance | De-esser 4 kHz, −22 dB, 3:1 | `de-esser` |

@@ -889,6 +889,15 @@ fn seed_builtin_presets(preset_dir: &std::path::Path) -> std::io::Result<()> {
         let path = preset_dir.join(format!("{stem}.json"));
         if !path.exists() {
             std::fs::write(path, text)?;
+        } else if std::fs::read_to_string(&path).map(|t| t != *text).unwrap_or(false) {
+            // Never overwrite — but say so loudly, or factory
+            // recalibrations (stronger denoise, retuned chains) would
+            // never reach existing installs.
+            eprintln!(
+                "preset '{stem}' differs from the factory version; \
+                 delete {} to receive the update (your edits will be lost)",
+                path.display()
+            );
         }
     }
     Ok(())
@@ -1804,7 +1813,7 @@ mod osc_chain_tests {
         assert!(reply.ok, "{:?}", reply.error);
         assert!(matches!(evts[0], ControlEvent::VoiceChanged { .. }));
         assert_eq!(*state.voice_name.lock().unwrap(), "mic-npr-voice");
-        assert_eq!(state.node_ids.lock().unwrap().len(), 11, "full chain must be wired");
+        assert_eq!(state.node_ids.lock().unwrap().len(), 10, "full chain must be wired");
 
         // Deterministic white noise (LCG), ±amp.
         let mut st = 0x2545_f491_4f6c_dd1du64;
@@ -1834,11 +1843,71 @@ mod osc_chain_tests {
         // stationary noise must come out quieter than it went in.
         let in_r = rms(&noise[72_000..]);
         let out_r = rms(&out_all[72_000..]);
+        eprintln!("stationary: in {in_r:.5}, out {out_r:.5}, ratio {r:.3}", r = out_r / in_r);
         assert!(
-            out_r < in_r * 0.9,
-            "mic chain must attenuate stationary noise: in {in_r:.4}, out {out_r:.4}"
+            out_r < in_r * 0.5,
+            "mic chain must crush stationary noise: in {in_r:.4}, out {out_r:.4}"
         );
         assert!(out_r > in_r * 0.001, "output must not be muted: {out_r:.5}");
+
+        // Nasal breathing: lowpassed-noise puffs (-30 dB peaks) over a
+        // -55 dB room bed. Pauses must go near-silent; puffs must come
+        // out weaker than they went in.
+        let mut st2 = 0x9e37_79b9_7f4a_7c15u64;
+        let mut lp = 0.0f32;
+        let mut breath = Vec::with_capacity(288_000);
+        for i in 0..288_000 {
+            st2 = st2.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            let w = ((st2 >> 32) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0;
+            lp += 0.04 * (w - lp); // heavy lowpass: breath-like rumble
+            let t = (i as f32 / 48_000.0) % 2.5;
+            let puff = if t < 0.5 { (t / 0.5 * std::f32::consts::PI).sin() } else { 0.0 };
+            breath.push(lp * (0.004 + 0.03 * puff));
+        }
+        let mut out_b = Vec::with_capacity(288_000);
+        for chunk in breath.as_chunks::<960>().0 {
+            let input = [chunk.to_vec(), chunk.to_vec()];
+            let mut out = vec![vec![0.0f32; chunk.len()]; 2];
+            let ins: Vec<&[f32]> = input.iter().map(Vec::as_slice).collect();
+            let mut outs: Vec<&mut [f32]> = out.iter_mut().map(Vec::as_mut_slice).collect();
+            proc.process(48_000, &ins, &mut outs);
+            out_b.extend_from_slice(&out[0]);
+        }
+        // Pause segment (room bed only, floor learned, gate settled):
+        // 3.5–4.5 s. Puff #3 at 5.0–5.5 s (fully warmed floor).
+        let bed_in = rms(&breath[168_000..216_000]);
+        let bed_out = rms(&out_b[168_000..216_000]);
+        let puff_in = rms(&breath[240_000..264_000]);
+        let puff_out = rms(&out_b[240_000..264_000]);
+        eprintln!(
+            "breath: bed in {bed_in:.5} out {bed_out:.5} (x{rb:.3}); puff in {puff_in:.5} out {puff_out:.5} (x{rp:.3})",
+            rb = bed_out / bed_in,
+            rp = puff_out / puff_in
+        );
+        assert!(bed_out < bed_in * 0.1, "pauses must go near-silent");
+        assert!(puff_out < puff_in * 0.5, "breath puffs must be crushed");
+
+        // Speech preservation: loud low-band complex tone after warmup.
+        let speech: Vec<f32> = (0..96_000)
+            .map(|i| {
+                let t = i as f32 / 48_000.0;
+                0.25 * (2.0 * std::f32::consts::PI * 150.0 * t).sin()
+                    + 0.15 * (2.0 * std::f32::consts::PI * 300.0 * t).sin()
+            })
+            .collect();
+        let mut out_s = Vec::with_capacity(96_000);
+        for chunk in speech.as_chunks::<960>().0 {
+            let input = [chunk.to_vec(), chunk.to_vec()];
+            let mut out = vec![vec![0.0f32; chunk.len()]; 2];
+            let ins: Vec<&[f32]> = input.iter().map(Vec::as_slice).collect();
+            let mut outs: Vec<&mut [f32]> = out.iter_mut().map(Vec::as_mut_slice).collect();
+            proc.process(48_000, &ins, &mut outs);
+            out_s.extend_from_slice(&out[0]);
+        }
+        let sp_in = rms(&speech[48_000..]);
+        let sp_out = rms(&out_s[48_000..]);
+        eprintln!("speech: in {sp_in:.4}, out {sp_out:.4}, ratio {r:.3}", r = sp_out / sp_in);
+        assert!(sp_out > sp_in * 0.5, "speech must survive the chain");
     }
 }
 
@@ -1961,7 +2030,13 @@ mod profile_tests {
         }
         assert_eq!(
             dn.params["strength"].value,
-            vm_preset::JsonParamValue::Float(2.0),
+            vm_preset::BUILTIN_PRESETS
+                .iter()
+                .find(|(s, _)| *s == "mic-npr-voice")
+                .and_then(|(_, t)| vm_preset::load(t).ok())
+                .and_then(|p| p.nodes.into_iter().find(|n| n.id == "denoise"))
+                .and_then(|n| n.params.get("strength").map(|s| s.value.clone()))
+                .expect("embedded preset carries strength"),
             "unrelated params survive capture"
         );
 
