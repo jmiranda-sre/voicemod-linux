@@ -4,11 +4,13 @@
 //! with `vm-preset` for ranges), everything else flows through actions.
 
 mod link;
+mod tray;
 
 use eframe::egui;
 use link::{Snapshot, UiLink};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tray::{Tray, TrayAction};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -33,13 +35,33 @@ struct VmApp {
     input_sel: String,
     daemon_child: Option<std::process::Child>,
     status_msg: String,
+    /// System tray (None = window-only: sandbox or no SNI host).
+    tray: Option<Tray>,
+    /// Last synced (visible, muted) — menu updates only on change.
+    tray_sync: (bool, bool),
+    visible: bool,
+    quit_requested: bool,
 }
 
 impl VmApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let ctx = cc.egui_ctx.clone();
-        let link = UiLink::new(move || ctx.request_repaint());
+        let link = UiLink::new({
+            let ctx = ctx.clone();
+            move || ctx.request_repaint()
+        });
         let snap = link.snapshot.clone();
+        let visible = !Self::start_hidden();
+        if !visible {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+        let tray = match Tray::new() {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!("tray: {e} (window-only mode)");
+                None
+            }
+        };
         let mut app = Self {
             link,
             snap,
@@ -54,9 +76,19 @@ impl VmApp {
             input_sel: String::new(),
             daemon_child: None,
             status_msg: "connecting…".to_string(),
+            tray,
+            tray_sync: (visible, false),
+            visible,
+            quit_requested: false,
         };
         app.refresh_presets();
         app
+    }
+
+    /// `--minimized`: boot straight into the tray (used by the XDG
+    /// autostart entry). Pure function for testability.
+    fn start_hidden() -> bool {
+        start_hidden_from(std::env::args())
     }
 
     fn preset_dir() -> std::path::PathBuf {
@@ -142,6 +174,43 @@ impl VmApp {
 impl eframe::App for VmApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let snap = self.snap.lock().map(|s| s.clone()).unwrap_or_default();
+
+        // Tray: drain menu/click actions, then reflect state in the menu
+        // (only on change — each sync is an SNI round-trip).
+        if let Some(tray) = &self.tray {
+            for action in tray.poll() {
+                match action {
+                    TrayAction::ToggleVisibility => {
+                        self.visible = !self.visible;
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(self.visible));
+                    }
+                    TrayAction::ToggleMute => {
+                        self.act(serde_json::json!({
+                            "action": "setMuted", "muted": !snap.muted,
+                        }));
+                    }
+                    TrayAction::Quit => {
+                        self.quit_requested = true;
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+            }
+            if (self.visible, snap.muted) != self.tray_sync {
+                tray.sync(self.visible, snap.muted);
+                self.tray_sync = (self.visible, snap.muted);
+            }
+        }
+        // Minimize-to-tray: plain window-close hides instead of quitting
+        // (the WS link thread is unaffected). Quit only via the tray.
+        // Without a tray (sandbox/headless) close behaves normally.
+        if self.tray.is_some()
+            && !self.quit_requested
+            && ui.ctx().input(|i| i.viewport().close_requested())
+        {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.visible = false;
+        }
 
         // Keep local preset selection in sync with the daemon voice.
         if !snap.selected_voice.is_empty()
@@ -547,10 +616,12 @@ impl VmApp {
 }
 
 fn main() -> eframe::Result<()> {
+    let hidden = start_hidden_from(std::env::args());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([980.0, 640.0])
-            .with_position([80.0, 80.0]),
+            .with_position([80.0, 80.0])
+            .with_visible(!hidden),
         ..Default::default()
     };
     eframe::run_native(
@@ -558,4 +629,26 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(VmApp::new(cc)))),
     )
+}
+
+/// `--minimized` anywhere in argv boots straight into the tray.
+fn start_hidden_from(mut args: impl Iterator<Item = String>) -> bool {
+    args.any(|a| a == "--minimized")
+}
+
+#[cfg(test)]
+mod ui_flag_tests {
+    use super::start_hidden_from;
+
+    fn argv(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn minimized_flag_detected() {
+        assert!(start_hidden_from(argv(&["vm-ui", "--minimized"]).into_iter()));
+        assert!(start_hidden_from(argv(&["vm-ui", "--foo", "--minimized", "--bar"]).into_iter()));
+        assert!(!start_hidden_from(argv(&["vm-ui"]).into_iter()));
+        assert!(!start_hidden_from(argv(&["vm-ui", "--minimize"]).into_iter()));
+    }
 }

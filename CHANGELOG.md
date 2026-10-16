@@ -6,6 +6,20 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added (F-13: autostart + tray)
+
+- `vm autostart status|enable|disable`: XDG desktop entry
+  (`vm-ui --minimized`) + `systemctl --user` wiring for the existing
+  `vm-daemon.service`; honest partial-failure reports, sandbox portal
+  guidance instead of acting.
+- UI system tray (StatusNotifier/AppIndicator, icon drawn in code):
+  close-to-hide with the WS link untouched, live mute checkmark, Quit;
+  `--minimized` boots into the tray.
+- UI snapshot learns `muted` (`mutedChanged` + health seed) for the
+  tray checkmark.
+- Sandbox: no tray, plain window; autostart delegated to the Flatpak
+  Background permission with an explanatory message.
+
 ### Added (F-6: factory persona voices)
 
 - Five built-in personas, shipped DSP nodes only: `robot`, `chipmunk`

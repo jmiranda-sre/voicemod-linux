@@ -72,6 +72,8 @@ pub struct Snapshot {
     pub health: HealthInfo,
     pub tier: String,
     pub voice_enabled: bool,
+    /// Master mute (tray menu checkmark; fed by `mutedChanged` + health).
+    pub muted: bool,
     pub selected_voice: String,
     pub last_error: String,
     pub master_per_mille: u16,
@@ -293,6 +295,9 @@ fn apply_event(snap: &Arc<Mutex<Snapshot>>, repaint: &Arc<dyn Fn()>, v: &serde_j
             Some("voiceChangerToggled") => {
                 s.voice_enabled = v.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
             }
+            Some("mutedChanged") => {
+                s.muted = v.get("muted").and_then(|x| x.as_bool()).unwrap_or(false);
+            }
             _ => {}
         }
     });
@@ -358,6 +363,9 @@ fn apply_reply(
             }
             "getHealth" => {
                 s.health = parse_health(data);
+                s.muted = data.and_then(|d| d.get("muted")).and_then(|x| x.as_bool()).unwrap_or(false);
+                s.voice_enabled =
+                    data.and_then(|d| d.get("enabled")).and_then(|x| x.as_bool()).unwrap_or(true);
             }
             _ => {}
         }
@@ -450,6 +458,8 @@ mod link_tests {
                 "link": "Streaming",
                 "graphXruns": 3,
                 "latencyMs": 10.666,
+                "muted": true,
+                "enabled": false,
                 "nodes": [
                     {"node": "denoise", "avgUs": 410.5, "maxUs": 900, "calls": 50, "latMs": 10.666}
                 ],
@@ -464,6 +474,8 @@ mod link_tests {
         assert!(s.health.active);
         assert_eq!(s.health.graph_xruns, 3);
         assert!((s.health.latency_ms - 10.666).abs() < 1e-9);
+        assert!(s.muted, "health seeds the tray mute checkmark");
+        assert!(!s.voice_enabled);
         assert_eq!(s.health.nodes.len(), 1);
         assert_eq!(s.health.nodes[0].node, "denoise");
         assert!((s.health.nodes[0].avg_us - 410.5).abs() < 1e-9);

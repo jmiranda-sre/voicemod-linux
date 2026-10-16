@@ -708,6 +708,20 @@ abaixo são o plano proposto p/ aprovação.
   direcional ×1.5 + rejeição absoluta <0.5; telephone vaza menos grave
   que o radio).
 
+### F-13 — FECHADA (autostart + tray) — 2026-10-15
+- `vm autostart`: entry XDG (`--minimized`) + unit user; falha parcial
+  honesta; sandbox → guia de portal (Background permission).
+- Tray SNI (ícone em código, menu Show/mute/Quit, left-click alterna):
+  close esconde (link WS intacto), Quit sai de verdade; `--minimized`
+  nasce escondido; sem tray (sandbox/sem host) = janela normal.
+- Snapshot UI += `muted` (evento + seed do health) p/ o checkmark.
+- Unit validada (`systemd-analyze verify` só reclama do binário, que
+  não está instalado aqui); desktop renderizado passa no
+  `desktop-file-validate`; ciclo enable→status→disable provado ao vivo.
+- Testes: ícone 32px RGBA, flag `--minimized`, entry/install/remove/
+  lookup/status puros; tray runtime não executado sem display (nota
+  honesta — D-Bus/SNI do usuário intocados).
+
 ### Ordem de execução sugerida (com motivo)
 1. **(11) Dashboard de saúde RT + watchdog** — PRIMEIRO porque é a
    instrumentação que todos os outros usam p/ se validar (xruns, CPU/nó,

@@ -3,6 +3,8 @@
 //! Talks to `vm-daemon` today via direct crate calls in-process (Fase 3b
 //! moves this onto the WebSocket Control API as its first client).
 
+mod autostart;
+
 use clap::{Parser, Subcommand};
 use vm_audio::backend::stub::StubBackend;
 use vm_audio::{AudioBackend, StreamTopology, DeviceUid};
@@ -32,6 +34,21 @@ enum Cmd {
     Actions,
     /// List readable evdev keyboards (needs input permissions).
     Keyboards,
+    /// Manage login autostart (XDG entry + systemd --user unit).
+    Autostart {
+        #[command(subcommand)]
+        op: AutostartOp,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AutostartOp {
+    /// Show UI entry + daemon unit state.
+    Status,
+    /// Install XDG entry, enable+start the daemon unit.
+    Enable,
+    /// Remove XDG entry, disable+stop the daemon unit.
+    Disable,
 }
 
 #[tokio::main]
@@ -119,6 +136,14 @@ async fn main() {
             for k in vm_control::HotkeyManager::scan_keyboards() {
                 println!("{k}");
             }
+        }
+        Cmd::Autostart { op } => {
+            let out = match op {
+                AutostartOp::Status => autostart::cmd_status(),
+                AutostartOp::Enable => autostart::cmd_enable(),
+                AutostartOp::Disable => autostart::cmd_disable(),
+            };
+            println!("{out}");
         }
     }
 }

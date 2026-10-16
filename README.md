@@ -116,6 +116,26 @@ else keeps working. Inside the Flatpak sandbox (`/.flatpak-info` present)
 hotkeys are unavailable by design — the daemon says so plainly and keeps
 serving the Control API.
 
+### Autostart and system tray
+
+`vm autostart status|enable|disable` manages login autostart: an XDG
+desktop entry booting `vm-ui --minimized` plus the `systemd --user`
+unit (`vm-daemon.service`, installed by the native package) for the
+headless pipeline:
+
+```bash
+vm autostart enable    # UI entry + systemctl --user enable --now vm-daemon
+vm autostart status    # entry presence + unit enabled/active
+```
+
+The UI lives in the system tray (StatusNotifier/AppIndicator): closing
+the window hides it instead of quitting — the daemon link thread is
+unaffected. Left-click (or the menu) shows it again; the menu carries
+a live mute checkmark and Quit. `vm-ui --minimized` boots straight
+into the tray. No tray in the Flatpak sandbox (no SNI host there by
+design): the window stays a normal window and autostart is owned by
+the Flatpak Background permission instead.
+
 ### Presets and soundboard
 
 Runtime data lives in `$VM_CONFIG_DIR` (default `~/.config/vm`):
