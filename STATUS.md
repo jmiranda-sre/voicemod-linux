@@ -603,6 +603,29 @@ Pós-v0.3.0 (brainstorm 2026-10-15, arquivados p/ v0.4.0+):
 - Próximo (do usuário): PR no Flathub (manifest pronto, tag v0.2.0
   resolve), AUR (PKGBUILD pronto), issues do backlog.
 
+## PUBLICADO — v0.3.0 no ar (2026-10-16)
+- Ritual RELEASE.md seguido à risca: 104/104 testes, release build,
+  `appstreamcli validate` ✔, AppImage, smoke, commit+tag+push+release.
+- Bump em 4 pontos (workspace Cargo.toml, manifest Flatpak `tag:
+  v0.3.0`, metainfo + entrada 0.3.0, CHANGELOG [Unreleased]→[0.3.0]);
+  PKGBUILD intacto (pkgver via `git describe`); RELEASE.md reescrito
+  como checklist vivo (estava preso na v0.1.0).
+- AppImage: `VoicemodLinux-0.3.0-x86_64.AppImage` (17.197.560 bytes).
+  Intervenção de peso no meio do ritual: backend AppIndicator default
+  puxava ICU+GTK (45,6 MB) → troca p/ `ksni` puro-Rust = 17,2 MB
+  (de volta ao patamar da 0.2.0); sem XEmbed legado.
+- Commits até `f053940` + tag anotada `v0.3.0`; push main + tag OK.
+  Release github.com/jmiranda-sre/voicemod-linux/releases/tag/v0.3.0
+  (não-draft, não-prerelease) com AppImage + notas do CHANGELOG (7
+  frentes F-A..F-13).
+- Smoke pós-build (release, stub, dir novo): 7 presets semeados,
+  select robot ok, health 4 nós / latencyMs 70.67 (= 42.67 formant +
+  28 delay — o relatório fecha na prática), addHotkey/setMuted ok,
+  getVoices = 7, `vm actions` = 23.
+- Próximo (do usuário): PR no Flathub (manifest pronto, tag v0.3.0
+  resolve), AUR (PKGBUILD pronto, .SRCINFO com MAKEPKG_LINT_PKGBUILD=0),
+  issues do backlog (itens 1, 2, 4, 7, 10, 12 + 15–20 pós-v0.3.0).
+
 ## v0.3.0 — ROADMAP APROVADO (planejamento, 2026-10-15 — SEM CÓDIGO AINDA)
 Escopo: 7 itens do brainstorm (numeração original entre parênteses).
 Foco: usabilidade + desempenho + integração. Nada implementado — frentes
