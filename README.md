@@ -300,9 +300,10 @@ target output; exactly the selected app is moved onto the sink and
 every other stream is restored to where it was. The action is
 declarative — re-running it converges — and an unknown app name fails
 loudly, with both the config and the backend rolled back. While it is
-on, soundboard sounds are injected into the same sink (`vm-inject`),
-so your listeners hear them too; a daemon restart re-applies the saved
-state and stale sinks from a crashed session are adopted and cleaned.
+on, the soundboard bus is injected into the same sink (`vm-inject`),
+so the chosen output gets your sounds alongside the app's audio —
+independent of `vm-mic`. A daemon restart re-applies the saved state;
+stale sinks from a crashed session are adopted and cleaned.
 
 EasyEffects note: its *Process all output streams* option re-routes
 every stream to `easyeffects_sink` and will fight any third-party move
