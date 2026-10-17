@@ -73,6 +73,8 @@ struct VmApp<'a> {
     prefs_status: Option<vm_control::autostart::Status>,
     /// Last enable/disable outcome: (is_error, text).
     prefs_note: Option<(bool, String)>,
+    /// About dialog (F-0.4.1.C): identity, clean-room note, license.
+    about_open: bool,
 }
 
 impl<'a> VmApp<'a> {
@@ -118,6 +120,7 @@ impl<'a> VmApp<'a> {
             prefs_open: false,
             prefs_status: None,
             prefs_note: None,
+            about_open: false,
         };
         app.refresh_presets();
         app
@@ -422,12 +425,21 @@ impl eframe::App for VmApp<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let snap = self.snap.lock().map(|s| s.clone()).unwrap_or_default();
 
-        // Keep local preset selection in sync with the daemon voice.
-        if !snap.selected_voice.is_empty()
-            && self.preset.as_ref().map(|p| p.name.as_str()) != Some(snap.selected_voice.as_str())
-            && self.presets.contains(&snap.selected_voice)
+        // Keep local preset selection in sync with the daemon voice. On a
+        // fresh connect `selected_voice` (event-driven) is still empty
+        // until the first voiceChanged, but `Health.voice` (status poll)
+        // is already populated — fall back to it so the tab never shows
+        // "select a voice preset" while a voice is live.
+        let daemon_voice: &str = if snap.selected_voice.is_empty() {
+            snap.health.voice.as_str()
+        } else {
+            snap.selected_voice.as_str()
+        };
+        if !daemon_voice.is_empty()
+            && self.preset.as_ref().map(|p| p.name.as_str()) != Some(daemon_voice)
+            && self.presets.iter().any(|v| v == daemon_voice)
         {
-            self.load_preset(&snap.selected_voice);
+            self.load_preset(daemon_voice);
         }
 
         egui::Panel::top("top").show(ui, |ui| {
@@ -455,6 +467,9 @@ impl eframe::App for VmApp<'_> {
                     self.prefs_open = true;
                     self.prefs_status = Some(vm_control::autostart::status());
                     self.prefs_note = None;
+                }
+                if ui.button("About").clicked() {
+                    self.about_open = true;
                 }
                 ui.separator();
                 if self.daemon_child.is_some() {
@@ -528,6 +543,12 @@ impl eframe::App for VmApp<'_> {
             let ctx = ui.ctx().clone();
             self.prefs_ui(&ctx);
         }
+
+        // About dialog (F-0.4.1.C): identity + clean-room note; static.
+        if self.about_open {
+            let ctx = ui.ctx().clone();
+            self.about_ui(&ctx);
+        }
     }
 }
 
@@ -546,6 +567,9 @@ impl VmApp<'_> {
         ui.separator();
         egui::Panel::left("voices").show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
+                if self.presets.is_empty() {
+                    ui.label("no presets found — click ↻ presets");
+                }
                 for name in self.presets.clone() {
                     let selected = self.preset.as_ref().map(|p| p.name.as_str()) == Some(name.as_str());
                     if ui.selectable_label(selected, &name).clicked() {
@@ -725,7 +749,7 @@ impl VmApp<'_> {
                 self.act(serde_json::json!({"action": "saveInstantReplay"}));
             }
             if !snap.replay_saved_path.is_empty() {
-                ui.label(format!("saved → {}", snap.replay_saved_path));
+                ui.label(format!("saved to {}", snap.replay_saved_path));
             }
         });
         // Per-application passthrough (F-0.4.B 18).
@@ -746,7 +770,8 @@ impl VmApp<'_> {
             apps.dedup_by(|a, b| a.app == b.app);
             let cur = self.m_text("passthrough", "app", &snap.passthrough.app);
             let mut chosen: Option<String> = None;
-            egui::ComboBox::from_label("App")
+            ui.label("App");
+            egui::ComboBox::from_id_salt("passthrough_app")
                 .selected_text(if cur.is_empty() {
                     "(none)".to_string()
                 } else {
@@ -784,7 +809,8 @@ impl VmApp<'_> {
                 .map(|d| d.name.clone())
                 .unwrap_or_else(|| "(system default)".to_string());
             let mut chosen_dev: Option<String> = None;
-            egui::ComboBox::from_label("→")
+            ui.label("to");
+            egui::ComboBox::from_id_salt("passthrough_device")
                 .selected_text(shown_dev)
                 .show_ui(ui, |ui| {
                     if ui
@@ -819,7 +845,7 @@ impl VmApp<'_> {
                                     "action": "fadeSound", "sound": name, "fade_out_secs": 0.5,
                                 }));
                             }
-                            ui.label("→ VAD+mon");
+                            ui.label("to VAD+mon");
                         });
                     });
                     if i % 3 == 2 {
@@ -834,6 +860,10 @@ impl VmApp<'_> {
     }
 
     fn devices_tab(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
+        if snap.devices.is_empty() {
+            ui.label("no devices yet — is the daemon running? (see the status bar below)");
+            ui.separator();
+        }
         ui.heading("Input");
         ui.add_space(4.0);
         let inputs: Vec<&link::DeviceInfo> =
@@ -999,7 +1029,7 @@ impl VmApp<'_> {
                 self.send_monitor(snap);
             }
             let mut mix = self.m_f32("monitor", "mix", snap.monitor.mix);
-            let r = ui.add(egui::Slider::new(&mut mix, 0.0..=1.0).text("dry → wet blend"));
+            let r = ui.add(egui::Slider::new(&mut mix, 0.0..=1.0).text("dry/wet blend"));
             self.set_f32("monitor", "mix", mix);
             if r.drag_stopped() {
                 self.send_monitor(snap);
@@ -1204,6 +1234,36 @@ impl VmApp<'_> {
         )
     }
 
+    /// About dialog (F-0.4.1.C): identity, clean-room note, license and
+    /// repo link. The URL opens in the browser (egui-winit open_url).
+    fn about_ui(&mut self, ctx: &egui::Context) {
+        let mut open = self.about_open;
+        egui::Window::new("About")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(400.0)
+            .show(ctx, |ui| {
+                ui.add_space(2.0);
+                ui.heading("Voicemod Linux");
+                ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                ui.add_space(6.0);
+                ui.label(
+                    "A clean-room, from-scratch voice changer for Linux: real-time DSP \
+                     effects, a soundboard and a real PipeWire virtual microphone. \
+                     Original code and permissive-only dependencies.",
+                );
+                ui.add_space(6.0);
+                ui.hyperlink_to(
+                    "github.com/jmiranda-sre/voicemod-linux",
+                    "https://github.com/jmiranda-sre/voicemod-linux",
+                );
+                ui.add_space(2.0);
+                ui.label("License: MIT OR Apache-2.0");
+            });
+        self.about_open = open;
+    }
+
     /// Setup wizard modal (F-0.4.B item 29).
     fn wizard_ui(&mut self, ctx: &egui::Context, snap: &Snapshot) {
         // Auto-advance the measurement steps when their clock elapses.
@@ -1234,9 +1294,9 @@ impl VmApp<'_> {
             .default_width(440.0)
             .show(ctx, |ui| match step {
                 wizard::Step::Welcome => {
-                    ui.label("This 1-minute check finds your microphone level, measures your room, and suggests a gate and a safety limiter.");
+                    ui.label("This 1-minute check finds your microphone level, measures your room, and suggests a noise gate and a safety limiter.");
                     ui.add_space(6.0);
-                    ui.label("Steps: speak once → stay silent 3 s → check the result.");
+                    ui.label("Flow: mic check » 3 s of silence » read one sentence » apply the suggestions.");
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         if ui.button("Start").clicked() {
@@ -1248,26 +1308,30 @@ impl VmApp<'_> {
                     });
                 }
                 wizard::Step::MicCheck => {
-                    ui.strong("1/4 · Test your microphone");
+                    wizard_pips(ui, 1);
+                    ui.label(egui::RichText::new("Test your microphone").size(15.0).strong());
                     ui.label("Speak normally — the bars must move.");
                     ui.add_space(4.0);
                     level_db_bar(ui, "mic", snap.levels.mic_db);
                     level_db_bar(ui, "out", snap.levels.out_db);
                     ui.add_space(6.0);
                     if snap.levels.speech {
-                        ui.colored_label(egui::Color32::GREEN, "speech detected ✓");
+                        ui.colored_label(egui::Color32::GREEN, "speech detected");
                     } else if snap.levels.mic_db < -55.0 {
                         ui.colored_label(
                             egui::Color32::YELLOW,
                             "No signal yet — check the microphone on the Devices tab.",
                         );
                     }
-                    if ui.button("I see the level moving →").clicked() {
+                    if ui.button("I see the level moving »").clicked() {
                         self.wizard.begin_step(wizard::Step::NoiseFloor);
                     }
                 }
                 wizard::Step::NoiseFloor => {
-                    ui.strong("2/4 · Measuring the noise floor");
+                    wizard_pips(ui, 2);
+                    ui.label(
+                        egui::RichText::new("Measuring the noise floor").size(15.0).strong(),
+                    );
                     ui.label("Stay silent for 3 seconds…");
                     ui.add(egui::ProgressBar::new(self.wizard.progress()).desired_height(10.0));
                     ui.add_space(4.0);
@@ -1280,7 +1344,8 @@ impl VmApp<'_> {
                     }
                 }
                 wizard::Step::Gate => {
-                    ui.strong("3/4 · Noise gate");
+                    wizard_pips(ui, 3);
+                    ui.label(egui::RichText::new("Noise gate").size(15.0).strong());
                     ui.label(format!(
                         "Room floor ≈ {:.0} dBFS — a gate {:.0} dBFS keeps it out.",
                         self.wizard.floor_db,
@@ -1309,7 +1374,7 @@ impl VmApp<'_> {
                                     "current preset has no gate node".to_string();
                             }
                         }
-                        if ui.button("Next →").clicked() {
+                        if ui.button("Next »").clicked() {
                             self.wizard.note.clear();
                             self.wizard.begin_step(wizard::Step::SpeechLevel);
                         }
@@ -1319,14 +1384,16 @@ impl VmApp<'_> {
                     }
                 }
                 wizard::Step::SpeechLevel => {
-                    ui.strong("4/4 · Speech level");
+                    wizard_pips(ui, 4);
+                    ui.label(egui::RichText::new("Speech level").size(15.0).strong());
                     ui.label("Read anything out loud: “The quick brown fox jumps over the lazy dog.”");
                     ui.add(egui::ProgressBar::new(self.wizard.progress()).desired_height(10.0));
                     ui.add_space(4.0);
                     level_db_bar(ui, "mic", snap.levels.mic_db);
                 }
                 wizard::Step::Limiter => {
-                    ui.strong("Finishing touches");
+                    wizard_pips(ui, 4);
+                    ui.label(egui::RichText::new("Finishing touches").size(15.0).strong());
                     ui.label(format!(
                         "Speech ≈ {:.0} dBFS (target {:.0} dBFS).",
                         self.wizard.speech_db,
@@ -1437,7 +1504,7 @@ impl VmApp<'_> {
         if h.nodes.is_empty() {
             ui.label("no telemetry yet — is a voice loaded and streaming?");
         }
-        ui.label("low-latency note: denoise frame 512 halves the STFT window (≈21 ms → ≈11 ms) \
+        ui.label("low-latency note: denoise frame 512 halves the STFT window (≈21 ms » ≈11 ms) \
             but also halves frequency resolution (93.8 Hz bins — bass selectivity suffers). \
             Opt in via the denoise frame param; re-capture the noise profile after switching.");
         ui.separator();
@@ -1466,6 +1533,28 @@ impl VmApp<'_> {
                 ui.end_row();
             }
         });
+    }
+}
+
+/// Setup wizard progress pips: 4 dots, `filled` of them done. Drawn
+/// with the painter (no font glyphs involved), purely cosmetic — the
+/// flow itself still lives in `wizard::Step`.
+fn wizard_pips(ui: &mut egui::Ui, filled: usize) {
+    let total = 4;
+    let gap = 12.0;
+    let r = 3.5;
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(gap * total as f32, r * 2.0 + 2.0),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter();
+    for i in 0..total {
+        let center = rect.min + egui::vec2(gap * (i as f32 + 0.5), rect.height() / 2.0);
+        if i < filled {
+            painter.circle_filled(center, r, egui::Color32::from_rgb(0x7d, 0xd3, 0xfc));
+        } else {
+            painter.circle_stroke(center, r, egui::Stroke::new(1.0, egui::Color32::GRAY));
+        }
     }
 }
 

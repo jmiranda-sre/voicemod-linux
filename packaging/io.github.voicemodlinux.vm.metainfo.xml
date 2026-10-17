@@ -17,6 +17,14 @@
       plugins) can also use.
     </p>
   </description>
+  <keywords>
+    <keyword>voice</keyword>
+    <keyword>changer</keyword>
+    <keyword>microphone</keyword>
+    <keyword>soundboard</keyword>
+    <keyword>pipewire</keyword>
+    <keyword>effects</keyword>
+  </keywords>
   <launchable type="desktop-id">io.github.voicemodlinux.vm.desktop</launchable>
   <provides>
     <binary>vm-ui</binary>
@@ -28,6 +36,21 @@
     <name>voicemod-linux contributors</name>
   </developer>
   <url type="homepage">https://github.com/jmiranda-sre/voicemod-linux</url>
+  <url type="bugtracker">https://github.com/jmiranda-sre/voicemod-linux/issues</url>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Voice presets with a live EQ response curve and per-node controls</caption>
+      <image type="source" width="1068" height="777">https://raw.githubusercontent.com/jmiranda-sre/voicemod-linux/main/packaging/screenshots/voices.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Soundboard pads, per-app routing and 30-second instant replay</caption>
+      <image type="source" width="1068" height="777">https://raw.githubusercontent.com/jmiranda-sre/voicemod-linux/main/packaging/screenshots/soundboard.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>First-run setup wizard measuring the microphone level live</caption>
+      <image type="source" width="1068" height="777">https://raw.githubusercontent.com/jmiranda-sre/voicemod-linux/main/packaging/screenshots/wizard.png</image>
+    </screenshot>
+  </screenshots>
   <releases>
     <release version="0.4.0" date="2026-10-17">
       <description>

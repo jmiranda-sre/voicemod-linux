@@ -1088,3 +1088,57 @@ Progresso 2026-10-17: **D, A, C e B FECHADAS — ciclo v0.4.0 completo (release 
   e refresh renderizando; botão na top bar e título "Voicemod Linux"
   na mesma captura. Patch temporário de abertura automática revertido
   (grep TEMP-SMOKE = 0); keepAbove do Konsole restaurado pelo script.
+
+## F-0.4.1.C — wizard/About + metainfo/screenshots (2026-10-17)
+- Wizard (só cosmético, fluxo intocado): pips de progresso desenhados no
+  painter (`wizard_pips`, 4 círculos vetoriais — sem glifo de fonte),
+  títulos sem prefixo "n/4 · " e a 15pt, e a linha de fluxo corrigida
+  (`mic check » 3 s de silêncio » ler uma frase » aplicar sugestões`,
+  antes prometia "fale uma vez" no lugar do mic check).
+- About: botão na top bar (após ⚙ Preferences) + diálogo — nome, versão
+  via `env!("CARGO_PKG_VERSION")`, nota clean-room, licença MIT OR
+  Apache-2.0 e hyperlink do repo. Link abre no browser: confirmado no
+  egui-winit 0.36 (`OutputCommand::OpenUrl` → `open_url_in_browser`);
+  captura mostra o link em azul sobre a aba viva.
+- Vazios/erros nas abas: lista de presets vazia ganhou "no presets found
+  — click ↻ presets"; Devices ganhou "no devices yet — is the daemon
+  running? (see the status bar below)" quando o snapshot vem sem
+  devices.
+- BUG REAL encontrado na captura: connect frio da UI mostrava "select a
+  voice preset" mesmo com voz ativa (o `selected_voice` é dirigido por
+  evento `voiceChanged` e nunca chega num connect sem interação).
+  Fix: fallback para `Health.voice` (poll de status) na sincronização —
+  `load_preset` é espelho local puro (não envia nada ao daemon). Prova
+  ao vivo: captura com `mic-npr-voice` selecionado + EQ curve + params.
+- Auditoria de glifos (probe visual no About): fonte default do egui
+  NÃO tem `→` nem `✓` (tofu confirmado em zoom); TODAS as ocorrências
+  visíveis trocadas por texto/`»` (guillemets Latin-1, verificados na
+  captura). Renderizam e ficaram: `± · — “ ” … ↻ ∈ − ≈ ⚙ µ` — `∈` só
+  existia em comentário de código (sem ação). Também: "saved →" →
+  "saved to", "→ VAD+mon" → "to VAD+mon", "dry → wet blend" →
+  "dry/wet blend", botões do wizard com `»`.
+- Passthrough do soundboard: "App [(none)] to [(system default)]" agora
+  lê em ordem (label explícito + `from_id_salt`) — `from_label` desenha
+  o texto DEPOIS do combo (confirmado em zoom na captura).
+- Metainfo/AppStream: `<url type="bugtracker">` (issues), `<keywords>`
+  (voice/changer/microphone/soundboard/pipewire/effects) e 3 screenshots
+  reais referenciadas por URL raw do `main`
+  (`packaging/screenshots/{voices,soundboard,wizard}.png`, 1068×777,
+  `type="default"` na primeira). `appstreamcli validate --no-net` OK;
+  com rede dá 3 warnings `screenshot-image-not-found` até o push criar
+  as URLs (revalidar pós-push).
+- Screenshots (sessão real, receita KWin scripting + `spectacle -a`):
+  daemon `--live` próprio com 6 sons WAV temporários gerados via ffmpeg
+  (pads em 2 fileiras cheias; dir `~/.config/vm/sounds` estava vazio),
+  entrada interna selecionada (sinal vivo; boot do daemon varia a
+  entrada por enumeração — EasyEffects source morta/Fifine mudo foram
+  descartados no probe de `selectInput`+`getLevels`), Instant Replay
+  com buffer cheio (30.0s). `io.github.voicemodlinux.vm.{desktop,svg,
+  png}` instalados TEMPORARIAMENTE em `~/.local/share` para o ícone
+  real na titlebar — removidos ao fim, junto com WAVs, marker
+  `wizard.json` e daemon (estado restaurado).
+- Captura env-driven temporária (`VM_SHOT_TAB`/`VM_SHOT_DIALOG`) para
+  abrir aba/diálogo sem clique: revertida (grep TEMP-SHOT/VM_SHOT = 0).
+- Gates: clippy 0, workspace 189/189 (5 novos rodadas de captura não
+  alteraram contagem). VM_CONTROL/`vm autostart` byte-idênticos não
+  foram tocados nesta frente.

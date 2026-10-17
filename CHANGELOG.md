@@ -51,6 +51,42 @@ semantic versioning.
   session) pins close→tray→quit, `--minimized` boot→Show→close→quit
   and the windowless-boot proof.
 
+### Added (wizard/About polish & store assets, F-0.4.1.C)
+
+- The wizard is now visibly a wizard: four painter-drawn progress pips
+  (`● ○ ○ ○` — vector circles, no font glyphs), step titles without
+  the `n/4 · ` prefix and at a slightly larger size, and a flow line
+  that matches the real sequence (`mic check » 3 s of silence » read
+  one sentence » apply the suggestions`). The measurement flow and its
+  state machine are untouched.
+- New "About" dialog (top-bar button, next to Preferences): app name,
+  version (`CARGO_PKG_VERSION`), the clean-room note, the license
+  (MIT OR Apache-2.0) and a clickable repository link (egui-winit
+  forwards `OpenUrl` to the system browser).
+- AppStream/Catalog metadata: `<url type="bugtracker">`, `<keywords>`
+  and three real screenshots (voices, soundboard, first-run wizard;
+  1068×777) served from `packaging/screenshots/` via raw URLs — ready
+  for Flathub, GNOME Software and KDE Discover listings.
+
+### Fixed (vm-ui boot state and glyphs, F-0.4.1.C)
+
+- A freshly connected vm-ui no longer shows "select a voice preset"
+  while a voice is live: when the event-driven `selected_voice` has not
+  arrived yet, the tab falls back to `Health.voice` from the status
+  poll and mirrors the active preset locally (`load_preset` only fills
+  widgets — it sends nothing to the daemon).
+- Empty-state pass on the tabs: the preset list says "no presets found
+  — click ↻ presets" and the Devices tab says "no devices yet — is the
+  daemon running?" instead of rendering silent blanks.
+- Glyph audit (screen probe): the bundled fonts lack `→` and `✓` (both
+  rendered as tofu); every user-visible occurrence was replaced with
+  plain text or `»` (guillemets, verified to render), while
+  `↻ ≈ µ · “ ” … − ⚙` were confirmed to render and stay. `∈` existed
+  only in a code comment.
+- The soundboard passthrough row reads in order now — "App [(none)] to
+  [(system default)]" (explicit labels + `from_id_salt`; `from_label`
+  draws the text after the combo).
+
 ## [0.4.0] — 2026-10-17
 
 ### Added (F-0.4.C: routing & integrations)
