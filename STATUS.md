@@ -1175,3 +1175,31 @@ Progresso 2026-10-17: **D, A, C e B FECHADAS — ciclo v0.4.0 completo (release 
 - AppImage: `VoicemodLinux-0.4.1-x86_64.AppImage` (18.233.848 bytes),
   extração + `ldd vm-ui` sem "not found" (bundle resolve as libs) +
   `vm actions` = 49 dentro do AppDir.
+
+## PUBLICADO — v0.4.1 no ar (2026-10-17)
+- Ritual RELEASE.md seguido: 189/189 testes workspace, release build,
+  clippy 0, `appstreamcli validate` ✔ (com rede — URLs raw das
+  screenshots resolvendo), `desktop-file-validate` ✔, AppImage, smokes,
+  commit+tag+push+release.
+- Bump em 4 pontos (workspace `Cargo.toml` + lock, Flatpak
+  `"tag": "v0.4.1"`, metainfo + entrada `<release 0.4.1>`, CHANGELOG
+  [Unreleased]→[0.4.1] com stub [Unreleased] novo); RELEASE.md
+  atualizado (189/189, 49 ações, gates: appstreamcli com URL raw,
+  desktop-file-validate, ui-lifecycle promovido a gate); PKGBUILD
+  intacto (pkgver via `git describe`).
+- AppImage validado: extração + `ldd vm-ui` sem "not found" + 49 ações
+  dentro do AppDir; anexado ao release (18.233.848 bytes).
+- Smoke pós-build (release, stub, dir novo): 49 ações, selectVoice
+  robot ok, health ok, 7 presets, setMuted ok, getVoices ok,
+  getInstantReplay (enabled/30 s), addHotkey PushToTalk + SaveReplay +
+  listHotkeys = 2. `ui-lifecycle.sh` na sessão real: SMOKE_OK
+  (close→tray, `--minimized`→Show→close→Quit, windowless boot
+  attaches=0/toplevels=0, Show attaches=32).
+- Commits até `a83ac36` + tag anotada `v0.4.1`; push main + tag OK.
+  Release github.com/jmiranda-sre/voicemod-linux/releases/tag/v0.4.1
+  (não-draft, não-prerelease) com AppImage + notas do CHANGELOG
+  (ciclo completo F-0.4.1 A/B/C/D).
+- Próximo (do usuário): PR no Flathub (manifest pronto, tag v0.4.1
+  resolve), AUR (PKGBUILD pronto, `.SRCINFO` com
+  `MAKEPKG_LINT_PKGBUILD=0` — pkgver derivado de `git describe`, sem
+  edição na receita) e issues do backlog pós-v0.4.1.
