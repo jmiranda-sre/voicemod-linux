@@ -9,6 +9,8 @@ members = [
     "vm-cli",
     "vm-daemon",
     "vm-ui",
+    "vm-obs",
+    "vm-midi",
 ]
 
 [workspace.package]

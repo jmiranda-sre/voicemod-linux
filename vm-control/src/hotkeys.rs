@@ -115,14 +115,26 @@ pub struct StoredBind {
 }
 
 /// Whole daemon config (`$VM_CONFIG_DIR/config.json`): hotkey binds +
-/// device→voice profiles.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// device→voice profiles + the F-0.4.C integration settings.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DaemonConfig {
     #[serde(default)]
     pub hotkeys: Vec<StoredBind>,
     /// Device (uid, uid base, or device name) → voice preset name.
     #[serde(default)]
     pub device_profiles: HashMap<String, String>,
+    /// Hear-myself monitor (F-0.4.C 15).
+    #[serde(default)]
+    pub monitor: super::settings::MonitorConfig,
+    /// Sidechain ducking (F-0.4.C 14).
+    #[serde(default)]
+    pub ducking: super::settings::DuckingConfig,
+    /// obs-websocket integration (F-0.4.C 35).
+    #[serde(default)]
+    pub obs: super::settings::ObsConfig,
+    /// MIDI learn (F-0.4.C 37).
+    #[serde(default)]
+    pub midi: super::settings::MidiConfig,
 }
 
 /// On-disk config file shape.
@@ -133,11 +145,20 @@ struct ConfigFile {
     hotkeys: Vec<StoredBind>,
     #[serde(default)]
     device_profiles: HashMap<String, String>,
+    #[serde(default)]
+    monitor: super::settings::MonitorConfig,
+    #[serde(default)]
+    ducking: super::settings::DuckingConfig,
+    #[serde(default)]
+    obs: super::settings::ObsConfig,
+    #[serde(default)]
+    midi: super::settings::MidiConfig,
 }
 
-/// Current config schema version. v1 files (hotkeys only) migrate
-/// forward; unknown versions fail closed with a clear error.
-pub const CONFIG_VERSION: u32 = 2;
+/// Current config schema version. v1 (hotkeys only) and v2 (device
+/// profiles) files migrate forward; unknown versions fail closed with a
+/// clear error.
+pub const CONFIG_VERSION: u32 = 3;
 
 /// Serialize the daemon config to file text.
 pub fn save_daemon_config(cfg: &DaemonConfig) -> String {
@@ -145,8 +166,17 @@ pub fn save_daemon_config(cfg: &DaemonConfig) -> String {
         version: CONFIG_VERSION,
         hotkeys: cfg.hotkeys.clone(),
         device_profiles: cfg.device_profiles.clone(),
+        monitor: cfg.monitor.clone(),
+        ducking: cfg.ducking.clone(),
+        obs: cfg.obs.clone(),
+        midi: cfg.midi.clone(),
     })
-    .unwrap_or_else(|_| String::from("{\"version\":2,\"hotkeys\":[],\"device_profiles\":{}}"))
+    .unwrap_or_else(|_| {
+        String::from(
+            "{\"version\":3,\"hotkeys\":[],\"device_profiles\":{},\"monitor\":{},\
+             \"ducking\":{},\"obs\":{},\"midi\":{}}",
+        )
+    })
 }
 
 /// Parse config file text. Unknown versions fail closed (never silently
@@ -156,11 +186,21 @@ pub fn load_daemon_config(text: &str) -> Result<DaemonConfig, String> {
     let cfg: ConfigFile =
         serde_json::from_str(text).map_err(|e| format!("bad daemon config: {e}"))?;
     match cfg.version {
-        1 => Ok(DaemonConfig { hotkeys: cfg.hotkeys, device_profiles: HashMap::new() }),
-        CONFIG_VERSION => {
-            Ok(DaemonConfig { hotkeys: cfg.hotkeys, device_profiles: cfg.device_profiles })
-        }
-        v => Err(format!("unsupported daemon config version {v} (want {CONFIG_VERSION}")),
+        1 => Ok(DaemonConfig { hotkeys: cfg.hotkeys, ..DaemonConfig::default() }),
+        2 => Ok(DaemonConfig {
+            hotkeys: cfg.hotkeys,
+            device_profiles: cfg.device_profiles,
+            ..DaemonConfig::default()
+        }),
+        CONFIG_VERSION => Ok(DaemonConfig {
+            hotkeys: cfg.hotkeys,
+            device_profiles: cfg.device_profiles,
+            monitor: cfg.monitor,
+            ducking: cfg.ducking,
+            obs: cfg.obs,
+            midi: cfg.midi,
+        }),
+        v => Err(format!("unsupported daemon config version {v} (want {CONFIG_VERSION})")),
     }
 }
 
@@ -341,18 +381,46 @@ mod hotkey_tests {
             device_profiles: [("Fifine Microphone".to_string(), "mic-npr-voice".to_string())]
                 .into_iter()
                 .collect(),
+            monitor: crate::settings::MonitorConfig {
+                enabled: true,
+                device: "out#3".into(),
+                mix: 0.25,
+                ..Default::default()
+            },
+            ducking: crate::settings::DuckingConfig { depth_db: 18.0, ..Default::default() },
+            obs: crate::settings::ObsConfig { enabled: true, password: "pw".into(), ..Default::default() },
+            midi: crate::settings::MidiConfig {
+                bindings: vec![crate::settings::MidiBinding {
+                    id: 0,
+                    channel: None,
+                    kind: crate::settings::MidiKind::Cc,
+                    number: 7,
+                    target: crate::settings::MidiTarget::Trigger(HotkeyTarget::ToggleMute),
+                    enabled: true,
+                }],
+                ..Default::default()
+            },
         };
         let text = save_daemon_config(&cfg);
         let back = load_daemon_config(&text).expect("roundtrip");
         assert_eq!(back.hotkeys.len(), 2);
         assert!(matches!(back.hotkeys[0].bind.target, HotkeyTarget::PushToTalk));
         assert_eq!(back.device_profiles["Fifine Microphone"], "mic-npr-voice");
-        // v1 files (hotkeys only) migrate forward with empty profiles.
+        assert!(back.monitor.enabled && back.monitor.mix == 0.25);
+        assert_eq!(back.ducking.depth_db, 18.0);
+        assert!(back.obs.enabled && back.obs.password == "pw");
+        assert_eq!(back.midi.bindings.len(), 1);
+        // v1/v2 files migrate forward; untouched sections keep defaults.
         let v1 = r#"{"version":1,"hotkeys":[]}"#;
         let migrated = load_daemon_config(v1).expect("v1 migrates");
         assert!(migrated.hotkeys.is_empty() && migrated.device_profiles.is_empty());
+        assert!(migrated.ducking.enabled, "settings get v3 defaults");
+        let v2 = r#"{"version":2,"hotkeys":[],"device_profiles":{"Fifine":"mic-npr-voice"}}"#;
+        let migrated = load_daemon_config(v2).expect("v2 migrates");
+        assert_eq!(migrated.device_profiles["Fifine"], "mic-npr-voice");
+        assert!(!migrated.monitor.enabled, "monitor stays off unless configured");
         // Wrong version fails closed.
-        let bad = text.replace("\"version\": 2", "\"version\": 99");
+        let bad = text.replace("\"version\": 3", "\"version\": 99");
         assert!(load_daemon_config(&bad).is_err());
         // Garbage fails with a clear error, never an empty store.
         assert!(load_daemon_config("not json").is_err());

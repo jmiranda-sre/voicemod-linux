@@ -32,6 +32,9 @@ pub struct SoundboardMixer {
     sounds: HashMap<SoundHashId, LoadedSound>,
     playing: Vec<PlayingSound>,
     master_per_mille: u16,
+    /// Scratch list reused across `mix_into` calls (keeps the RT path
+    /// allocation-free once the buses have grown).
+    finished: Vec<SoundHashId>,
 }
 
 impl SoundboardMixer {
@@ -109,21 +112,45 @@ impl SoundboardMixer {
         self.playing.iter().map(|p| p.id).collect()
     }
 
+    /// True while any playing sound requested `mute_voice`: the caller
+    /// drops the voice from its own mix (documented contract).
+    pub fn voice_muted(&self) -> bool {
+        self.playing.iter().any(|p| p.options.mute_voice)
+    }
+
     /// Render `frames` samples into fresh Vad + Monitor buses.
     /// Fades were baked at load; per-call gain = sound × master.
     /// Muted-voice / mute-others flags are honored by the caller dropping
     /// the respective bus (documented contract).
     pub fn mix(&mut self, frames: usize) -> (StereoBus, StereoBus) {
-        let mut vad = StereoBus {
-            left: vec![0.0; frames],
-            right: vec![0.0; frames],
-        };
-        let mut mon = StereoBus {
-            left: vec![0.0; frames],
-            right: vec![0.0; frames],
-        };
+        let mut vad = StereoBus::default();
+        let mut mon = StereoBus::default();
+        self.mix_into(frames, &mut vad, &mut mon);
+        (vad, mon)
+    }
+
+    /// Render `frames` samples into caller-owned reusable buses.
+    /// Identical semantics to [`Self::mix`]; the RT path uses this so a
+    /// quantum never allocates once the buses have grown.
+    pub fn mix_into(&mut self, frames: usize, vad: &mut StereoBus, mon: &mut StereoBus) {
+        for bus in [&mut *vad, &mut *mon] {
+            bus.left.resize(frames, 0.0);
+            bus.right.resize(frames, 0.0);
+            bus.left[..frames].fill(0.0);
+            bus.right[..frames].fill(0.0);
+        }
         let master = self.master_per_mille as f32 / 1000.0;
-        let mut finished: Vec<SoundHashId> = Vec::new();
+        let mut finished = std::mem::take(&mut self.finished);
+        finished.clear();
+        // `mute_other_sounds`: the most recently started solo silences
+        // the rest. Muted sounds keep advancing their playhead, so they
+        // resume in-step once the solo ends (reference semantics).
+        let solo = self
+            .playing
+            .iter()
+            .rev()
+            .find(|p| p.options.mute_other_sounds)
+            .map(|p| p.id);
         for p in self.playing.iter_mut() {
             let Some(sound) = self.sounds.get(&p.id) else { continue };
             if sound.channels.is_empty() {
@@ -133,6 +160,7 @@ impl SoundboardMixer {
             if len == 0 {
                 continue;
             }
+            let mixed = solo.map(|s| s == p.id).unwrap_or(true);
             let g = (p.options.volume_per_mille as f32 / 1000.0) * master;
             let fade_in = (p.options.fade_in_secs.max(0.0) * 48_000.0) as usize;
             let fade_out = (p.options.fade_out_secs.max(0.0) * 48_000.0) as usize;
@@ -154,7 +182,9 @@ impl SoundboardMixer {
                     if p.options.loop_ {
                         // Wrap within this block (may wrap multiple times).
                         let at = idx % len;
-                        Self::accumulate(&mut vad, &mut mon, sound, at, g, 1.0, to_vad, f);
+                        if mixed {
+                            Self::accumulate(vad, mon, sound, at, g, 1.0, to_vad, f);
+                        }
                     } else {
                         break;
                     }
@@ -167,7 +197,9 @@ impl SoundboardMixer {
                     if fade_out > 0 && !p.options.loop_ && idx + fade_out >= len {
                         m *= (len - idx) as f32 / fade_out as f32;
                     }
-                    Self::accumulate(&mut vad, &mut mon, sound, idx, g, m, to_vad, f);
+                    if mixed {
+                        Self::accumulate(vad, mon, sound, idx, g, m, to_vad, f);
+                    }
                 }
             }
             p.position += frames;
@@ -177,10 +209,10 @@ impl SoundboardMixer {
                 p.position %= len.max(1);
             }
         }
-        for id in finished {
-            self.playing.retain(|p| p.id != id);
+        for id in &finished {
+            self.playing.retain(|p| p.id != *id);
         }
-        (vad, mon)
+        self.finished = finished;
     }
 
     // Orthogonal scalars of the playback hot path; bundling them into a
@@ -277,6 +309,53 @@ mod tests {
     fn unknown_sound_rejected() {
         let mut m = SoundboardMixer::new();
         assert!(m.play(SoundHashId(999), opts()).is_err());
+    }
+
+    #[test]
+    fn mix_into_reuses_buses_without_stale_samples() {
+        let mut m = SoundboardMixer::new();
+        m.add_sound(sound(4, vec![vec![0.25; 64]]));
+        let mut vad = StereoBus::default();
+        let mut mon = StereoBus::default();
+        m.play(SoundHashId(4), opts()).unwrap();
+        m.mix_into(32, &mut vad, &mut mon);
+        assert!(vad.left[..32].iter().all(|s| (*s - 0.25).abs() < 1e-6));
+        assert!(mon.right[..32].iter().all(|s| (*s - 0.25).abs() < 1e-6));
+        // Second call, shorter block: the first `frames` are rewritten,
+        // nothing from the previous call leaks into them.
+        m.mix_into(16, &mut vad, &mut mon);
+        assert!(vad.left[..16].iter().all(|s| (*s - 0.25).abs() < 1e-6));
+    }
+
+    #[test]
+    fn mute_other_sounds_solos_the_capper() {
+        let mut m = SoundboardMixer::new();
+        m.add_sound(sound(10, vec![vec![1.0; 64]]));
+        m.add_sound(sound(11, vec![vec![0.5; 64]]));
+        m.play(SoundHashId(10), opts()).unwrap();
+        let mut o = opts();
+        o.mute_other_sounds = true;
+        m.play(SoundHashId(11), o).unwrap();
+        let (vad, _) = m.mix(32);
+        // Only the solo (0.5) is audible; the first sound advanced in step.
+        assert!(vad.left.iter().all(|s| (*s - 0.5).abs() < 1e-6));
+        m.stop_all();
+        m.play(SoundHashId(10), opts()).unwrap();
+        let (vad, _) = m.mix(16);
+        assert!(vad.left.iter().all(|s| (*s - 1.0).abs() < 1e-6), "solo retired, others audible again");
+    }
+
+    #[test]
+    fn voice_muted_flag_tracks_playing_options() {
+        let mut m = SoundboardMixer::new();
+        m.add_sound(sound(12, vec![vec![1.0; 16]]));
+        assert!(!m.voice_muted());
+        let mut o = opts();
+        o.mute_voice = true;
+        m.play(SoundHashId(12), o).unwrap();
+        assert!(m.voice_muted());
+        m.mix(16); // non-looping sound retires
+        assert!(!m.voice_muted());
     }
 }
 

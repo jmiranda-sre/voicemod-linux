@@ -8,10 +8,15 @@
 pub mod actions;
 pub mod hotkeys;
 pub mod server;
+pub mod settings;
 
-pub use actions::{Action, ControlEvent, ControlHandler, ControlMessage, ControlReply};
+pub use actions::{Action, ControlEvent, ControlHandler, ControlMessage, ControlReply, ALL_ACTIONS};
 pub use hotkeys::{
     HotkeyManager, HotkeyTarget, Keybind, StoredBind, DaemonConfig, CONFIG_VERSION, is_momentary,
     load_daemon_config, save_daemon_config, sandbox_note, validate_bind,
 };
 pub use server::{dispatch, ControlApiServer, ServerConfig};
+pub use settings::{
+    DuckingConfig, MidiBinding, MidiConfig, MidiEvent, MidiKind, MidiTarget, MonitorConfig,
+    ObsConfig,
+};

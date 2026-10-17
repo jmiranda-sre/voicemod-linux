@@ -20,14 +20,15 @@
 
 use super::super::{
     AudioBackend, AudioDevice, AudioError, CallbackStats, DeviceRole, DeviceUid, HotplugEvent,
-    StreamKind, StreamLinkState, StreamProcessor, StreamStopReason, StreamTopology, MAX_CHANNELS,
-    MONITOR_SINK_NAME, QUANTUM_FRAMES, SAMPLE_RATE, VIRTUAL_SOURCE_NAME,
+    MonitorSettings, StreamKind, StreamLinkState, StreamProcessor, StreamStopReason, StreamTopology,
+    MAX_CHANNELS, MONITOR_SINK_NAME, QUANTUM_FRAMES, SAMPLE_RATE, VIRTUAL_SOURCE_NAME,
 };
 use pipewire as pw;
 use pw::{properties::properties, spa};
 use spa::pod::Pod;
 use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 /// Ring capacity in samples (8 quanta × stereo × headroom).
@@ -91,6 +92,11 @@ struct Shared {
     fmt_cap: Mutex<FormatState>,
     fmt_out: Mutex<FormatState>,
     link: Mutex<StreamLinkState>,
+    monitor_enabled: AtomicBool,
+    monitor_mix: AtomicU32,
+    monitor_volume_db: AtomicU32,
+    monitor_muted: AtomicBool,
+    monitor_device: Mutex<String>,
 }
 
 impl Shared {
@@ -102,6 +108,11 @@ impl Shared {
             fmt_cap: Mutex::new(FormatState { rate: SAMPLE_RATE, channels: 2, format: SampleFormat::F32 }),
             fmt_out: Mutex::new(FormatState { rate: SAMPLE_RATE, channels: 2, format: SampleFormat::F32 }),
             link: Mutex::new(StreamLinkState::Down),
+            monitor_enabled: AtomicBool::new(false),
+            monitor_mix: AtomicU32::new(0.0f32.to_bits()),
+            monitor_volume_db: AtomicU32::new(0.0f32.to_bits()),
+            monitor_muted: AtomicBool::new(false),
+            monitor_device: Mutex::new(String::new()),
         })
     }
 }
@@ -132,6 +143,9 @@ struct PlaybackData {
     scratch_in: Vec<Vec<f32>>,
     scratch_out: Vec<Vec<f32>>,
     scratch_raw: Vec<f32>,
+    /// Interleaved stereo monitor-only bus (soundboard sounds routed away
+    /// from vm-mic), staged here so the RT callback never allocates.
+    mon_scratch: Vec<f32>,
 }
 
 struct MonitorData {
@@ -179,6 +193,8 @@ enum Cmd {
     Start(mpsc::Sender<Result<(), AudioError>>),
     Stop(StreamStopReason, mpsc::Sender<Result<(), AudioError>>),
     DestroyVmMic(mpsc::Sender<Result<(), AudioError>>),
+    /// Move the hear-myself monitor stream to another sink (F-0.4.C 15).
+    MonitorRetarget(String, mpsc::Sender<Result<(), AudioError>>),
     Quit,
 }
 
@@ -186,6 +202,9 @@ struct OpenReq {
     input_id: u32,
     vm_id: u32,
     processor: Arc<Mutex<dyn StreamProcessor>>,
+    /// Explicit hear-myself output node (`name#id` resolved by the handle);
+    /// `None` falls back to the system default sink.
+    monitor_id: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +342,10 @@ impl AudioBackend for PipeWireBackend {
             input_id: find(&topology.input)?,
             vm_id: find(&topology.virtual_out)?,
             processor: proc,
+            monitor_id: topology
+                .monitor
+                .as_ref()
+                .and_then(|u| self.node_ids.get(&u.0).copied()),
         };
         flatten(self.roundtrip(|tx| Cmd::Open(req, tx), "open"))?;
         self.topology = Some(topology.clone());
@@ -384,6 +407,21 @@ impl AudioBackend for PipeWireBackend {
     fn set_processor(&mut self, processor: Arc<Mutex<dyn StreamProcessor>>) {
         self.processor = Some(processor);
     }
+
+    fn set_monitor(&mut self, settings: &MonitorSettings) -> Result<(), AudioError> {
+        self.shared.monitor_enabled.store(settings.enabled, Ordering::Relaxed);
+        self.shared.monitor_mix.store(settings.mix.to_bits(), Ordering::Relaxed);
+        self.shared.monitor_volume_db.store(settings.volume_db.to_bits(), Ordering::Relaxed);
+        self.shared.monitor_muted.store(settings.muted, Ordering::Relaxed);
+        *self.shared.monitor_device.lock().unwrap() = settings.device.clone();
+        if !settings.device.is_empty() {
+            flatten(self.roundtrip(
+                |tx| Cmd::MonitorRetarget(settings.device.clone(), tx),
+                "monitor retarget",
+            ))?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -409,6 +447,9 @@ fn reply_err(cmd: Cmd, msg: &str) {
             let _ = tx.send(Err(err));
         }
         Cmd::DestroyVmMic(tx) => {
+            let _ = tx.send(Err(err));
+        }
+        Cmd::MonitorRetarget(_, tx) => {
             let _ = tx.send(Err(err));
         }
         Cmd::Quit => {}
@@ -546,6 +587,8 @@ fn worker_main(
         vm_module: None,
         streams: None,
         links: Vec::new(),
+        mon_links: Vec::new(),
+        mon_node_id: None,
     };
     worker.run(&mainloop, &core);
 }
@@ -582,6 +625,11 @@ struct Worker {
     vm_module: Option<u32>,
     streams: Option<LiveStreams>,
     links: Vec<pw::link::Link>,
+    /// Monitor→sink links, tracked separately so the hear-myself output
+    /// can be retargeted at runtime without tearing the whole pipeline.
+    mon_links: Vec<pw::link::Link>,
+    /// Node id of the monitor stream (set on `open`).
+    mon_node_id: Option<u32>,
 }
 
 impl Worker {
@@ -621,6 +669,8 @@ impl Worker {
 
     fn teardown(&mut self) {
         self.streams = None;
+        self.mon_links.clear();
+        self.mon_node_id = None;
         *self.shared.link.lock().unwrap() = StreamLinkState::Down;
     }
 
@@ -649,6 +699,9 @@ impl Worker {
             }
             Cmd::DestroyVmMic(tx) => {
                 let _ = tx.send(self.destroy_vm_mic(core, loop_));
+            }
+            Cmd::MonitorRetarget(uid, tx) => {
+                let _ = tx.send(self.retarget_monitor(&uid, core, loop_));
             }
             Cmd::Quit => {}
         }
@@ -809,6 +862,7 @@ impl Worker {
             scratch_in: Vec::new(),
             scratch_out: Vec::new(),
             scratch_raw: Vec::new(),
+            mon_scratch: Vec::new(),
         };
         let mon_data = MonitorData { shared: self.shared.clone(), rx: mon_rx, scratch: Vec::new() };
 
@@ -835,7 +889,7 @@ impl Worker {
         // Monitor routing: explicit link to the default sink when pactl
         // resolves it (deterministic, no doubles); AUTOCONNECT flag only
         // as a fallback when resolution fails.
-        let mon_sink = default_sink_id(&self.nodes);
+        let mon_sink = req.monitor_id.or_else(|| default_sink_id(&self.nodes));
         if mon_sink.is_none() {
             eprintln!("vm-audio: default sink unknown, monitor falls back to autoconnect");
         }
@@ -1067,6 +1121,7 @@ impl Worker {
                             for stage in data.scratch_out.iter_mut() {
                                 stage.resize(frames, 0.0);
                             }
+                            data.mon_scratch.resize(frames * 2, 0.0);
                             match data.processor.try_lock() {
                                 Ok(mut proc) => {
                                     let ins: Vec<&[f32]> =
@@ -1077,6 +1132,11 @@ impl Worker {
                                         .map(Vec::as_mut_slice)
                                         .collect();
                                     proc.process(rate, &ins, &mut outs);
+                                    // Monitor-only bus (soundboard sounds that must
+                                    // never reach vm-mic) — staged for the mix below.
+                                    let bus = proc.monitor_bus();
+                                    let n = bus.len().min(data.mon_scratch.len());
+                                    data.mon_scratch[..n].copy_from_slice(&bus[..n]);
                                 }
                                 Err(_) => {
                                     // Contended: pass through (never block RT).
@@ -1131,9 +1191,37 @@ impl Worker {
                             *chunk.stride_mut() = (ch * 4) as _;
                             *chunk.size_mut() = (frames * ch * 4) as _;
                             if let Some(mon) = data.mon_tx.as_mut() {
+                                // Hear-myself mix (F-0.4.C 15): dry (raw mic,
+                                // zero added latency) + wet (processed voice) +
+                                // extra (monitor-only bus). Fully independent of
+                                // the vm-mic channel; mute/volume live here.
+                                let mix = f32::from_bits(
+                                    data.shared.monitor_mix.load(Ordering::Relaxed),
+                                )
+                                .clamp(0.0, 1.0);
+                                let vol = 10f32.powf(
+                                    f32::from_bits(
+                                        data.shared.monitor_volume_db.load(Ordering::Relaxed),
+                                    ) / 20.0,
+                                );
+                                let (dry_g, wet_g, extra_g) =
+                                    ((1.0 - mix) * vol, mix * vol, vol);
+                                let on = data.shared.monitor_enabled.load(Ordering::Relaxed)
+                                    && !data.shared.monitor_muted.load(Ordering::Relaxed);
                                 for f in 0..frames {
                                     for c in 0..ch {
-                                        if mon.push(data.scratch_out[c % MAX_CHANNELS][f]).is_err() {
+                                        let mut v = 0.0;
+                                        if on {
+                                            let dry = data.scratch_in[c % MAX_CHANNELS][f];
+                                            let wet = data.scratch_out[c % MAX_CHANNELS][f];
+                                            let extra = data
+                                                .mon_scratch
+                                                .get(f * 2 + c)
+                                                .copied()
+                                                .unwrap_or(0.0);
+                                            v = dry_g * dry + wet_g * wet + extra_g * extra;
+                                        }
+                                        if mon.push(v).is_err() {
                                             break;
                                         }
                                     }
@@ -1273,14 +1361,16 @@ impl Worker {
             _mon_l: mon_l,
             _pods: vec![pod_cap, pod_out, pod_mon],
         });
+        self.mon_node_id = Some(mon_node_id);
         // Explicit links, both directions (deterministic; no dependence on
         // session-manager timing; TARGET_OBJECT dropped from props so the
         // session manager never doubles them).
-        self.link_ports(core, loop_, req.input_id, cap_node_id)?;
-        self.link_vad_to_vmic(core, loop_, req.vm_id, vad_node_id)?;
+        self.links.extend(self.link_ports(core, loop_, req.input_id, cap_node_id)?);
+        self.links.extend(self.link_vad_to_vmic(core, loop_, req.vm_id, vad_node_id)?);
         if let Some(sink_id) = mon_sink {
-            if self.link_ports(core, loop_, mon_node_id, sink_id).is_err() {
-                eprintln!("vm-audio: explicit monitor link failed");
+            match self.link_ports(core, loop_, mon_node_id, sink_id) {
+                Ok(links) => self.mon_links.extend(links),
+                Err(_) => eprintln!("vm-audio: explicit monitor link failed"),
             }
         }
         // Manually-linked streams don't self-activate: kick all three.
@@ -1319,12 +1409,12 @@ impl Worker {
     /// Explicit links between two nodes, matched by channel index:
     /// `from` outputs → `to` inputs.
     fn link_ports(
-        &mut self,
+        &self,
         core: &pw::core::CoreRc,
         loop_: &pw::loop_::Loop,
         from_node: u32,
         to_node: u32,
-    ) -> Result<(), AudioError> {
+    ) -> Result<Vec<pw::link::Link>, AudioError> {
         let mut out_ports: Vec<u32> = Vec::new();
         let mut in_ports: Vec<u32> = Vec::new();
         self.pump_until(loop_, Duration::from_secs(10), || {
@@ -1356,6 +1446,7 @@ impl Worker {
                 in_ports.len()
             )));
         }
+        let mut links: Vec<pw::link::Link> = Vec::new();
         for (out_port, in_port) in out_ports.iter().zip(in_ports.iter()).take(n) {
             let link: pw::link::Link = core
                 .create_object(
@@ -1368,21 +1459,46 @@ impl Worker {
                     },
                 )
                 .map_err(|e| AudioError::Backend(format!("create link: {e:?}")))?;
-            self.links.push(link);
+            links.push(link);
         }
-        Ok(())
+        Ok(links)
     }
-
     /// Create output→input links from our vad stream ports to the vm-mic
     /// sink ports, matched by channel index (FL→playback_1, FR→playback_2).
     fn link_vad_to_vmic(
-        &mut self,
+        &self,
         core: &pw::core::CoreRc,
         loop_: &pw::loop_::Loop,
         vm_id: u32,
         vad_node_id: u32,
-    ) -> Result<(), AudioError> {
+    ) -> Result<Vec<pw::link::Link>, AudioError> {
         self.link_ports(core, loop_, vad_node_id, vm_id)
+    }
+
+    /// Move the hear-myself monitor to another sink node: drop the
+    /// existing monitor links (dropping the proxies disconnects them) and
+    /// link the monitor stream to the requested node. Runs on the worker
+    /// thread (F-0.4.C item 15).
+    fn retarget_monitor(
+        &mut self,
+        uid: &str,
+        core: &pw::core::CoreRc,
+        loop_: &pw::loop_::Loop,
+    ) -> Result<(), AudioError> {
+        let id: u32 = uid
+            .rsplit('#')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| AudioError::Backend(format!("bad monitor device uid '{uid}'")))?;
+        let known = self.nodes.lock().map(|m| m.contains_key(&id)).unwrap_or(false);
+        if !known {
+            return Err(AudioError::Backend(format!("monitor device '{uid}' not found")));
+        }
+        let mon_id = self.mon_node_id.ok_or(AudioError::NoStream)?;
+        self.mon_links.clear();
+        let links = self.link_ports(core, loop_, mon_id, id)?;
+        self.mon_links.extend(links);
+        Ok(())
     }
 
     fn start_streams(&mut self) -> Result<(), AudioError> {
@@ -1398,6 +1514,8 @@ impl Worker {
         // worker keeps the loop alive for re-open (mirrors the reference
         // restart path).
         self.links.clear();
+        self.mon_links.clear();
+        self.mon_node_id = None;
         self.streams = None;
         *self.shared.link.lock().unwrap() = StreamLinkState::Down;
     }

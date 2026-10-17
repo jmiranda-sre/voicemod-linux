@@ -1,0 +1,9 @@
+[package]
+name = "vm-midi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+midir = "0.10"
+vm-control = { path = "../vm-control" }

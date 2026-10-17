@@ -1,0 +1,13 @@
+[package]
+name = "vm-obs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+tokio.workspace = true
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+sha2 = "0.10"
+base64 = "0.22"

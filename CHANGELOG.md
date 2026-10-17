@@ -6,6 +6,61 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added (F-0.4.C: routing & integrations)
+
+- Monitor mix (item 15): a hear-yourself path independent of `vm-mic`.
+  The dry leg is the raw pre-graph input (zero added latency) blended
+  with the processed wet signal via `mix`; `setMonitor` changes
+  enable/device/mix/volume/mute live — a device retarget rebuilds only
+  the monitor links, the DSP chain never restarts (rejected devices
+  roll the setting back). Mute or disable pushes zeros instead of
+  leaving a dangling link (no xruns). `getMonitor` + `monitorChanged`
+  report the live state; `getLevels` exposes mic/out dBFS for scripts.
+- Sidechain ducking (item 14): mic-over-threshold attenuation of the
+  soundboard/music bus (defaults: on, 12 dB at −40 dBFS, 50/400 ms
+  attack/release). RT-safe by construction — knobs mirror into atomics
+  and the gain ramp scales with the quantum, the RT thread never
+  blocks. `setDucking`/`getDucking` + `duckingChanged`. The soundboard
+  bus now mixes into `vm-mic` output (all paths incl. bypass), so
+  ducking is audible exactly where music and voice share one stream.
+- OBS integration (item 35): new `vm-obs` crate (pure Rust —
+  tokio-tungstenite + sha2/base64) speaking obs-websocket v5: Hello /
+  Identify handshake with the salted-SHA256 auth challenge (vector
+  tested), event subscriptions General|Scenes. Scene → voice profiles
+  auto-switch the voice on scene change
+  (`setObsSceneProfile`/`removeObsSceneProfile`/`listObsSceneProfiles`);
+  `obsStatusChanged` publishes connect state + current scene. Live VU
+  for OBS: `$VM_CONFIG_DIR/obs-vu.txt` is rewritten every 100 ms
+  (`[voice] mic -58.3dB out -11.7dB ▇`) — point an OBS Text source at
+  the file. `setObs` configures url/password/enabled; inert unless
+  enabled (no runtime cost when off).
+- MIDI learn (item 37): new `vm-midi` crate (midir/ALSA) behind the
+  optional `midi` cargo feature — the default build stays free of ALSA
+  deps and answers the MIDI actions without ever opening a port. CC /
+  Note bindings drive any hotkey target (ToggleMute, PushToTalk,
+  PlaySound, SelectVoice…), or a voice parameter with min/max range
+  mapping (`SetVoiceParameter`); triggers fire on the press edge
+  (Note-off never double-fires toggles). `midiLearnStart` captures the
+  next event into a persisted binding (`midiLearned`,
+  `midiBindingsChanged`); `midiBindAdd`/`midiBindRemove`/
+  `listMidiBindings`/`setMidi`/`getMidiStatus` complete the surface.
+- Config schema v3 (`monitor`, `ducking`, `obs`, `midi` sections);
+  partial updates keep every other field, persist-then-apply so a
+  rejected change never sticks.
+- `vm actions` now prints the catalogue from `vm_control::ALL_ACTIONS`
+  (43 actions) — one source of truth, guarded by a test that
+  serializes every `Action` variant and compares names in order.
+
+### Fixed (F-0.4.C)
+
+- Soundboard files never loaded at runtime: `decode_to_loaded`
+  returned `Err("unreachable")` on every call, so `playSound` replied
+  OK but ran silent. Now it decodes through `decode::decode_file`;
+  the live smoke shows the output level jump to −11.7 dB during
+  playback (previously flat at the mic noise floor).
+- MIDI open failures are logged once per distinct error instead of
+  every 2 s retry.
+
 ### Added (F-0.4.A: new-generation DSP)
 
 - `rnnoise` node: Xiph RNNoise denoiser via the pure-Rust

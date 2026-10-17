@@ -63,6 +63,9 @@ rust (≥1.74)  cargo  clang (libclang, needed by bindgen)  pkg-config
 libpipewire-0.3-dev  libopus-dev
 ```
 
+The optional `midi` feature (see *MIDI learn* above) additionally needs
+`libasound2-dev`. Everything else builds without ALSA.
+
 ```bash
 cargo build --release --workspace
 # binaries: target/release/{vm,vm-daemon,vm-ui}
@@ -98,6 +101,104 @@ The daemon creates a null-sink named **`vm-mic`** (plus `vm-monitor`) and links
 keep working. In Discord/OBS/etc. pick the input usually shown as **`vm-mic`**
 (Monitor of `vm-mic`). Use the UI's *Devices* tab to pick the physical input
 (the environment variable `VM_INPUT_UID` pins one at startup).
+
+### Hear yourself (monitor mix)
+
+The daemon always creates a **`vm-monitor`** sink next to `vm-mic`, but
+it stays silent until you turn the monitor on — `vm-mic` is the clean
+signal apps record, the monitor is only for your own ears:
+
+```bash
+vm call '{"action":"setMonitor","enabled":true,"mix":0.5,"volume_db":-6}'
+vm call '{"action":"getMonitor"}'
+vm call '{"action":"setMonitor","muted":true}'     # quick mute, settings kept
+```
+
+`mix` blends the two legs: `0.0` is the **raw input** (dry — zero added
+latency, no DSP), `1.0` is the fully processed voice. `0.5` lets you
+hear both, which is the classic "do I sound like that?" check without
+running your voice through a second output path. The monitor is
+independent of `vm-mic`: muting it (or disabling it) never touches what
+apps receive. A device retarget (`"device":"..."`, same names as
+`getAudioDevices`) rebuilds only the monitor link, so changing outputs
+never interrupts the main chain; a rejected device rolls the setting
+back and says why.
+
+### Sidechain ducking
+
+When the mic crosses `threshold_db` the daemon attenuates the
+soundboard/music bus by up to `depth_db` — music dips under your voice
+and comes back up ~`release_ms` after you stop:
+
+```bash
+vm call '{"action":"setDucking","enabled":true,"depth_db":12,"threshold_db":-40}'
+vm call '{"action":"getDucking"}'
+```
+
+Defaults: enabled, 12 dB at −40 dBFS, 50 ms attack / 400 ms release.
+The detector runs on atomics only (the real-time thread never blocks),
+so ducking cannot cause xruns. The bus is mixed into `vm-mic`, so the
+duck applies exactly where callers hear music and voice together.
+
+### OBS integration (scene → voice + live VU)
+
+OBS scenes can switch your voice automatically (e.g. *Game* scene →
+`robot`, *Just Chatting* → your normal mic chain), and OBS can show a
+live input meter from the daemon:
+
+1. In OBS: **Tools → WebSocket Server Settings** → enable, note the
+   port (default `4455`) and the password (or disable auth).
+2. Point the daemon at it, and bind scenes to voices:
+
+```bash
+vm call '{"action":"setObs","enabled":true,"url":"ws://127.0.0.1:4455","password":"..."}'
+vm call '{"action":"setObsSceneProfile","scene":"Game","voice":"robot"}'
+vm call '{"action":"listObsSceneProfiles"}'
+vm call '{"action":"getObsStatus"}'   # connected, current scene, url
+```
+
+3. For the VU: add a **Text source** in OBS, enable *Read from file* and
+   select `~/.config/vm/obs-vu.txt` (inside the Flatpak:
+   `~/.var/app/io.github.voicemodlinux.vm/config/vm/obs-vu.txt`). The
+   daemon rewrites it ~10×/s with one line:
+   `[robot] mic -58.3dB out -11.7dB ▇` — current voice, mic level,
+   output level and a level bar.
+
+The client speaks plain obs-websocket v5 (auth handshake included) and
+subscribes to events only — it never issues OBS requests, so it cannot
+fight the OBS UI. Disabled by default; when off it is dormant.
+
+### MIDI learn (CC / Note)
+
+Any MIDI controller can drive the daemon — faders to parameters, pads
+to sounds and mutes. MIDI support is an optional build (ALSA via
+`libasound2-dev`); the default binaries answer the MIDI actions but
+never open a port:
+
+```bash
+sudo apt install libasound2-dev                 # Debian/Ubuntu
+cargo build --release -p vm-daemon --features midi
+```
+
+Bind by hand or capture the next control you touch:
+
+```bash
+# Map CC 7 (channel 1) to the drive amount, 0→4.0
+vm call '{"action":"midiBindAdd","channel":0,"kind":"cc","number":7,
+          "target":{"SetVoiceParameter":{"param":"drive.gain","min":0.0,"max":4.0}}}'
+# Arm learn, then wiggle: the next CC/Note becomes bound to ToggleMute
+vm call '{"action":"midiLearnStart","target":{"Trigger":"ToggleMute"}}'
+vm call '{"action":"listMidiBindings"}'
+vm call '{"action":"getMidiStatus"}'            # connected, port, bindings
+```
+
+Targets are the hotkey targets (`ToggleMute`, `ToggleVoiceChanger`,
+`PushToTalk`, `{"PlaySound": name}`, `{"SelectVoice": name}`,
+`StopAllSounds`) or `SetVoiceParameter` with a min/max range map.
+Triggers fire on the press edge only. `setMidi` picks the port
+(`{"action":"setMidi","port":"..."}`, empty = first); `midi: listening
+on ...` appears in the daemon log once connected, and the learn result
+broadcasts as `midiLearned`.
 
 ### Global hotkeys (evdev)
 
@@ -279,18 +380,23 @@ events. Replies echo an optional request `id` for strict correlation:
 ← {"event":"voiceChanged","voice":"widget-showcase"}
 ```
 
-Actions: `selectVoice`, `toggleVoiceChanger`, `stopAllSounds`, `playSound`,
+Actions (43 total — `vm actions` prints the catalogue):
+`selectVoice`, `toggleVoiceChanger`, `stopAllSounds`, `playSound`,
 `getAllSoundboard`, `setVoiceParameter`, `resetVoiceParameters`,
 `setDefaultMicrophone`, `getAudioDevices`, `getUserLicense`, `fadeSound`,
-`startAudioStreaming`, `getAudioStreamStatus`, `getHealth`, `addHotkey`,
-`removeHotkey`, `listHotkeys`, `setMuted`, `getVoices`,
-`captureNoiseProfile`, `setDeviceProfile`, `removeDeviceProfile`,
-`listDeviceProfiles`, `getBitmap`, `setSoundboardMasterVolume`,
-`selectInput` (26 total — `vm actions`).
+`startAudioStreaming`, `getAudioStreamStatus`, `getHealth`, `getBitmap`,
+`setSoundboardMasterVolume`, `selectInput`, `addHotkey`, `removeHotkey`,
+`listHotkeys`, `setMuted`, `getVoices`, `captureNoiseProfile`,
+`setDeviceProfile`, `removeDeviceProfile`, `listDeviceProfiles`,
+`setMonitor`, `getMonitor`, `setDucking`, `getDucking`, `getLevels`,
+`setObs`, `getObsStatus`, `setObsSceneProfile`, `removeObsSceneProfile`,
+`listObsSceneProfiles`, `getMidiStatus`, `setMidi`, `midiLearnStart`,
+`midiLearnCancel`, `midiBindAdd`, `midiBindRemove`, `listMidiBindings`.
 
 Events: `voiceChanged`, `voiceParameterChanged`, `soundStarted`,
 `soundStopped`, `voiceChangerToggled`, `mutedChanged`, `streamStatus`,
-`devicesChanged`.
+`devicesChanged`, `monitorChanged`, `duckingChanged`, `obsStatusChanged`,
+`midiLearned`, `midiBindingsChanged`.
 
 Hardware buttons (Stream Deck / Bitfocus Companion) speak this API
 directly — action map, payload examples and a module sketch live in
@@ -434,6 +540,8 @@ systemctl --user enable --now vm-daemon
 | UI shows `offline` | start the daemon (or click *Launch daemon*) |
 | hotkeys never fire | 0.1.0 ships the evdev watcher but no bindings yet (infrastructure only); also check the `input` group + udev rule — everything else works regardless |
 | control port busy | another daemon instance runs — stop it (`Stop daemon` in the UI, or the systemd unit) |
+| MIDI bindings never fire | the default build has no MIDI input — build `vm-daemon --features midi` (needs `libasound2-dev`); check `getMidiStatus.connected` |
+| OBS never switches voice | obs-websocket disabled or wrong password — `getObsStatus` shows `connected` + live scene; scene names must match `setObsSceneProfile` exactly |
 | Flatpak: no sound | ensure `pipewire` is your session manager; the native socket permission must be granted (see manifest) |
 
 ## Repository layout

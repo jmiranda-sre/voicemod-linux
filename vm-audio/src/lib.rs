@@ -210,6 +210,44 @@ pub enum StreamLinkState {
 /// allocation, no syscalls. Contended locks must be skipped, never waited.
 pub trait StreamProcessor: Send {
     fn process(&mut self, rate: u32, inputs: &[&[f32]], outputs: &mut [&mut [f32]]);
+
+    /// Interleaved **stereo** extra samples (frames × 2, L/R) that belong
+    /// only to the hear-myself monitor — sounds routed `sendToVAD=false`
+    /// (`Monitor`) must never reach `vm-mic`. Empty slice = silence.
+    /// Called by live backends right after [`StreamProcessor::process`];
+    /// must be allocation-free and non-blocking.
+    fn monitor_bus(&self) -> &[f32] {
+        &[]
+    }
+}
+
+/// Hear-myself monitor settings (F-0.4.C item 15). `mix` blends the raw
+/// mic (0.0, dry, zero added latency) with the processed output (1.0,
+/// wet); `device` is an output uid (`name#id`) or empty for the system
+/// default sink. Live backends apply this after `open` and on change.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MonitorSettings {
+    pub enabled: bool,
+    pub device: String,
+    pub mix: f32,
+    pub volume_db: f32,
+    pub muted: bool,
+}
+
+impl Default for MonitorSettings {
+    fn default() -> Self {
+        Self { enabled: false, device: String::new(), mix: 0.0, volume_db: 0.0, muted: false }
+    }
+}
+
+impl MonitorSettings {
+    /// Linear gains for the monitor mixer: `(dry, wet, extra)`. The
+    /// monitor-only bus rides the volume but not the blend.
+    pub fn gains(&self) -> (f32, f32, f32) {
+        let vol = 10f32.powf(self.volume_db / 20.0);
+        let mix = self.mix.clamp(0.0, 1.0);
+        ((1.0 - mix) * vol, mix * vol, vol)
+    }
 }
 
 /// Audio backend: enumerate → open(topology) → start/stop, with hotplug.
@@ -230,6 +268,13 @@ pub trait AudioBackend: Send {    fn enumerate(&mut self) -> Result<Vec<AudioDev
     /// Install the RT DSP entry (used by live backends on `open`).
     /// Default: ignored (stub behaviour).
     fn set_processor(&mut self, _processor: std::sync::Arc<std::sync::Mutex<dyn StreamProcessor>>) {
+    }
+
+    /// Apply hear-myself monitor settings (F-0.4.C item 15): enable /
+    /// retarget the monitor stream, blend and mute. Default: accepted
+    /// as a no-op (backends without a monitor path, e.g. the stub).
+    fn set_monitor(&mut self, _settings: &MonitorSettings) -> Result<(), AudioError> {
+        Ok(())
     }
 
     /// Create the virtual source if missing; returns its uid either way.

@@ -65,6 +65,13 @@ impl AudioNode for Gain {
             _ => Err(ParamError::Unknown(name.into())),
         }
     }
+    fn get_param(&self, name: &str) -> Option<ParamValue> {
+        match name {
+            "gain" => Some(ParamValue::Float(self.gain)),
+            "note" => Some(ParamValue::Text(self.note.clone())),
+            _ => None,
+        }
+    }
     fn params(&self) -> Vec<PublicParam> {
         vec![
             PublicParam {

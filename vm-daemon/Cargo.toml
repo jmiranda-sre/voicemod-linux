@@ -16,6 +16,15 @@ vm-dsp = { path = "../vm-dsp" }
 vm-soundboard = { path = "../vm-soundboard" }
 vm-preset = { path = "../vm-preset" }
 vm-control = { path = "../vm-control" }
+vm-obs = { path = "../vm-obs" }
+vm-midi = { path = "../vm-midi", optional = true }
+
+[features]
+default = []
+# Physical MIDI learn (ALSA sequencer, native libasound). Off by default so
+# the lean build stays dependency-free: `cargo build --release -p vm-daemon
+# --features midi`.
+midi = ["dep:vm-midi"]
 
 [dev-dependencies]
 tokio-tungstenite = "0.26"

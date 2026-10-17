@@ -141,6 +141,13 @@ impl ControlApiServer {
     pub fn subscribe(&self) -> broadcast::Receiver<String> {
         self.events.subscribe()
     }
+
+    /// Clone of the event bus sender: lets the daemon's non-WS dispatch
+    /// paths (hotkeys, MIDI, OBS, hotplug autoswitch) broadcast the same
+    /// `ControlEvent` JSON string the server sends for API requests.
+    pub fn publisher(&self) -> broadcast::Sender<String> {
+        self.events.clone()
+    }
 }
 
 async fn handle(

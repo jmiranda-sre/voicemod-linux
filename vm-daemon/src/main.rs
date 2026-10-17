@@ -7,18 +7,69 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     Arc, Mutex,
 };
-use vm_audio::{AudioBackend, DeviceRole, StreamProcessor, StreamStopReason, StreamTopology, SAMPLE_RATE};
+use vm_audio::{
+    AudioBackend, DeviceRole, MonitorSettings, StreamProcessor, StreamStopReason, StreamTopology,
+    SAMPLE_RATE,
+};
 use vm_control::{
-    Action, ControlApiServer, ControlEvent, ControlHandler, ControlReply, HotkeyManager,
-    HotkeyTarget, Keybind, ServerConfig,
+    Action, ControlApiServer, ControlEvent, ControlHandler, ControlReply, DuckingConfig,
+    HotkeyManager, HotkeyTarget, Keybind, MidiBinding, MidiConfig, MidiEvent, MidiKind,
+    MidiTarget, MonitorConfig, ObsConfig, ServerConfig,
 };
 use vm_dsp::{Graph, NodeConstructorContext, NodeFactory, NodeId, ProcessContext};
 
+/// Ducking knobs mirrored to atomics so the RT processor never blocks on
+/// a control-plane mutex (F-0.4.C item 14).
+#[derive(Default)]
+struct DuckingRt {
+    enabled: AtomicBool,
+    depth_db: AtomicU32,
+    threshold_db: AtomicU32,
+    attack_ms: AtomicU32,
+    release_ms: AtomicU32,
+}
+
+/// Live level snapshot for `getLevels` / the OBS VU source: written by the
+/// RT processor, read by the control plane.
+#[derive(Debug, Clone, Copy)]
+struct LevelsSnapshot {
+    mic_db: f32,
+    out_db: f32,
+    speech: bool,
+}
+
+impl Default for LevelsSnapshot {
+    fn default() -> Self {
+        // Silence floor, not 0 dB: a fresh `getLevels` must read as quiet.
+        Self { mic_db: -100.0, out_db: -100.0, speech: false }
+    }
+}
+
+/// obs-websocket bridge runtime status (F-0.4.C item 35).
+#[derive(Debug, Default, Clone)]
+struct ObsStatus {
+    connected: bool,
+    scene: String,
+    url: String,
+}
+
+/// MIDI input runtime state (F-0.4.C item 37).
+#[derive(Debug, Default, Clone)]
+struct MidiRuntime {
+    /// Armed learn target: the next incoming event binds to it.
+    learn: Option<MidiTarget>,
+    connected: bool,
+}
+
 /// RT DSP entry: runs the voice graph, or passes through when the voice
 /// changer is bypassed. Graph + flag shared with the control plane.
+///
+/// F-0.4.C: also mixes the soundboard into the vm-mic (VAD bus) and the
+/// hear-myself monitor (monitor-only bus), and applies sidechain ducking
+/// driven by the raw mic level.
 struct GraphProcessor {
     graph: Arc<Mutex<Graph>>,
     voice_enabled: Arc<AtomicBool>,
@@ -29,8 +80,23 @@ struct GraphProcessor {
     /// (preset swap in flight) passes the previous buffer through and
     /// counts as a graph-side xrun instead of blocking the RT thread.
     graph_xruns: Arc<AtomicU64>,
+    /// Soundboard mixer, shared with the control plane (play/stop/volume).
+    mixer: Arc<Mutex<vm_soundboard::SoundboardMixer>>,
+    /// Ducking knobs (atomics) read every quantum.
+    ducking: Arc<DuckingRt>,
+    /// Level snapshot shared with `getLevels` / the OBS bridge.
+    levels: Arc<Mutex<LevelsSnapshot>>,
     lane_in: Vec<Vec<f32>>,
     lane_out: Vec<Vec<f32>>,
+    /// Soundboard buses (reused; `mix_into` zeroes them each call).
+    vad_bus: vm_soundboard::StereoBus,
+    mon_bus: vm_soundboard::StereoBus,
+    /// Interleaved stereo monitor-only bus (`mon − vad`), returned by
+    /// `monitor_bus()` for the hear-myself mix.
+    mon_extra: Vec<f32>,
+    /// Smoothed duck gain in dB (0 = unity).
+    duck_db: f32,
+    speech: bool,
 }
 
 impl GraphProcessor {
@@ -39,8 +105,127 @@ impl GraphProcessor {
         voice_enabled: Arc<AtomicBool>,
         muted: Arc<AtomicBool>,
         graph_xruns: Arc<AtomicU64>,
+        mixer: Arc<Mutex<vm_soundboard::SoundboardMixer>>,
+        ducking: Arc<DuckingRt>,
+        levels: Arc<Mutex<LevelsSnapshot>>,
     ) -> Self {
-        Self { graph, voice_enabled, muted, graph_xruns, lane_in: Vec::new(), lane_out: Vec::new() }
+        Self {
+            graph,
+            voice_enabled,
+            muted,
+            graph_xruns,
+            mixer,
+            ducking,
+            levels,
+            lane_in: Vec::new(),
+            lane_out: Vec::new(),
+            vad_bus: vm_soundboard::StereoBus::default(),
+            mon_bus: vm_soundboard::StereoBus::default(),
+            mon_extra: Vec::new(),
+            duck_db: 0.0,
+            speech: false,
+        }
+    }
+
+    /// Build a processor wired to the live state's shared stores (tests).
+    #[cfg(test)]
+    fn for_state(state: &Arc<DaemonState>) -> Self {
+        Self::new(
+            state.graph.clone(),
+            state.voice_enabled.clone(),
+            state.muted.clone(),
+            state.graph_xruns.clone(),
+            state.mixer.clone(),
+            state.ducking_rt.clone(),
+            state.levels.clone(),
+        )
+    }
+
+    /// RMS of the pre-graph mic lanes, in dBFS (−100 floor).
+    fn mic_level(&self, frames: usize) -> f32 {
+        let mut sum = 0.0f64;
+        let mut n = 0usize;
+        for lane in self.lane_in.iter() {
+            for s in lane.iter().take(frames) {
+                sum += (*s as f64) * (*s as f64);
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return -100.0;
+        }
+        let rms = (sum / n as f64).sqrt() as f32;
+        if rms > 1e-9 {
+            20.0 * rms.log10()
+        } else {
+            -100.0
+        }
+    }
+
+    /// RMS of the final output lanes, in dBFS.
+    fn output_level(&self, outputs: &[&mut [f32]], frames: usize) -> f32 {
+        let mut sum = 0.0f64;
+        let mut n = 0usize;
+        for lane in outputs.iter() {
+            for s in lane.iter().take(frames) {
+                sum += (*s as f64) * (*s as f64);
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return -100.0;
+        }
+        let rms = (sum / n as f64).sqrt() as f32;
+        if rms > 1e-9 {
+            20.0 * rms.log10()
+        } else {
+            -100.0
+        }
+    }
+
+    /// Sidechain ducking (F-0.4.C item 14): attenuate the soundboard
+    /// buses while the mic sits above the speech threshold. Ramps are in
+    /// dB/frame so `attack_ms`/`release_ms` map to the configured times.
+    fn apply_ducking(&mut self, mic_db: f32, rate: u32, frames: usize) {
+        let rt = &self.ducking;
+        let enabled = rt.enabled.load(Ordering::Relaxed);
+        let depth = f32::from_bits(rt.depth_db.load(Ordering::Relaxed));
+        let thresh = f32::from_bits(rt.threshold_db.load(Ordering::Relaxed));
+        let attack = f32::from_bits(rt.attack_ms.load(Ordering::Relaxed)).max(1.0);
+        let release = f32::from_bits(rt.release_ms.load(Ordering::Relaxed)).max(1.0);
+        self.speech = enabled && mic_db > thresh;
+        let target = if self.speech { -depth } else { 0.0 };
+        let down = depth / (attack / 1000.0 * rate as f32) * frames as f32;
+        let up = depth / (release / 1000.0 * rate as f32) * frames as f32;
+        if target < self.duck_db {
+            self.duck_db = (self.duck_db - down).max(target);
+        } else {
+            self.duck_db = (self.duck_db + up).min(target);
+        }
+        let g = 10f32.powf(self.duck_db / 20.0);
+        for s in self.vad_bus.left.iter_mut() {
+            *s *= g;
+        }
+        for s in self.vad_bus.right.iter_mut() {
+            *s *= g;
+        }
+        for s in self.mon_bus.left.iter_mut() {
+            *s *= g;
+        }
+        for s in self.mon_bus.right.iter_mut() {
+            *s *= g;
+        }
+        // Monitor-only bus = monitor − vad: sounds sent to vm-mic already
+        // ride the wet path, so they must not be counted twice here.
+        self.mon_extra.resize(frames * 2, 0.0);
+        for f in 0..frames {
+            let l = self.mon_bus.left.get(f).copied().unwrap_or(0.0)
+                - self.vad_bus.left.get(f).copied().unwrap_or(0.0);
+            let r = self.mon_bus.right.get(f).copied().unwrap_or(0.0)
+                - self.vad_bus.right.get(f).copied().unwrap_or(0.0);
+            self.mon_extra[f * 2] = l;
+            self.mon_extra[f * 2 + 1] = r;
+        }
     }
 }
 
@@ -72,23 +257,33 @@ impl StreamProcessor for GraphProcessor {
                 lane.resize(frames, 0.0);
             }
         }
+        // Sidechain source: the raw mic, before the voice graph.
+        let mic_db = self.mic_level(frames);
         if !self.voice_enabled.load(Ordering::Relaxed) {
-            for (dst, src) in outputs.iter_mut().zip(self.lane_in.iter()) {
-                dst.copy_from_slice(&src[..frames.min(dst.len()).min(src.len())]);
+            for (dst, src) in self.lane_out.iter_mut().zip(self.lane_in.iter()) {
+                dst[..frames].copy_from_slice(&src[..frames]);
             }
-            if self.muted.load(Ordering::Relaxed) {
-                for dst in outputs.iter_mut() {
-                    let n = frames.min(dst.len());
-                    dst[..n].fill(0.0);
-                }
-            }
-            return;
-        }
-        let ctx = ProcessContext { rate, frames };
-        if let Ok(mut graph) = self.graph.try_lock() {
+        } else if let Ok(mut graph) = self.graph.try_lock() {
+            let ctx = ProcessContext { rate, frames };
             graph.process(&ctx, &self.lane_in, &mut self.lane_out);
         } else {
             self.graph_xruns.fetch_add(1, Ordering::Relaxed);
+            for (dst, src) in self.lane_out.iter_mut().zip(self.lane_in.iter()) {
+                dst[..frames].copy_from_slice(&src[..frames]);
+            }
+        }
+        // Soundboard into the vm-mic (VAD bus) + monitor-only bus, then
+        // sidechain ducking. A contended mixer keeps the previous quantum's
+        // buses: never block the RT thread for a control-plane action.
+        if let Ok(mut mixer) = self.mixer.try_lock() {
+            mixer.mix_into(frames, &mut self.vad_bus, &mut self.mon_bus);
+        }
+        self.apply_ducking(mic_db, rate, frames);
+        for (li, lane) in self.lane_out.iter_mut().enumerate() {
+            let src = if li == 0 { &self.vad_bus.left } else { &self.vad_bus.right };
+            for (slot, v) in lane.iter_mut().zip(src.iter().take(frames)) {
+                *slot += *v;
+            }
         }
         for (dst, src) in outputs.iter_mut().zip(self.lane_out.iter()) {
             dst.copy_from_slice(&src[..frames.min(dst.len()).min(src.len())]);
@@ -99,6 +294,15 @@ impl StreamProcessor for GraphProcessor {
                 dst[..n].fill(0.0);
             }
         }
+        if let Ok(mut lv) = self.levels.try_lock() {
+            lv.mic_db = mic_db;
+            lv.out_db = self.output_level(outputs, frames);
+            lv.speech = self.speech;
+        }
+    }
+
+    fn monitor_bus(&self) -> &[f32] {
+        &self.mon_extra
     }
 }
 
@@ -110,7 +314,7 @@ struct DaemonState {
     node_ids: Mutex<HashMap<String, NodeId>>,
     voice_name: Mutex<String>,
     voice_enabled: Arc<AtomicBool>,
-    mixer: Mutex<vm_soundboard::SoundboardMixer>,
+    mixer: Arc<Mutex<vm_soundboard::SoundboardMixer>>,
     /// Sound name → id index (built at boot from the sound dir).
     sound_ids: Mutex<HashMap<String, vm_soundboard::SoundHashId>>,
     audio: Arc<Mutex<Box<dyn AudioBackend>>>,
@@ -130,6 +334,24 @@ struct DaemonState {
     /// Device (uid, uid base, or name) → voice preset. Autoswitches the
     /// voice when the device appears or is selected.
     device_profiles: Mutex<HashMap<String, String>>,
+    /// Hear-myself monitor settings (persisted config v3, F-0.4.C 15).
+    monitor: Mutex<MonitorConfig>,
+    /// Sidechain ducking settings (persisted, F-0.4.C 14).
+    ducking: Mutex<DuckingConfig>,
+    /// Ducking knobs mirrored to atomics for the RT processor.
+    ducking_rt: Arc<DuckingRt>,
+    /// obs-websocket settings (persisted, F-0.4.C 35).
+    obs: Mutex<ObsConfig>,
+    /// obs-websocket bridge runtime status (for `getObsStatus`).
+    obs_status: Arc<Mutex<ObsStatus>>,
+    /// MIDI learn settings (persisted, F-0.4.C 37).
+    midi: Mutex<MidiConfig>,
+    /// MIDI input runtime state (learn target + connected flag).
+    midi_runtime: Arc<Mutex<MidiRuntime>>,
+    /// Live level snapshot (mic/output RMS + speech) for `getLevels`.
+    levels: Arc<Mutex<LevelsSnapshot>>,
+    /// watch channel notifying the obs-websocket bridge of config changes.
+    obs_tx: tokio::sync::watch::Sender<ObsConfig>,
 }
 
 /// Strip a PipeWire `#node-id` suffix (`alsa:...#52` → base): node ids
@@ -229,10 +451,7 @@ impl DaemonState {
         let out = op(&mut mgr, &mut profiles);
         match out {
             Ok(v) => {
-                let cfg = vm_control::DaemonConfig {
-                    hotkeys: mgr.export(),
-                    device_profiles: profiles.clone(),
-                };
+                let cfg = self.build_config_from(&mgr, &profiles);
                 match self.write_config_file(&cfg) {
                     Ok(()) => Ok(v),
                     Err(e) => {
@@ -243,6 +462,184 @@ impl DaemonState {
                 }
             }
             Err(e) => Err(e),
+        }
+    }
+
+    /// Persist one F-0.4.C section (monitor/ducking/obs/midi) with the
+    /// same snapshot/rollback discipline as [`Self::transact_config`].
+    /// The section lock is released before the file snapshot is taken (the
+    /// snapshot re-locks every section, so holding one would deadlock).
+    fn transact_section<T: Clone>(
+        &self,
+        store: &Mutex<T>,
+        op: impl FnOnce(&mut T) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let backup = store.lock().unwrap().clone();
+        {
+            let mut sec = store.lock().unwrap();
+            op(&mut sec)?;
+        }
+        let mgr = self.hotkeys.lock().unwrap();
+        let profiles = self.device_profiles.lock().unwrap();
+        let cfg = self.build_config_from(&mgr, &profiles);
+        drop(mgr);
+        drop(profiles);
+        match self.write_config_file(&cfg) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                *store.lock().unwrap() = backup;
+                Err(format!("applied but not saved, rolled back: {e}"))
+            }
+        }
+    }
+
+    /// Assemble the persisted config from the live stores. `hotkeys` and
+    /// `device_profiles` are passed in because the caller may already hold
+    /// their locks; the F-0.4.C sections are snapshotted here.
+    fn build_config_from(
+        &self,
+        mgr: &HotkeyManager,
+        profiles: &HashMap<String, String>,
+    ) -> vm_control::DaemonConfig {
+        vm_control::DaemonConfig {
+            hotkeys: mgr.export(),
+            device_profiles: profiles.clone(),
+            monitor: self.monitor.lock().unwrap().clone(),
+            ducking: self.ducking.lock().unwrap().clone(),
+            obs: self.obs.lock().unwrap().clone(),
+            midi: self.midi.lock().unwrap().clone(),
+        }
+    }
+
+    /// Mirror the persisted ducking config into the RT atomics (called on
+    /// boot and on every `setDucking`).
+    fn push_ducking_rt(&self, cfg: &DuckingConfig) {
+        let rt = &self.ducking_rt;
+        rt.enabled.store(cfg.enabled, Ordering::Relaxed);
+        rt.depth_db.store(cfg.depth_db.to_bits(), Ordering::Relaxed);
+        rt.threshold_db.store(cfg.threshold_db.to_bits(), Ordering::Relaxed);
+        rt.attack_ms.store(cfg.attack_ms.to_bits(), Ordering::Relaxed);
+        rt.release_ms.store(cfg.release_ms.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Apply monitor settings to the backend (validates the device uid)
+    /// and return the broadcast event for the new state.
+    fn apply_monitor(&self, cfg: &MonitorConfig) -> Result<ControlEvent, String> {
+        let settings = MonitorSettings {
+            enabled: cfg.enabled,
+            device: cfg.device.clone(),
+            mix: cfg.mix,
+            volume_db: cfg.volume_db,
+            muted: cfg.muted,
+        };
+        let mut audio = self.audio.lock().unwrap();
+        audio.set_monitor(&settings).map_err(|e| e.to_string())?;
+        Ok(ControlEvent::MonitorChanged {
+            enabled: cfg.enabled,
+            device: cfg.device.clone(),
+            mix: cfg.mix,
+            volume_db: cfg.volume_db,
+            muted: cfg.muted,
+        })
+    }
+
+    fn obs_status_json(&self) -> serde_json::Value {
+        let st = self.obs_status.lock().unwrap();
+        // Before the bridge connects, report the configured endpoint so
+        // UIs can show where it *would* connect.
+        let url = if st.url.is_empty() {
+            self.obs.lock().unwrap().url.clone()
+        } else {
+            st.url.clone()
+        };
+        serde_json::json!({
+            "connected": st.connected,
+            "scene": st.scene,
+            "url": url,
+        })
+    }
+
+    fn obs_status_event(&self) -> ControlEvent {
+        let st = self.obs_status.lock().unwrap();
+        ControlEvent::ObsStatusChanged {
+            connected: st.connected,
+            scene: st.scene.clone(),
+            url: st.url.clone(),
+        }
+    }
+
+    #[cfg_attr(not(feature = "midi"), allow(dead_code))]
+    fn set_midi_connected(&self, connected: bool) {
+        self.midi_runtime.lock().unwrap().connected = connected;
+    }
+
+    fn set_obs_status(&self, connected: bool, scene: String, url: String) {
+        let mut st = self.obs_status.lock().unwrap();
+        st.connected = connected;
+        st.scene = scene;
+        st.url = url;
+    }
+
+    /// Dispatch one incoming MIDI event (F-0.4.C 37): while learning, the
+    /// event becomes a new binding; otherwise it fires the mapped target.
+    #[cfg_attr(not(feature = "midi"), allow(dead_code))]
+    fn dispatch_midi(
+        &self,
+        ev: &MidiEvent,
+        publisher: &tokio::sync::broadcast::Sender<String>,
+    ) {
+        let learn_target = self.midi_runtime.lock().unwrap().learn.take();
+        if let Some(target) = learn_target {
+            let binding = MidiBinding {
+                id: 0,
+                channel: Some(ev.channel),
+                kind: ev.kind,
+                number: ev.number,
+                target: target.clone(),
+                enabled: true,
+            };
+            let res = self.transact_section(&self.midi, |c| {
+                let id = c.next_binding_id();
+                let mut b = binding.clone();
+                b.id = id;
+                c.bindings.push(b);
+                Ok(())
+            });
+            if let Err(e) = res {
+                eprintln!("midi learn: {e}");
+                return;
+            }
+            let id = self.midi.lock().unwrap().bindings.last().map(|b| b.id).unwrap_or(0);
+            publish(publisher, &ControlEvent::MidiLearned {
+                midi_id: id,
+                kind: ev.kind,
+                number: ev.number,
+                channel: Some(ev.channel),
+                target,
+            });
+            publish(publisher, &ControlEvent::MidiBindingsChanged);
+            return;
+        }
+        let binding = {
+            let cfg = self.midi.lock().unwrap();
+            cfg.find_binding(ev.kind, ev.number, ev.channel).cloned()
+        };
+        let Some(b) = binding else { return };
+        let action = match &b.target {
+            MidiTarget::Trigger(t) => hotkey_action(t, ev.value > 0, self),
+            MidiTarget::SetVoiceParameter { param, min, max } => {
+                let t = (ev.value as f32 / 127.0).clamp(0.0, 1.0);
+                Some(Action::SetVoiceParameter {
+                    param: param.clone(),
+                    value: serde_json::json!(min + t * (max - min)),
+                })
+            }
+        };
+        if let Some(a) = action {
+            let (_reply, evts) = self.handle(&a);
+            for e in &evts {
+                publish(publisher, e);
+            }
         }
     }
 
@@ -907,6 +1304,261 @@ impl ControlHandler for DaemonState {
                 }
                 Err(e) => (ControlReply::err(e), Vec::new()),
             },
+            Action::SetMonitor { enabled, device, mix, volume_db, muted } => {
+                let next = {
+                    let cfg = self.monitor.lock().unwrap();
+                    let mut n = cfg.clone();
+                    if let Some(v) = enabled {
+                        n.enabled = *v;
+                    }
+                    if let Some(v) = device {
+                        n.device = v.clone();
+                    }
+                    if let Some(v) = mix {
+                        n.mix = *v;
+                    }
+                    if let Some(v) = volume_db {
+                        n.volume_db = *v;
+                    }
+                    if let Some(v) = muted {
+                        n.muted = *v;
+                    }
+                    n.clamp();
+                    n
+                };
+                // Persist first (rollback-safe), then push to the backend;
+                // a bad device rolls the section back so disk and audio
+                // can never disagree.
+                let prev = self.monitor.lock().unwrap().clone();
+                match self.transact_section(&self.monitor, |c| {
+                    *c = next.clone();
+                    Ok(())
+                }) {
+                    Ok(()) => match self.apply_monitor(&next) {
+                        Ok(evt) => (ControlReply::ok(), vec![evt]),
+                        Err(e) => {
+                            let _ = self.transact_section(&self.monitor, |c| {
+                                *c = prev;
+                                Ok(())
+                            });
+                            (ControlReply::err(format!("monitor: {e}")), Vec::new())
+                        }
+                    },
+                    Err(e) => (ControlReply::err(e), Vec::new()),
+                }
+            }
+            Action::GetMonitor => {
+                let cfg = self.monitor.lock().unwrap();
+                let v = serde_json::to_value(&*cfg).unwrap_or(serde_json::Value::Null);
+                (ControlReply::ok_data(v), Vec::new())
+            }
+            Action::SetDucking { enabled, depth_db, threshold_db, attack_ms, release_ms } => {
+                let next = {
+                    let cfg = self.ducking.lock().unwrap();
+                    let mut n = cfg.clone();
+                    if let Some(v) = enabled {
+                        n.enabled = *v;
+                    }
+                    if let Some(v) = depth_db {
+                        n.depth_db = *v;
+                    }
+                    if let Some(v) = threshold_db {
+                        n.threshold_db = *v;
+                    }
+                    if let Some(v) = attack_ms {
+                        n.attack_ms = *v;
+                    }
+                    if let Some(v) = release_ms {
+                        n.release_ms = *v;
+                    }
+                    n.clamp();
+                    n
+                };
+                match self.transact_section(&self.ducking, |c| {
+                    *c = next.clone();
+                    Ok(())
+                }) {
+                    Ok(()) => {
+                        self.push_ducking_rt(&next);
+                        (
+                            ControlReply::ok(),
+                            vec![ControlEvent::DuckingChanged {
+                                enabled: next.enabled,
+                                depth_db: next.depth_db,
+                                threshold_db: next.threshold_db,
+                                attack_ms: next.attack_ms,
+                                release_ms: next.release_ms,
+                            }],
+                        )
+                    }
+                    Err(e) => (ControlReply::err(e), Vec::new()),
+                }
+            }
+            Action::GetDucking => {
+                let cfg = self.ducking.lock().unwrap();
+                let v = serde_json::to_value(&*cfg).unwrap_or(serde_json::Value::Null);
+                (ControlReply::ok_data(v), Vec::new())
+            }
+            Action::GetLevels => {
+                let lv = self.levels.lock().unwrap();
+                (
+                    ControlReply::ok_data(serde_json::json!({
+                        "mic_db": lv.mic_db,
+                        "out_db": lv.out_db,
+                        "speech": lv.speech,
+                    })),
+                    Vec::new(),
+                )
+            }
+            Action::SetObs { enabled, url, password } => {
+                let next = {
+                    let cfg = self.obs.lock().unwrap();
+                    let mut n = cfg.clone();
+                    if let Some(v) = enabled {
+                        n.enabled = *v;
+                    }
+                    if let Some(v) = url {
+                        n.url = v.clone();
+                    }
+                    if let Some(v) = password {
+                        n.password = v.clone();
+                    }
+                    n
+                };
+                match self.transact_section(&self.obs, |c| {
+                    *c = next.clone();
+                    Ok(())
+                }) {
+                    Ok(()) => {
+                        let _ = self.obs_tx.send(next);
+                        (ControlReply::ok(), vec![self.obs_status_event()])
+                    }
+                    Err(e) => (ControlReply::err(e), Vec::new()),
+                }
+            }
+            Action::GetObsStatus => (ControlReply::ok_data(self.obs_status_json()), Vec::new()),
+            Action::SetObsSceneProfile { scene, voice } => {
+                if voice.trim().is_empty() {
+                    return (ControlReply::err("voice must not be empty"), Vec::new());
+                }
+                match self.transact_section(&self.obs, |c| {
+                    c.scenes.insert(scene.clone(), voice.clone());
+                    Ok(())
+                }) {
+                    Ok(()) => (ControlReply::ok(), Vec::new()),
+                    Err(e) => (ControlReply::err(e), Vec::new()),
+                }
+            }
+            Action::RemoveObsSceneProfile { scene } => {
+                match self.transact_section(&self.obs, |c| {
+                    c.scenes.remove(scene);
+                    Ok(())
+                }) {
+                    Ok(()) => (ControlReply::ok(), Vec::new()),
+                    Err(e) => (ControlReply::err(e), Vec::new()),
+                }
+            }
+            Action::ListObsSceneProfiles => {
+                let obs = self.obs.lock().unwrap();
+                let mut scenes: Vec<(&String, &String)> = obs.scenes.iter().collect();
+                scenes.sort();
+                let v = serde_json::json!({
+                    "scenes": scenes
+                        .iter()
+                        .map(|(s, v)| serde_json::json!({ "scene": s, "voice": v }))
+                        .collect::<Vec<_>>(),
+                });
+                (ControlReply::ok_data(v), Vec::new())
+            }
+            Action::GetMidiStatus => {
+                let rt = self.midi_runtime.lock().unwrap();
+                let cfg = self.midi.lock().unwrap();
+                (
+                    ControlReply::ok_data(serde_json::json!({
+                        "connected": rt.connected,
+                        "learning": rt.learn.is_some(),
+                        "port": cfg.port,
+                        "bindings": cfg.bindings.len(),
+                    })),
+                    Vec::new(),
+                )
+            }
+            Action::SetMidi { enabled, port } => {
+                let next = {
+                    let cfg = self.midi.lock().unwrap();
+                    let mut n = cfg.clone();
+                    if let Some(v) = enabled {
+                        n.enabled = *v;
+                    }
+                    if let Some(v) = port {
+                        n.port = v.clone();
+                    }
+                    n
+                };
+                match self.transact_section(&self.midi, |c| {
+                    *c = next;
+                    Ok(())
+                }) {
+                    Ok(()) => (ControlReply::ok(), Vec::new()),
+                    Err(e) => (ControlReply::err(e), Vec::new()),
+                }
+            }
+            Action::MidiLearnStart { target } => {
+                let probe = MidiBinding {
+                    id: 0,
+                    channel: None,
+                    kind: MidiKind::Cc,
+                    number: 0,
+                    target: target.clone(),
+                    enabled: true,
+                };
+                if let Err(e) = probe.validate() {
+                    return (ControlReply::err(e), Vec::new());
+                }
+                self.midi_runtime.lock().unwrap().learn = Some(target.clone());
+                (ControlReply::ok(), Vec::new())
+            }
+            Action::MidiLearnCancel => {
+                self.midi_runtime.lock().unwrap().learn = None;
+                (ControlReply::ok(), Vec::new())
+            }
+            Action::MidiBindAdd { channel, kind, number, target } => {
+                let binding = MidiBinding {
+                    id: 0,
+                    channel: *channel,
+                    kind: *kind,
+                    number: *number,
+                    target: target.clone(),
+                    enabled: true,
+                };
+                if let Err(e) = binding.validate() {
+                    return (ControlReply::err(e), Vec::new());
+                }
+                match self.transact_section(&self.midi, |c| {
+                    let id = c.next_binding_id();
+                    let mut b = binding.clone();
+                    b.id = id;
+                    c.bindings.push(b);
+                    Ok(())
+                }) {
+                    Ok(()) => (ControlReply::ok(), vec![ControlEvent::MidiBindingsChanged]),
+                    Err(e) => (ControlReply::err(e), Vec::new()),
+                }
+            }
+            Action::MidiBindRemove { midi_id } => {
+                match self.transact_section(&self.midi, |c| {
+                    c.bindings.retain(|b| b.id != *midi_id);
+                    Ok(())
+                }) {
+                    Ok(()) => (ControlReply::ok(), vec![ControlEvent::MidiBindingsChanged]),
+                    Err(e) => (ControlReply::err(e), Vec::new()),
+                }
+            }
+            Action::ListMidiBindings => {
+                let cfg = self.midi.lock().unwrap();
+                let v = serde_json::to_value(&cfg.bindings).unwrap_or(serde_json::Value::Null);
+                (ControlReply::ok_data(serde_json::json!({ "bindings": v })), Vec::new())
+            }
         }
     }
 }
@@ -939,6 +1591,173 @@ fn hotkey_action(target: &HotkeyTarget, pressed: bool, state: &DaemonState) -> O
         }
         HotkeyTarget::StopAllSounds if pressed => Some(Action::StopAllSounds),
         _ => None,
+    }
+}
+
+/// Broadcast a control event on the shared bus (hotkeys, MIDI, OBS).
+fn publish(publisher: &tokio::sync::broadcast::Sender<String>, event: &ControlEvent) {
+    if let Ok(text) = serde_json::to_string(event) {
+        let _ = publisher.send(text);
+    }
+}
+
+/// Write the VU line for OBS's Text source (read from file).
+fn write_vu_file(path: &std::path::Path, state: &DaemonState) {
+    let lv = state.levels.lock().unwrap();
+    let voice = state.voice_name.lock().unwrap().clone();
+    const BARS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+    let idx = (((-lv.mic_db).clamp(0.0, 60.0) / 60.0 * (BARS.len() - 1) as f32).round() as usize)
+        .min(BARS.len() - 1);
+    let text = format!(
+        "[{voice}] mic {:.1}dB out {:.1}dB {}",
+        lv.mic_db,
+        lv.out_db,
+        BARS[idx]
+    );
+    drop(lv);
+    let _ = std::fs::write(path, text);
+}
+
+/// obs-websocket bridge: reconnect loop, scene → voice autoswitch and the
+/// VU text source (F-0.4.C 35).
+async fn obs_bridge(
+    state: Arc<DaemonState>,
+    publisher: tokio::sync::broadcast::Sender<String>,
+    mut cfg_rx: tokio::sync::watch::Receiver<ObsConfig>,
+) {
+    let vu_path = state
+        .preset_dir
+        .parent()
+        .map(|p| p.join("obs-vu.txt"))
+        .unwrap_or_else(|| std::path::PathBuf::from("obs-vu.txt"));
+    let mut last_scene = String::new();
+    loop {
+        let cfg = cfg_rx.borrow().clone();
+        if !cfg.enabled {
+            if cfg_rx.changed().await.is_err() {
+                return;
+            }
+            last_scene.clear();
+            continue;
+        }
+        match vm_obs::ObsClient::connect(&cfg.url, &cfg.password).await {
+            Ok(mut cli) => {
+                last_scene.clear();
+                state.set_obs_status(true, String::new(), cfg.url.clone());
+                publish(&publisher, &state.obs_status_event());
+                let mut vu = tokio::time::interval(std::time::Duration::from_millis(100));
+                vu.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        changed = cfg_rx.changed() => {
+                            if changed.is_err() { return; }
+                            break; // config changed: reconnect with the new settings
+                        }
+                        _ = vu.tick() => write_vu_file(&vu_path, &state),
+                        ev = cli.recv() => {
+                            let Some((event_type, data)) = ev else { break };
+                            if event_type != "CurrentProgramSceneChanged" {
+                                continue;
+                            }
+                            let scene = data
+                                .get("sceneName")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if scene == last_scene {
+                                continue;
+                            }
+                            last_scene = scene.clone();
+                            state.set_obs_status(true, scene.clone(), cfg.url.clone());
+                            if let Some(voice) = cfg.scenes.get(&scene) {
+                                let (reply, evts) = state.handle(&Action::SelectVoice { voice: voice.clone() });
+                                if !reply.ok {
+                                    eprintln!("obs scene '{scene}': {:?}", reply.error);
+                                }
+                                for e in &evts {
+                                    publish(&publisher, e);
+                                }
+                            }
+                            publish(&publisher, &state.obs_status_event());
+                        }
+                    }
+                }
+                state.set_obs_status(false, String::new(), cfg.url.clone());
+                publish(&publisher, &state.obs_status_event());
+            }
+            Err(e) => {
+                eprintln!("obs: {e}");
+                state.set_obs_status(false, String::new(), cfg.url.clone());
+                publish(&publisher, &state.obs_status_event());
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    cfg_rx.changed(),
+                )
+                .await;
+            }
+        }
+    }
+}
+
+/// MIDI input loop: open the configured port, dispatch events, reopen when
+/// the enable/port settings change (F-0.4.C 37).
+#[cfg(feature = "midi")]
+fn midi_input_loop(
+    state: Arc<DaemonState>,
+    publisher: tokio::sync::broadcast::Sender<String>,
+) {
+    // Repeat open failures every 2 s, but only print when the message
+    // changes — a machine with no ALSA ports must not spam the log.
+    let mut last_err: Option<String> = None;
+    loop {
+        let (enabled, port) = {
+            let cfg = state.midi.lock().unwrap();
+            (cfg.enabled, cfg.port.clone())
+        };
+        if !enabled {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            continue;
+        }
+        let opened_port = port.clone();
+        let input = match vm_midi::MidiInput::open(if port.is_empty() { None } else { Some(port.as_str()) }) {
+            Ok(i) => {
+                last_err = None;
+                i
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if last_err.as_deref() != Some(msg.as_str()) {
+                    eprintln!("midi: {msg}");
+                    last_err = Some(msg);
+                }
+                state.set_midi_connected(false);
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                continue;
+            }
+        };
+        let label = if opened_port.is_empty() {
+            "<first port>".to_string()
+        } else {
+            opened_port.clone()
+        };
+        eprintln!("midi: listening on {label}");
+        state.set_midi_connected(true);
+        loop {
+            match input.recv_timeout(std::time::Duration::from_millis(200)) {
+                vm_midi::MidiRecv::Event(ev) => state.dispatch_midi(&ev, &publisher),
+                vm_midi::MidiRecv::Disconnected => break,
+                vm_midi::MidiRecv::Timeout => {
+                    let (enabled, port) = {
+                        let cfg = state.midi.lock().unwrap();
+                        (cfg.enabled, cfg.port.clone())
+                    };
+                    if !enabled || port != opened_port {
+                        break; // settings changed: reopen below
+                    }
+                }
+            }
+        }
+        state.set_midi_connected(false);
     }
 }
 
@@ -1038,6 +1857,10 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| PathBuf::from("/tmp/vm-config.json"));
     let mut hotkeys = HotkeyManager::new();
     let mut device_profiles = HashMap::new();
+    let mut monitor = MonitorConfig::default();
+    let mut ducking = DuckingConfig::default();
+    let mut obs = ObsConfig::default();
+    let mut midi = MidiConfig::default();
     match load_daemon_config_file(&config_path) {
         Ok(cfg) => {
             if !cfg.hotkeys.is_empty() {
@@ -1056,16 +1879,22 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             device_profiles = cfg.device_profiles;
+            monitor = cfg.monitor;
+            ducking = cfg.ducking;
+            obs = cfg.obs;
+            midi = cfg.midi;
         }
         Err(e) => eprintln!("config: {e} (starting empty)"),
     }
 
+    let ducking_rt = Arc::new(DuckingRt::default());
+    let (obs_tx, obs_rx) = tokio::sync::watch::channel(obs.clone());
     let state = Arc::new(DaemonState {
         graph: Arc::new(Mutex::new(Graph::new())),
         node_ids: Mutex::new(HashMap::new()),
         voice_name: Mutex::new(String::new()),
         voice_enabled: Arc::new(AtomicBool::new(true)),
-        mixer: Mutex::new(vm_soundboard::SoundboardMixer::new()),
+        mixer: Arc::new(Mutex::new(vm_soundboard::SoundboardMixer::new())),
         sound_ids: Mutex::new(HashMap::new()),
         audio: Arc::new(Mutex::new(build_backend(live)?)),
         preset_dir: preset_dir.clone(),
@@ -1076,6 +1905,15 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
         hotkeys: Arc::new(Mutex::new(hotkeys)),
         config_path: config_path.clone(),
         device_profiles: Mutex::new(device_profiles),
+        monitor: Mutex::new(monitor),
+        ducking: Mutex::new(ducking),
+        ducking_rt: ducking_rt.clone(),
+        obs: Mutex::new(obs),
+        obs_status: Arc::new(Mutex::new(ObsStatus::default())),
+        midi: Mutex::new(midi),
+        midi_runtime: Arc::new(Mutex::new(MidiRuntime::default())),
+        levels: Arc::new(Mutex::new(LevelsSnapshot::default())),
+        obs_tx,
     });
     // Default voice.
     {
@@ -1085,11 +1923,18 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
     // Graph processor shares the live graph + bypass flag.
     let graph_xruns = state.graph_xruns.clone();
+    {
+        let cfg = state.ducking.lock().unwrap().clone();
+        state.push_ducking_rt(&cfg);
+    }
     let processor: Arc<Mutex<dyn StreamProcessor>> = Arc::new(Mutex::new(GraphProcessor::new(
         state.graph.clone(),
         state.voice_enabled.clone(),
         state.muted.clone(),
         graph_xruns,
+        state.mixer.clone(),
+        state.ducking_rt.clone(),
+        state.levels.clone(),
     )));
     // Preload sounds (decode+resample now; never on the trigger path).
     {
@@ -1189,6 +2034,7 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         let manager = state.hotkeys.clone();
+        let publisher = server.publisher();
         let keyboards = HotkeyManager::scan_keyboards();
         if keyboards.is_empty() && vm_control::sandbox_note().is_none() {
             eprintln!("hotkeys: no readable keyboards (need input group/udev rule)");
@@ -1200,20 +2046,43 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
             }
             let manager = manager.clone();
             let state = state.clone();
+            let publisher = publisher.clone();
             std::thread::Builder::new()
                 .name("vm-hotkey".into())
                 .spawn(move || {
                     vm_control::hotkeys::watch_device(path, manager, move |target, pressed| {
                         if let Some(action) = hotkey_action(&target, pressed, &state) {
-                            let (reply, _evts) = state.handle(&action);
+                            let (reply, evts) = state.handle(&action);
                             if !reply.ok {
                                 eprintln!("hotkey action failed: {:?}", reply.error);
+                            }
+                            for e in &evts {
+                                publish(&publisher, e);
                             }
                         }
                     })
                 })
                 .ok();
         }
+    }
+
+    // obs-websocket bridge (F-0.4.C 35): scene → voice autoswitch + VU
+    // text source. Reconnects with backoff until disabled.
+    {
+        let state = state.clone();
+        let publisher = server.publisher();
+        tokio::spawn(async move { obs_bridge(state, publisher, obs_rx).await });
+    }
+
+    // MIDI learn input (F-0.4.C 37; ALSA sequencer, feature-gated).
+    #[cfg(feature = "midi")]
+    {
+        let state = state.clone();
+        let publisher = server.publisher();
+        std::thread::Builder::new()
+            .name("vm-midi".into())
+            .spawn(move || midi_input_loop(state, publisher))
+            .ok();
     }
 
     // Hotplug watch + status.
@@ -1291,10 +2160,16 @@ fn decode_to_loaded(
     name: &str,
     path: &std::path::Path,
 ) -> Result<vm_soundboard::LoadedSound, Box<dyn std::error::Error>> {
-    // Reuse the soundboard's own decode path through a temp controller.
-    let mut ctl = vm_soundboard::SoundboardController::new();
-    ctl.load_file(id, name.to_string(), path)?;
-    Err("unreachable".into())
+    // Reuse the soundboard's own decode path, then hand the decoded PCM
+    // to the mixer. (This used to end in `Err("unreachable")`, which
+    // silently skipped every sound at boot.)
+    let decoded = vm_soundboard::decode::decode_file(path)?;
+    Ok(vm_soundboard::LoadedSound {
+        id,
+        name: name.to_string(),
+        rate: decoded.rate,
+        channels: decoded.channels,
+    })
 }
 
 fn build_backend(live: bool) -> Result<Box<dyn AudioBackend>, Box<dyn std::error::Error>> {
@@ -1320,7 +2195,7 @@ fn test_state() -> Arc<DaemonState> {
         node_ids: Mutex::new(HashMap::new()),
         voice_name: Mutex::new(String::new()),
         voice_enabled: Arc::new(AtomicBool::new(true)),
-        mixer: Mutex::new(vm_soundboard::SoundboardMixer::new()),
+        mixer: Arc::new(Mutex::new(vm_soundboard::SoundboardMixer::new())),
         sound_ids: Mutex::new(HashMap::new()),
         audio: Arc::new(Mutex::new(build_backend(false).unwrap())),
         preset_dir: dir.join("presets"),
@@ -1331,6 +2206,15 @@ fn test_state() -> Arc<DaemonState> {
         hotkeys: Arc::new(Mutex::new(HotkeyManager::new())),
         config_path: dir.join("config.json"),
         device_profiles: Mutex::new(HashMap::new()),
+        monitor: Mutex::new(MonitorConfig::default()),
+        ducking: Mutex::new(DuckingConfig::default()),
+        ducking_rt: Arc::new(DuckingRt::default()),
+        obs: Mutex::new(ObsConfig::default()),
+        obs_status: Arc::new(Mutex::new(ObsStatus::default())),
+        midi: Mutex::new(MidiConfig::default()),
+        midi_runtime: Arc::new(Mutex::new(MidiRuntime::default())),
+        levels: Arc::new(Mutex::new(LevelsSnapshot::default())),
+        obs_tx: tokio::sync::watch::channel(ObsConfig::default()).0,
     });
     // Seed example preset + one wav sound.
     let text = serde_json::to_string_pretty(&vm_preset::example_drive()).unwrap();
@@ -1507,12 +2391,7 @@ mod tests {
         assert!(!state.voice_enabled.load(Ordering::Relaxed));
         assert!(matches!(evts[0], ControlEvent::VoiceChangerToggled { enabled: false }));
         // Bypass actually passes audio through.
-        let mut proc = GraphProcessor::new(
-            state.graph.clone(),
-            state.voice_enabled.clone(),
-            state.muted.clone(),
-            state.graph_xruns.clone(),
-        );
+        let mut proc = GraphProcessor::for_state(&state);
         let input = [vec![0.3f32; 64]];
         let mut out = [vec![0.0f32; 64]];
         let ins: Vec<&[f32]> = input.iter().map(Vec::as_slice).collect();
@@ -1561,15 +2440,10 @@ mod health_tests {
         let (reply, _) = state.handle(&Action::SelectVoice { voice: "example-drive".into() });
         assert!(reply.ok, "{:?}", reply.error);
         // Run a few quanta so telemetry has calls.
-        let mut proc = GraphProcessor::new(
-            state.graph.clone(),
-            state.voice_enabled.clone(),
-            state.muted.clone(),
-            state.graph_xruns.clone(),
-        );
+        let mut proc = GraphProcessor::for_state(&state);
         for _ in 0..4 {
             let input = vec![vec![0.1f32; 64]; 2];
-            let mut out = vec![vec![0.0f32; 64]; 2];
+            let mut out = [vec![0.0f32; 64], vec![0.0f32; 64]];
             let ins: Vec<&[f32]> = input.iter().map(Vec::as_slice).collect();
             let mut outs: Vec<&mut [f32]> = out.iter_mut().map(Vec::as_mut_slice).collect();
             proc.process(48_000, &ins, &mut outs);
@@ -1601,16 +2475,11 @@ mod health_tests {
         let state = test_state();
         let (reply, _) = state.handle(&Action::SelectVoice { voice: "example-drive".into() });
         assert!(reply.ok);
-        let mut proc = GraphProcessor::new(
-            state.graph.clone(),
-            state.voice_enabled.clone(),
-            state.muted.clone(),
-            state.graph_xruns.clone(),
-        );
+        let mut proc = GraphProcessor::for_state(&state);
         // Hold the graph lock: the RT path must skip, not block.
         let _held = state.graph.lock().unwrap();
         let input = vec![vec![0.1f32; 64]; 2];
-        let mut out = vec![vec![0.0f32; 64]; 2];
+        let mut out = [vec![0.0f32; 64], vec![0.0f32; 64]];
         let ins: Vec<&[f32]> = input.iter().map(Vec::as_slice).collect();
         let mut outs: Vec<&mut [f32]> = out.iter_mut().map(Vec::as_mut_slice).collect();
         proc.process(48_000, &ins, &mut outs);
@@ -1698,8 +2567,13 @@ mod hotkey_api_tests {
         // Persisted to config.json with schema version.
         let text = std::fs::read_to_string(&state.config_path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v["version"], 2);
+        assert_eq!(v["version"], 3);
         assert_eq!(v["hotkeys"].as_array().unwrap().len(), 1);
+        // F-0.4.C: the v3 schema always carries the integration sections.
+        assert!(v["monitor"].is_object());
+        assert!(v["ducking"].is_object());
+        assert!(v["obs"].is_object());
+        assert!(v["midi"].is_object());
 
         let (reply, _) = state.handle(&Action::RemoveHotkey { hotkey_id: 0 });
         assert!(reply.ok, "{:?}", reply.error);
@@ -1771,12 +2645,7 @@ mod hotkey_api_tests {
         assert!(reply.ok);
         let run_block = |muted: bool| {
             state.muted.store(muted, Ordering::Relaxed);
-            let mut proc = GraphProcessor::new(
-                state.graph.clone(),
-                state.voice_enabled.clone(),
-                state.muted.clone(),
-                state.graph_xruns.clone(),
-            );
+            let mut proc = GraphProcessor::for_state(&state);
             let input = vec![vec![0.4f32; 64]; 2];
             let mut out = vec![vec![9.9f32; 64]; 2];
             let ins: Vec<&[f32]> = input.iter().map(Vec::as_slice).collect();
@@ -1895,12 +2764,7 @@ mod osc_chain_tests {
             public_params: vec![],
         };
         state.apply_preset(&preset).expect("apply");
-        let mut proc = GraphProcessor::new(
-            state.graph.clone(),
-            state.voice_enabled.clone(),
-            state.muted.clone(),
-            state.graph_xruns.clone(),
-        );
+        let mut proc = GraphProcessor::for_state(&state);
         // Run 1 s through the processor in 960-frame blocks.
         let mut out_all = Vec::new();
         for _ in 0..50 {
@@ -1958,12 +2822,7 @@ mod osc_chain_tests {
             noise.push((((st >> 32) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0) * 0.1);
         }
         let rms = |x: &[f32]| (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt();
-        let mut proc = GraphProcessor::new(
-            state.graph.clone(),
-            state.voice_enabled.clone(),
-            state.muted.clone(),
-            state.graph_xruns.clone(),
-        );
+        let mut proc = GraphProcessor::for_state(&state);
         let mut out_all = Vec::new();
         for chunk in noise.as_chunks::<960>().0 {
             let input = [chunk.to_vec(), chunk.to_vec()];
@@ -2123,12 +2982,7 @@ mod profile_tests {
         assert!(reply.ok, "{:?}", reply.error);
         // 2 s of room noise through the chain: the floor learns.
         let mut st = 0x2545_f491_4f6c_dd1du64;
-        let mut proc = GraphProcessor::new(
-            state.graph.clone(),
-            state.voice_enabled.clone(),
-            state.muted.clone(),
-            state.graph_xruns.clone(),
-        );
+        let mut proc = GraphProcessor::for_state(&state);
         for _ in 0..100 {
             let mut chunk = vec![0.0f32; 960];
             for s in chunk.iter_mut() {
@@ -2260,12 +3114,7 @@ mod profile_tests {
         assert!(reply.ok);
         // Fresh noise (unseen room) through the 512 chain.
         let mut st = 0x9e37_79b9_7f4a_7c15u64;
-        let mut proc = GraphProcessor::new(
-            state.graph.clone(),
-            state.voice_enabled.clone(),
-            state.muted.clone(),
-            state.graph_xruns.clone(),
-        );
+        let mut proc = GraphProcessor::for_state(&state);
         let mut out_all = Vec::new();
         let mut noise = Vec::with_capacity(96_000);
         for _ in 0..96_000 {
@@ -2311,7 +3160,7 @@ mod device_profile_tests {
     }
 
     #[test]
-    fn profile_crud_persists_v2() {
+    fn profile_crud_persists_v3() {
         let state = test_state();
         // Empty values rejected.
         let (reply, _) = state.handle(&Action::SetDeviceProfile {
@@ -2330,11 +3179,12 @@ mod device_profile_tests {
             reply.data.unwrap()["profiles"],
             serde_json::json!([{"device": "stub:input:0", "voice": "example-drive"}])
         );
-        // File is schema v2 with both sections.
+        // File is schema v3 with the profile + integration sections.
         let text = std::fs::read_to_string(&state.config_path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v["version"], 2);
+        assert_eq!(v["version"], 3);
         assert_eq!(v["device_profiles"]["stub:input:0"], "example-drive");
+        assert_eq!(v["ducking"]["enabled"], true, "ducking defaults on");
         // Reload survives a reboot.
         let cfg = load_daemon_config_file(&state.config_path).expect("reload");
         assert_eq!(cfg.device_profiles["stub:input:0"], "example-drive");
@@ -2479,12 +3329,7 @@ mod f04a_node_tests {
     }
 
     fn process(state: &Arc<DaemonState>, input: &[f32]) -> Vec<f32> {
-        let mut proc = GraphProcessor::new(
-            state.graph.clone(),
-            state.voice_enabled.clone(),
-            state.muted.clone(),
-            state.graph_xruns.clone(),
-        );
+        let mut proc = GraphProcessor::for_state(state);
         let mut out_all = Vec::new();
         for chunk in input.as_chunks::<960>().0 {
             let cin = [chunk.to_vec(), chunk.to_vec()];
@@ -2726,12 +3571,7 @@ mod persona_tests {
     use super::*;
 
     fn render(state: &Arc<DaemonState>, input: &[f32]) -> Vec<f32> {
-        let mut proc = GraphProcessor::new(
-            state.graph.clone(),
-            state.voice_enabled.clone(),
-            state.muted.clone(),
-            state.graph_xruns.clone(),
-        );
+        let mut proc = GraphProcessor::for_state(state);
         let mut out_all = Vec::with_capacity(input.len());
         for chunk in input.chunks(960) {
             let ch = chunk.to_vec();
@@ -2847,5 +3687,247 @@ mod persona_tests {
             tele_lo < radio_lo,
             "telephone ({tele_lo:.4}) must leak less bass than radio ({radio_lo:.4})"
         );
+    }
+}
+
+#[cfg(test)]
+mod f04c_tests {
+    use super::*;
+
+    fn rms(x: &[f32]) -> f32 {
+        if x.is_empty() {
+            return 0.0;
+        }
+        (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt()
+    }
+
+    fn run_block(proc: &mut GraphProcessor, input: &[Vec<f32>; 2], out: &mut [Vec<f32>; 2]) {
+        let ins: Vec<&[f32]> = input.iter().map(Vec::as_slice).collect();
+        let mut outs: Vec<&mut [f32]> = out.iter_mut().map(Vec::as_mut_slice).collect();
+        proc.process(48_000, &ins, &mut outs);
+    }
+
+    fn add_tone(state: &DaemonState, id: u64, sample: f32, send_to_vad: bool) {
+        let mut m = state.mixer.lock().unwrap();
+        m.add_sound(vm_soundboard::LoadedSound {
+            id: vm_soundboard::SoundHashId(id),
+            name: format!("tone{id}"),
+            rate: 48_000,
+            channels: vec![vec![sample; 256]],
+        });
+        let opts = vm_soundboard::SoundOptions { send_to_vad, ..Default::default() };
+        m.play(vm_soundboard::SoundHashId(id), opts).unwrap();
+    }
+
+    #[test]
+    fn monitor_set_get_and_persisted() {
+        let state = test_state();
+        let (reply, evts) = state.handle(&Action::SetMonitor {
+            enabled: Some(true),
+            device: None,
+            mix: Some(0.5),
+            volume_db: Some(-6.0),
+            muted: None,
+        });
+        assert!(reply.ok, "{:?}", reply.error);
+        match &evts[0] {
+            ControlEvent::MonitorChanged { enabled, mix, volume_db, muted, .. } => {
+                assert!(*enabled);
+                assert!((*mix - 0.5).abs() < 1e-6);
+                assert!((*volume_db + 6.0).abs() < 1e-6);
+                assert!(!*muted);
+            }
+            other => panic!("expected MonitorChanged, got {other:?}"),
+        }
+        let (reply, _) = state.handle(&Action::GetMonitor);
+        let d = reply.data.unwrap();
+        assert_eq!(d["enabled"], true);
+        assert_eq!(d["mix"], 0.5);
+        assert_eq!(d["volume_db"], -6.0);
+        assert_eq!(d["muted"], false);
+        let cfg = load_daemon_config_file(&state.config_path).expect("reload");
+        assert!(cfg.monitor.enabled);
+        assert_eq!(cfg.monitor.mix, 0.5);
+    }
+
+    #[test]
+    fn ducking_set_get_and_persisted() {
+        let state = test_state();
+        let (reply, evts) = state.handle(&Action::SetDucking {
+            enabled: Some(false),
+            depth_db: Some(18.0),
+            threshold_db: None,
+            attack_ms: None,
+            release_ms: None,
+        });
+        assert!(reply.ok, "{:?}", reply.error);
+        assert!(matches!(evts[0], ControlEvent::DuckingChanged { enabled: false, depth_db: 18.0, .. }));
+        let (reply, _) = state.handle(&Action::GetDucking);
+        let d = reply.data.unwrap();
+        assert_eq!(d["enabled"], false);
+        assert_eq!(d["depth_db"], 18.0);
+        assert_eq!(d["threshold_db"], -40.0, "untouched field keeps its default");
+        let cfg = load_daemon_config_file(&state.config_path).expect("reload");
+        assert!(!cfg.ducking.enabled);
+        assert_eq!(cfg.ducking.depth_db, 18.0);
+    }
+
+    #[test]
+    fn monitor_only_bus_carries_non_vad_sounds() {
+        let state = test_state();
+        state.voice_enabled.store(false, Ordering::Relaxed);
+        add_tone(&state, 7, 0.4, false);
+        let mut proc = GraphProcessor::for_state(&state);
+        let silent = [vec![0.0f32; 64], vec![0.0f32; 64]];
+        let mut out = [vec![0.0f32; 64], vec![0.0f32; 64]];
+        run_block(&mut proc, &silent, &mut out);
+        // Never reaches vm-mic...
+        assert!(out[0].iter().all(|s| s.abs() < 1e-6), "monitor-only sound leaked to vm-mic");
+        // ...but it is on the hear-myself monitor bus.
+        let bus = proc.monitor_bus();
+        assert!(bus.len() >= 128, "interleaved stereo bus");
+        assert!((bus[0] - 0.4).abs() < 1e-6, "monitor bus: {}", bus[0]);
+    }
+
+    #[test]
+    fn ducking_attenuates_soundboard_while_speech() {
+        let state = test_state();
+        state.voice_enabled.store(false, Ordering::Relaxed);
+        add_tone(&state, 9, 0.5, false);
+        let (reply, _) = state.handle(&Action::SetDucking {
+            enabled: Some(true),
+            depth_db: Some(12.0),
+            threshold_db: Some(-40.0),
+            attack_ms: Some(1.0),
+            release_ms: Some(1.0),
+        });
+        assert!(reply.ok, "{:?}", reply.error);
+        let mut proc = GraphProcessor::for_state(&state);
+        let silent = [vec![0.0f32; 64], vec![0.0f32; 64]];
+        let loud = [vec![0.5f32; 64], vec![0.5f32; 64]];
+        let mut out = [vec![0.0f32; 64], vec![0.0f32; 64]];
+        run_block(&mut proc, &silent, &mut out);
+        let unity = rms(&proc.monitor_bus()[..128]);
+        assert!(unity > 0.1, "sound must reach the monitor bus un-ducked: {unity}");
+        run_block(&mut proc, &loud, &mut out);
+        let ducked = rms(&proc.monitor_bus()[..128]);
+        assert!(ducked < unity * 0.35, "12 dB duck expected: unity {unity:.4} ducked {ducked:.4}");
+        assert!(ducked > unity * 0.1, "not silenced either: {ducked:.4}");
+    }
+
+    #[test]
+    fn levels_reported_from_rt_processor() {
+        let state = test_state();
+        let mut proc = GraphProcessor::for_state(&state);
+        let input = [vec![0.25f32; 64], vec![0.25f32; 64]];
+        let mut out = [vec![0.0f32; 64], vec![0.0f32; 64]];
+        run_block(&mut proc, &input, &mut out);
+        let (reply, _) = state.handle(&Action::GetLevels);
+        assert!(reply.ok, "{:?}", reply.error);
+        let d = reply.data.unwrap();
+        let mic = d["mic_db"].as_f64().unwrap();
+        assert!((mic - (-12.04)).abs() < 0.5, "0.25 amplitude ≈ −12 dBFS, got {mic}");
+        assert!(d["out_db"].as_f64().is_some());
+        assert!(d["speech"].is_boolean());
+    }
+
+    #[test]
+    fn obs_scene_profiles_and_status() {
+        let state = test_state();
+        let (reply, _) = state.handle(&Action::SetObs {
+            enabled: Some(true),
+            url: Some("ws://127.0.0.1:4455".into()),
+            password: None,
+        });
+        assert!(reply.ok, "{:?}", reply.error);
+        let (reply, _) = state.handle(&Action::SetObsSceneProfile {
+            scene: "Game".into(),
+            voice: "robot".into(),
+        });
+        assert!(reply.ok);
+        let (reply, _) = state.handle(&Action::ListObsSceneProfiles);
+        let scenes = reply.data.unwrap()["scenes"].as_array().unwrap().clone();
+        assert_eq!(scenes.len(), 1);
+        assert_eq!(scenes[0]["scene"], "Game");
+        assert_eq!(scenes[0]["voice"], "robot");
+        let (reply, _) = state.handle(&Action::GetObsStatus);
+        assert_eq!(reply.data.unwrap()["url"], "ws://127.0.0.1:4455");
+        let cfg = load_daemon_config_file(&state.config_path).expect("reload");
+        assert!(cfg.obs.enabled);
+        assert_eq!(cfg.obs.scenes["Game"], "robot");
+        let (reply, _) = state.handle(&Action::RemoveObsSceneProfile { scene: "Game".into() });
+        assert!(reply.ok);
+        let (reply, _) = state.handle(&Action::ListObsSceneProfiles);
+        assert_eq!(reply.data.unwrap()["scenes"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn midi_bindings_learn_and_dispatch() {
+        let state = test_state();
+        let (reply, _) = state.handle(&Action::SelectVoice { voice: "example-drive".into() });
+        assert!(reply.ok, "{:?}", reply.error);
+        let (reply, _) = state.handle(&Action::MidiBindAdd {
+            channel: Some(0),
+            kind: MidiKind::Cc,
+            number: 7,
+            target: MidiTarget::SetVoiceParameter { param: "drive.gain".into(), min: 0.0, max: 4.0 },
+        });
+        assert!(reply.ok, "{:?}", reply.error);
+        // Invalid number fails closed.
+        let (reply, _) = state.handle(&Action::MidiBindAdd {
+            channel: None,
+            kind: MidiKind::Cc,
+            number: 200,
+            target: MidiTarget::Trigger(HotkeyTarget::ToggleMute),
+        });
+        assert!(!reply.ok);
+        // Learn: the next event becomes a binding and is broadcast.
+        let (reply, _) = state.handle(&Action::MidiLearnStart {
+            target: MidiTarget::Trigger(HotkeyTarget::ToggleMute),
+        });
+        assert!(reply.ok);
+        let (publisher, mut sub) = tokio::sync::broadcast::channel(16);
+        state.dispatch_midi(
+            &MidiEvent { channel: 3, kind: MidiKind::Note, number: 36, value: 100 },
+            &publisher,
+        );
+        let learned = sub.try_recv().expect("MidiLearned broadcast");
+        assert!(learned.contains("midiLearned"), "{learned}");
+        let (reply, _) = state.handle(&Action::ListMidiBindings);
+        let binds = reply.data.unwrap()["bindings"].as_array().unwrap().clone();
+        assert_eq!(binds.len(), 2, "manual + learned");
+        assert_eq!(binds[1]["number"], 36);
+        assert_eq!(binds[1]["channel"], 3);
+        // Dispatching the learned note toggles mute.
+        state.dispatch_midi(
+            &MidiEvent { channel: 3, kind: MidiKind::Note, number: 36, value: 100 },
+            &publisher,
+        );
+        assert!(state.muted.load(Ordering::Relaxed), "note bound to ToggleMute");
+        // The CC binding maps 64/127 onto [0, 4] → drive.gain ≈ 2.016.
+        state.dispatch_midi(
+            &MidiEvent { channel: 0, kind: MidiKind::Cc, number: 7, value: 64 },
+            &publisher,
+        );
+        let ids = state.node_ids.lock().unwrap();
+        let id = ids.get("drive").copied().expect("example-drive has a drive node");
+        drop(ids);
+        let mut graph = state.graph.lock().unwrap();
+        let node = graph.node_mut(id).expect("node");
+        match node.get_param("gain") {
+            Some(vm_dsp::ParamValue::Float(v)) => {
+                assert!((v - (64.0 / 127.0 * 4.0)).abs() < 0.02, "gain={v}");
+            }
+            other => panic!("expected a float gain param, got {other:?}"),
+        }
+        drop(graph);
+        // Remove by id.
+        let (reply, _) = state.handle(&Action::MidiBindRemove { midi_id: 0 });
+        assert!(reply.ok);
+        let (reply, _) = state.handle(&Action::ListMidiBindings);
+        assert_eq!(reply.data.unwrap()["bindings"].as_array().unwrap().len(), 1);
+        let (reply, _) = state.handle(&Action::GetMidiStatus);
+        assert!(reply.ok);
+        assert_eq!(reply.data.unwrap()["bindings"], 1);
     }
 }

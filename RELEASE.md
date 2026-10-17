@@ -21,6 +21,10 @@ appstreamcli validate packaging/io.github.voicemodlinux.vm.metainfo.xml
 # with a clear error at preset load):
 cargo build --release -p vm-daemon --features vm-dsp/neural
 
+# Optional: MIDI learn input (ALSA via libasound2-dev; the default
+# build answers the midi actions but never opens a port):
+cargo build --release -p vm-daemon --features midi
+
 
 # 1. Version bump (workspace Cargo.toml + Flatpak tag + metainfo entry;
 #    PKGBUILD derives pkgver from `git describe`, no edit needed):
@@ -36,7 +40,7 @@ packaging/appimage/build.sh
 # 3. Smoke the release binaries (fresh VM_CONFIG_DIR, stub backend):
 VM_CONFIG_DIR=/tmp/vm-rel target/release/vm-daemon &
 # selectVoice / getHealth / hotkey + profile actions over ws://127.0.0.1:8765
-target/release/vm actions   # must list the full catalogue
+target/release/vm actions   # must list the full catalogue (43 on v0.4.0)
 
 # 4. Commit, tag, push:
 git add -A && git commit -m "Release vX.Y.Z — ..."

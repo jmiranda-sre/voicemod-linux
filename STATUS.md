@@ -829,6 +829,7 @@ da fábrica (nunca sobrescreve): deletar o arquivo recebe a update.
 **D → A → C → B** (infra de automação primeiro p/ testar o resto;
 DSP pesado em seguida; roteamento; UX coroa o ciclo; itens do B são
 paralelizáveis a qualquer momento).
+Progresso 2026-10-17: **D, A e C FECHADAS — resta B.**
 
 ### F-0.4.D — Automação + dispositivos (Pilar 4)
 - Item 42: CLI 100% da Control API (base p/ scripts/testes de tudo).
@@ -878,3 +879,46 @@ paralelizáveis a qualquer momento).
   voz → no-op; arquivo ausente falha alto sem tocar estado.
 - Bug real: save por-caller travava o próprio Mutex (self-deadlock nos
   testes!) → `transact_config` central (ordem fixa, rollback duplo).
+
+### F-0.4.C — FECHADA (roteamento + integrações) — 2026-10-17
+- Item 15 monitor: caminho hear-myself independente do `vm-mic` (sink
+  `vm-monitor`): dry = entrada crua pré-grafo (0 latência adicionada),
+  wet = voz processada, blend por `mix`; `muted`/disable empurram zeros
+  (sem xrun); troca de device reconstrói SÓ os links do monitor
+  (`Cmd::MonitorRetarget`, `mon_links` rastreados), cadeia não
+  reinicia; device rejeitado faz rollback da seção. `setMonitor`/
+  `getMonitor`/`monitorChanged`; `getLevels` (mic/out dBFS).
+- Item 14 ducking: sidechain do mic atenua o bus do soundboard/música
+  (default on, 12 dB @ −40 dBFS, 50/400 ms). Knobs espelhados em
+  atomics (`DuckingRt`) — RT thread nunca bloqueia; rampa escala com o
+  quantum. `setDucking`/`getDucking`/`duckingChanged`.
+- Item 35 OBS: crate `vm-obs` puro Rust (tokio-tungstenite +
+  sha2/base64), obs-websocket v5 com auth salt+challenge (vetor
+  testado), subscriptions General|Scenes (só eventos, nenhum request);
+  perfil cena→voz persiste e troca no scene change; VU = `obs-vu.txt`
+  reescrito a cada 100 ms (`[voz] mic -58.3dB out -11.7dB ▇`) p/ Text
+  source; `setObs`/`getObsStatus`/`obsStatusChanged`; inerte desligado.
+- Item 37 MIDI: crate `vm-midi` (midir/ALSA) atrás da feature opcional
+  `midi` (default sem dep ALSA; ações respondem, nenhuma porta abre).
+  `MidiEvent` no vm-control; CC/note → alvo de hotkey OU
+  `SetVoiceParameter` com range min/max; trigger dispara só na borda
+  de press (note-off não re-dispara toggle). Learn captura o próximo
+  evento em binding persistido (`midiLearned`), `midiBindAdd`/
+  `midiBindRemove`/`listMidiBindings`/`setMidi`/`getMidiStatus`.
+  Log de falha de open idempotente (sem spam a cada 2 s).
+- Soundboard agora mistura no `vm-mic` de verdade (bus VAD em todos os
+  caminhos, incl. bypass); bus monitor = `mon_bus − vad_bus` p/ não
+  contar duas vezes via wet; ducking atenua ambos.
+- BUG REAL corrigido: `decode_to_loaded` retornava sempre
+  `Err("unreachable")` → nenhum som carregava em runtime (playSound
+  respondia ok e ficava mudo). Agora chama `decode::decode_file`
+  direto; smoke live: out dB salta p/ −11.7 durante playback.
+- Schema config v3 (`monitor`/`ducking`/`obs`/`midi`), updates
+  parciais, persiste-antes-de-aplicar (rollback seguro).
+- Integração/qualidade: 153 testes workspace (vm-obs 5 c/ vetor de
+  auth + mock handshake; f04c 7 no daemon: monitor, ducking RT,
+  levels, perfis OBS, learn/dispatch MIDI); clippy zero default e
+  `--features midi`; `vm actions` agora lê `vm_control::ALL_ACTIONS`
+  (43) com guarda que serializa cada variant e compara nomes na ordem.
+- UI: ainda sem superfície p/ monitor/ducking/OBS/MIDI (tudo via API;
+  candidato natural ao lado do wizard do B).

@@ -115,34 +115,7 @@ async fn main() {
             }
         }
         Cmd::Actions => {
-            for a in [
-                "selectVoice",
-                "toggleVoiceChanger",
-                "stopAllSounds",
-                "playSound",
-                "getAllSoundboard",
-                "setVoiceParameter",
-                "resetVoiceParameters",
-                "setDefaultMicrophone",
-                "getAudioDevices",
-                "getUserLicense",
-                "fadeSound",
-                "startAudioStreaming",
-                "getAudioStreamStatus",
-                "getHealth",
-                "addHotkey",
-                "removeHotkey",
-                "listHotkeys",
-                "setMuted",
-                "getVoices",
-                "captureNoiseProfile",
-                "setDeviceProfile",
-                "removeDeviceProfile",
-                "listDeviceProfiles",
-                "getBitmap",
-                "setSoundboardMasterVolume",
-                "selectInput",
-            ] {
+            for a in vm_control::ALL_ACTIONS {
                 println!("{a}");
             }
         }
