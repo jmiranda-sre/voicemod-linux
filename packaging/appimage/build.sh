@@ -70,6 +70,17 @@ find "$APPDIR/usr/lib" -type f | while read -r f; do
     rm -f "$f"
   fi
 done
+
+# The dynamic loader looks libraries up by SONAME, not by their
+# versioned file name: without these symlinks LD_LIBRARY_PATH never
+# matches and the bundled libs are silently ignored (host lib wins).
+find "$APPDIR/usr/lib" -type f | while read -r f; do
+  soname="$(objdump -p "$f" 2>/dev/null | awk '/SONAME/{print $2; exit}')"
+  if [ -n "$soname" ] && [ "$soname" != "$(basename "$f")" ]; then
+    ln -sf "$(basename "$f")" "$APPDIR/usr/lib/$soname"
+  fi
+done
+
 echo "== bundled libraries:"
 (cd "$APPDIR/usr/lib" && ls -1 || true)
 

@@ -8,11 +8,11 @@ manifest, CHANGELOG and this documentation. (The Flatpak app ID
 `voicemodlinux` organization, a repository transfer keeps the old links
 working and only these references need updating.)
 
-## Per-release procedure (followed for v0.3.0)
+## Per-release procedure (followed through v0.4.0)
 
 ```bash
 # 0. Everything green first:
-cargo test --workspace            # 104/104 on v0.3.0
+cargo test --workspace            # 182/182 on v0.4.0
 cargo build --release
 appstreamcli validate packaging/io.github.voicemodlinux.vm.metainfo.xml
 
@@ -40,7 +40,7 @@ packaging/appimage/build.sh
 # 3. Smoke the release binaries (fresh VM_CONFIG_DIR, stub backend):
 VM_CONFIG_DIR=/tmp/vm-rel target/release/vm-daemon &
 # selectVoice / getHealth / hotkey + profile actions over ws://127.0.0.1:8765
-target/release/vm actions   # must list the full catalogue (43 on v0.4.0)
+target/release/vm actions   # must list the full catalogue (49 on v0.4.0)
 
 # 4. Commit, tag, push:
 git add -A && git commit -m "Release vX.Y.Z — ..."

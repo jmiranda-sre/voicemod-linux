@@ -6,6 +6,8 @@ semantic versioning.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-10-17
+
 ### Added (F-0.4.C: routing & integrations)
 
 - Monitor mix (item 15): a hear-yourself path independent of `vm-mic`.
@@ -166,6 +168,13 @@ semantic versioning.
   Gate/compressor/EQ/de-esser/limiter values were already exact.
 - Boot now logs when a seeded file differs from the factory version
   (seed never overwrites): delete the file to receive recalibrations.
+
+### Fixed (packaging)
+
+- AppImage bundling now creates SONAME symlinks (`libpipewire-0.3.so.0`
+  → `libpipewire-0.3.so.0.1609.0`): the loader looks libraries up by
+  SONAME, so without them `LD_LIBRARY_PATH` never matched and the
+  bundled libs were silently ignored in favor of host ones.
 
 ## [0.3.0] — 2026-10-16
 

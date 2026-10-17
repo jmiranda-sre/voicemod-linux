@@ -29,6 +29,16 @@
   </developer>
   <url type="homepage">https://github.com/jmiranda-sre/voicemod-linux</url>
   <releases>
+    <release version="0.4.0" date="2026-10-17">
+      <description>
+        <p>Routing and UX cycle: per-application passthrough into the
+        soundboard bus, 30-second Instant Replay with WAV export, a first-run
+        setup wizard, an interactive graphic EQ, monitor mix and sidechain
+        ducking, an OBS WebSocket bridge, MIDI learn, neural denoisers,
+        autogain, autotune and an IR convolver, plus per-device voice
+        profiles and a complete CLI for the Control API.</p>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-10-16">
       <description>
         <p>Usability, performance and integration cycle: RT health dashboard
