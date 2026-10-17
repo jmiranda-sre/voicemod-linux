@@ -246,13 +246,17 @@ vm autostart enable    # UI entry + systemctl --user enable --now vm-daemon
 vm autostart status    # entry presence + unit enabled/active
 ```
 
-The UI lives in the system tray (StatusNotifier/AppIndicator): closing
-the window hides it instead of quitting — the daemon link thread is
-unaffected. Left-click (or the menu) shows it again; the menu carries
-a live mute checkmark and Quit. `vm-ui --minimized` boots straight
-into the tray. No tray in the Flatpak sandbox (no SNI host there by
-design): the window stays a normal window and autostart is owned by
-the Flatpak Background permission instead. Tabs: *Voices* (presets,
+The UI lives in the system tray (StatusNotifier/AppIndicator): the
+window "X" hides it — the process keeps running with the daemon link
+(WebSocket) alive, and the tray menu stays responsive (show/hide, live
+mute checkmark, Quit). Closing the window really destroys it (the only
+hide that works on Wayland) and "Show" builds a fresh one, so the UI
+state reloads from disk/daemon. Quitting for real is exclusive to the
+tray's "Quit" item; `vm-ui --minimized` boots straight into the tray
+without ever creating a window. Without a tray (Flatpak sandbox — the
+SNI host is unreachable there by design — or a headless session) the
+window stays a normal window and X closes the app; autostart is owned
+by the Flatpak Background permission instead. Tabs: *Voices* (presets,
 parameters, EQ), *Soundboard* (sounds, instant replay, passthrough),
 *Devices* (input / output / virtual+monitor), *Integrations* (monitor
 mix, ducking, OBS, MIDI) and *Health*.

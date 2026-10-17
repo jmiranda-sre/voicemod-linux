@@ -42,6 +42,11 @@ VM_CONFIG_DIR=/tmp/vm-rel target/release/vm-daemon &
 # selectVoice / getHealth / hotkey + profile actions over ws://127.0.0.1:8765
 target/release/vm actions   # must list the full catalogue (49 on v0.4.0)
 
+# 3b. Tray lifecycle smoke (desktop session with a StatusNotifier host;
+#     CI/VMs skip it cleanly):
+cargo build --release -p vm-ui
+UI=target/release/vm-ui packaging/smoke/ui-lifecycle.sh   # -> SMOKE_OK
+
 # 4. Commit, tag, push:
 git add -A && git commit -m "Release vX.Y.Z — ..."
 git tag -a vX.Y.Z -m "Voicemod Linux X.Y.Z — ..."

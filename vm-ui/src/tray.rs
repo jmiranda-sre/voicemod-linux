@@ -1,12 +1,16 @@
 //! System tray for `vm-ui` (F-13): StatusNotifier/AppIndicator icon +
-//! menu so the window can hide while the daemon link stays alive.
+//! menu so the window can close while the daemon link stays alive.
 //!
-//! The tray lives on the egui thread: [`Tray::poll`] drains both event
-//! channels without blocking and the app applies the actions. Window
-//! visibility is driven with `ViewportCommand::Visible`, quitting with
-//! a real `Close` once the user picks Quit (plain window-close hides
-//! instead — minimize-to-tray). No tray in the Flatpak sandbox
-//! (`/dev/input`-style: the SNI host is unreachable there by design).
+//! The tray is owned by `main` and outlives every window: [`Tray::poll`]
+//! drains both event channels without blocking, called from the app's
+//! `logic` hook while a window exists and from the tray wait loop in
+//! `main` when none does. The channels never wake egui, so with a window
+//! a 500 ms self-tick keeps the menu responsive, and the wait loop polls
+//! on its own. "Hide"/"Show" map to closing and reopening the window —
+//! the only mechanism that actually hides on Wayland, where winit's
+//! `Window::set_visible` is a documented no-op. No tray in the Flatpak
+//! sandbox (`/dev/input`-style: the SNI host is unreachable there by
+//! design).
 
 use muda::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 

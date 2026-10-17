@@ -6,6 +6,25 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Fixed (tray / close lifecycle, vm-ui)
+
+- The window "X" now hides for real: the window is a disposable
+  viewport — closing it (X or the tray's "Hide") destroys it while the
+  process, daemon WebSocket link and tray keep running, and "Show"
+  builds a fresh window (UI state reloads from disk/daemon). The old
+  minimize-to-tray used `ViewportCommand::Visible(false)`, which winit
+  documents as a no-op on Wayland (`Window::set_visible`): the window
+  never actually hid there, and an idle window could sit without ticks
+  (the tray channels never wake egui), freezing the menu. `--minimized`
+  (autostart) now boots into the tray wait loop without ever creating a
+  window — nothing can flash on screen (proof at the Wayland protocol
+  level: zero buffer attaches / toplevels). Real quitting stays
+  exclusive to the tray's "Quit" item; without a tray (sandbox /
+  headless) closing quits normally, so the app can never become
+  unreachable. New e2e smoke `packaging/smoke/ui-lifecycle.sh` (real
+  session) pins close→tray→quit, `--minimized` boot→Show→close→quit
+  and the windowless-boot proof.
+
 ## [0.4.0] — 2026-10-17
 
 ### Added (F-0.4.C: routing & integrations)

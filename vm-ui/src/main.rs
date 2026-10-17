@@ -2,6 +2,11 @@
 //!
 //! The UI owns no audio: presets come from `~/.config/vm/presets` (parsed
 //! with `vm-preset` for ranges), everything else flows through actions.
+//!
+//! The window is disposable: closing it (WM "X" or the tray's Hide) destroys
+//! it while the process — WS link, tray, child daemon — keeps running, and
+//! the tray's Show builds a fresh one. This is also the only true "hide" on
+//! Wayland, where winit's `Window::set_visible` is a documented no-op.
 
 mod eq;
 mod link;
@@ -11,8 +16,14 @@ mod wizard;
 use eframe::egui;
 use link::{Snapshot, UiLink};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use tray::{Tray, TrayAction};
+
+/// Where the WS link thread wakes the UI: the current window's context.
+/// Windows are disposable, so `VmApp::new` points this slot at the fresh
+/// context on every run and `main` clears it when the run ends.
+type Waker = Arc<Mutex<Option<egui::Context>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -23,8 +34,9 @@ enum Tab {
     Health,
 }
 
-struct VmApp {
-    link: UiLink,
+struct VmApp<'a> {
+    /// The process-wide WS link (owned by `main`; windows are disposable).
+    link: &'a UiLink,
     snap: Arc<Mutex<Snapshot>>,
     tab: Tab,
     presets: Vec<String>,
@@ -36,14 +48,16 @@ struct VmApp {
     texts: HashMap<(String, String), String>,
     master: f32,
     input_sel: String,
-    daemon_child: Option<std::process::Child>,
+    /// Daemon launched from the UI, if any. `main` owns it: a re-opened
+    /// window still finds the handle for the Stop button.
+    daemon_child: &'a mut Option<std::process::Child>,
     status_msg: String,
-    /// System tray (None = window-only: sandbox or no SNI host).
-    tray: Option<Tray>,
-    /// Last synced (visible, muted) — menu updates only on change.
+    /// System tray, owned by `main` and borrowed while a window exists
+    /// (None = window-only: sandbox or no SNI host).
+    tray: &'a Option<Tray>,
+    /// Last synced (visible, muted) — menu updates only on change. This
+    /// struct only exists while its window does, so visible is always true.
     tray_sync: (bool, bool),
-    visible: bool,
-    quit_requested: bool,
     /// EQ canvas bands (rebuilt on preset load; values refreshed from the
     /// slider mirrors every frame).
     eq_bands: Vec<eq::EqBand>,
@@ -54,25 +68,20 @@ struct VmApp {
     wizard_fast: bool,
 }
 
-impl VmApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let ctx = cc.egui_ctx.clone();
-        let link = UiLink::new({
-            let ctx = ctx.clone();
-            move || ctx.request_repaint()
-        });
+impl<'a> VmApp<'a> {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        link: &'a UiLink,
+        tray: &'a Option<Tray>,
+        daemon_child: &'a mut Option<std::process::Child>,
+        waker: &Waker,
+    ) -> Self {
+        // Point the link's repaint hook at this window's context. `main`
+        // clears it when the run ends: between windows there is nothing to
+        // repaint and the tray wait loop polls on its own.
+        *waker.lock().unwrap() = Some(cc.egui_ctx.clone());
         let snap = link.snapshot.clone();
-        let visible = !Self::start_hidden();
-        if !visible {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        }
-        let tray = match Tray::new() {
-            Ok(t) => Some(t),
-            Err(e) => {
-                eprintln!("tray: {e} (window-only mode)");
-                None
-            }
-        };
+        let first = snap.lock().map(|s| s.clone()).unwrap_or_default();
         let mut app = Self {
             link,
             snap,
@@ -85,12 +94,16 @@ impl VmApp {
             texts: HashMap::new(),
             master: 1000.0,
             input_sel: String::new(),
-            daemon_child: None,
-            status_msg: "connecting…".to_string(),
+            daemon_child,
+            // A re-opened window usually lands on a live link: don't show
+            // "connecting…" when we already are.
+            status_msg: if first.connected {
+                "connected".into()
+            } else {
+                "connecting…".into()
+            },
             tray,
-            tray_sync: (visible, false),
-            visible,
-            quit_requested: false,
+            tray_sync: (true, false),
             eq_bands: Vec::new(),
             eq_selected: None,
             wizard: wizard::Wizard::first_run(&Self::config_dir()),
@@ -98,12 +111,6 @@ impl VmApp {
         };
         app.refresh_presets();
         app
-    }
-
-    /// `--minimized`: boot straight into the tray (used by the XDG
-    /// autostart entry). Pure function for testability.
-    fn start_hidden() -> bool {
-        start_hidden_from(std::env::args())
     }
 
     fn preset_dir() -> std::path::PathBuf {
@@ -347,18 +354,34 @@ impl VmApp {
     }
 }
 
-impl eframe::App for VmApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let snap = self.snap.lock().map(|s| s.clone()).unwrap_or_default();
+impl eframe::App for VmApp<'_> {
+    /// Runs before every `ui` pass. While this window exists, the tray
+    /// actions (hide / mute / quit) and the smoke hooks land here. Closing
+    /// the window — WM "X" or the tray's Hide — needs no interception: the
+    /// run just ends and `main` picks up with the link and tray still alive.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let now = std::time::Instant::now();
+        if smoke().close_due(now) {
+            // Same path as the WM "X": close; `main` decides the fate.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            ctx.request_repaint();
+        }
+        if smoke().quit_due(now) {
+            QUIT.store(true, Ordering::Relaxed);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            ctx.request_repaint();
+        }
 
         // Tray: drain menu/click actions, then reflect state in the menu
         // (only on change — each sync is an SNI round-trip).
-        if let Some(tray) = &self.tray {
+        let snap = self.snap.lock().map(|s| s.clone()).unwrap_or_default();
+        if let Some(tray) = self.tray.as_ref() {
             for action in tray.poll() {
                 match action {
+                    // "Hide" closes the window; link + tray stay up in
+                    // `main`, and "Show" opens a fresh window.
                     TrayAction::ToggleVisibility => {
-                        self.visible = !self.visible;
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(self.visible));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                     TrayAction::ToggleMute => {
                         self.act(serde_json::json!({
@@ -366,27 +389,28 @@ impl eframe::App for VmApp {
                         }));
                     }
                     TrayAction::Quit => {
-                        self.quit_requested = true;
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        QUIT.store(true, Ordering::Relaxed);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 }
             }
-            if (self.visible, snap.muted) != self.tray_sync {
-                tray.sync(self.visible, snap.muted);
-                self.tray_sync = (self.visible, snap.muted);
+            if (true, snap.muted) != self.tray_sync {
+                tray.sync(true, snap.muted);
+                self.tray_sync = (true, snap.muted);
             }
         }
-        // Minimize-to-tray: plain window-close hides instead of quitting
-        // (the WS link thread is unaffected). Quit only via the tray.
-        // Without a tray (sandbox/headless) close behaves normally.
-        if self.tray.is_some()
-            && !self.quit_requested
-            && ui.ctx().input(|i| i.viewport().close_requested())
-        {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            self.visible = false;
+
+        // Tray channels never wake egui and an idle window gets no input
+        // events either, so keep a slow self-tick while a tray is live:
+        // 500 ms keeps menu clicks (hide / mute / quit) prompt. With no
+        // window there is no loop to tick — the wait in `main` polls itself.
+        if self.tray.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let snap = self.snap.lock().map(|s| s.clone()).unwrap_or_default();
 
         // Keep local preset selection in sync with the daemon voice.
         if !snap.selected_voice.is_empty()
@@ -430,7 +454,7 @@ impl eframe::App for VmApp {
                     match Self::daemon_path() {
                         Some(path) => match std::process::Command::new(path).arg("--live").spawn() {
                             Ok(child) => {
-                                self.daemon_child = Some(child);
+                                *self.daemon_child = Some(child);
                                 self.status_msg = "daemon launched".to_string();
                             }
                             Err(e) => self.status_msg = format!("launch failed: {e}"),
@@ -483,7 +507,7 @@ impl eframe::App for VmApp {
     }
 }
 
-impl VmApp {
+impl VmApp<'_> {
     fn voices_tab(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
         ui.horizontal(|ui| {
             ui.label("Voice changer:");
@@ -1345,20 +1369,202 @@ fn level_db_bar(ui: &mut egui::Ui, label: &str, db: f32) {
     });
 }
 
-fn main() -> eframe::Result<()> {
-    let hidden = start_hidden_from(std::env::args());
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 640.0])
-            .with_position([80.0, 80.0])
-            .with_visible(!hidden),
-        ..Default::default()
+/// What `main` does after a window closes; kept pure for the unit tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseOutcome {
+    /// Link + tray live on in `main`; a later tray "Show" opens a new window.
+    WaitTray,
+    /// Quit (tray menu / smoke hook), or window-only mode: with no tray
+    /// there is no way back to a closed window, and a stranded process
+    /// would need a kill — so closing really quits.
+    Exit,
+}
+
+fn close_outcome(quit: bool, tray: bool) -> CloseOutcome {
+    if quit || !tray {
+        CloseOutcome::Exit
+    } else {
+        CloseOutcome::WaitTray
+    }
+}
+
+/// Set by tray Quit (or the quit smoke hook); read by `main` after every
+/// window closes: set = the process exits, clear = back to the tray.
+static QUIT: AtomicBool = AtomicBool::new(false);
+
+/// What the tray wait loop got: open a window, or exit the process.
+enum WaitAction {
+    Show,
+    Exit,
+}
+
+/// E2E smoke hooks, armed by env: `VM_UI_SMOKE_CLOSE_SECS` closes the
+/// window like the WM "X" and `VM_UI_SMOKE_QUIT_SECS` quits like the tray
+/// Quit item (both once, counting from process start), while
+/// `VM_UI_SMOKE_SHOW_SECS` re-opens one like a tray "Show" click, N seconds
+/// into every stay in the tray. Together they drive the whole lifecycle
+/// with no human clicking; unset in normal runs.
+struct Smoke {
+    start: std::time::Instant,
+    close_after: Option<std::time::Duration>,
+    show_after: Option<std::time::Duration>,
+    quit_after: Option<std::time::Duration>,
+    close_fired: AtomicBool,
+}
+
+impl Smoke {
+    fn from_env() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            close_after: smoke_secs("VM_UI_SMOKE_CLOSE_SECS"),
+            show_after: smoke_secs("VM_UI_SMOKE_SHOW_SECS"),
+            quit_after: smoke_secs("VM_UI_SMOKE_QUIT_SECS"),
+            close_fired: AtomicBool::new(false),
+        }
+    }
+
+    fn due(
+        &self,
+        deadline: Option<std::time::Duration>,
+        fired: &AtomicBool,
+        now: std::time::Instant,
+    ) -> bool {
+        deadline.is_some_and(|d| now.saturating_duration_since(self.start) >= d)
+            && !fired.swap(true, Ordering::Relaxed)
+    }
+
+    fn close_due(&self, now: std::time::Instant) -> bool {
+        self.due(self.close_after, &self.close_fired, now)
+    }
+
+    /// Quit is idempotent (the `QUIT` flag latches), so it stays "due".
+    fn quit_due(&self, now: std::time::Instant) -> bool {
+        self.quit_after
+            .is_some_and(|d| now.saturating_duration_since(self.start) >= d)
+    }
+}
+
+/// Parse a smoke-hook env var (seconds; clamped to a small minimum so the
+/// app always finishes booting first).
+fn smoke_secs(var: &str) -> Option<std::time::Duration> {
+    let secs: f32 = std::env::var(var).ok()?.parse().ok()?;
+    Some(std::time::Duration::from_secs_f32(secs.max(0.05)))
+}
+
+/// One process-wide smoke instance, anchored at first use (`main` arms it
+/// before doing anything else).
+fn smoke() -> &'static Smoke {
+    static SMOKE: OnceLock<Smoke> = OnceLock::new();
+    SMOKE.get_or_init(Smoke::from_env)
+}
+
+/// Pump the tray while no window exists: show / mute / quit and the smoke
+/// hooks, with the WS link still running on its own thread. Returns when a
+/// window should open or the process should exit.
+fn tray_wait(tray: &Option<Tray>, link: &UiLink) -> WaitAction {
+    let Some(tray) = tray.as_ref() else {
+        // Unreachable (window-only mode exits instead of waiting), but a
+        // wait with nothing to wait on must never become an infinite loop.
+        return WaitAction::Exit;
     };
-    eframe::run_native(
-        "vm-ui — Voicemod Linux (clean-room)",
-        options,
-        Box::new(|cc| Ok(Box::new(VmApp::new(cc)))),
-    )
+    let show_after = smoke().show_after;
+    let entered = std::time::Instant::now();
+    let mut synced: Option<bool> = None;
+    loop {
+        let now = std::time::Instant::now();
+        if smoke().quit_due(now) {
+            QUIT.store(true, Ordering::Relaxed);
+        }
+        if QUIT.load(Ordering::Relaxed) {
+            return WaitAction::Exit;
+        }
+        if show_after.is_some_and(|d| now.saturating_duration_since(entered) >= d) {
+            return WaitAction::Show;
+        }
+        for action in tray.poll() {
+            match action {
+                TrayAction::ToggleVisibility => return WaitAction::Show,
+                TrayAction::ToggleMute => {
+                    let muted = link.snapshot.lock().map(|s| s.muted).unwrap_or(false);
+                    link.send_action(serde_json::json!({
+                        "action": "setMuted", "muted": !muted,
+                    }));
+                }
+                TrayAction::Quit => {
+                    QUIT.store(true, Ordering::Relaxed);
+                    return WaitAction::Exit;
+                }
+            }
+        }
+        // Menu reflects "no window": label says Show, checkmark stays live.
+        let muted = link.snapshot.lock().map(|s| s.muted).unwrap_or(false);
+        if synced != Some(muted) {
+            tray.sync(false, muted);
+            synced = Some(muted);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn main() -> eframe::Result<()> {
+    let _ = smoke(); // anchor the smoke deadlines at process start
+    let hidden = start_hidden_from(std::env::args());
+
+    let waker: Waker = Arc::new(Mutex::new(None));
+    let mut daemon_child: Option<std::process::Child> = None;
+    let link = UiLink::new({
+        let waker = waker.clone();
+        move || {
+            if let Ok(waker) = waker.lock() {
+                if let Some(ctx) = waker.as_ref() {
+                    ctx.request_repaint();
+                }
+            }
+        }
+    });
+    let tray = match Tray::new() {
+        Ok(t) => Some(t),
+        Err(e) => {
+            eprintln!("tray: {e} (window-only mode: closing the window quits)");
+            None
+        }
+    };
+    // A hidden boot without a tray would leave nothing on screen to click,
+    // so window-only mode always shows the window (it stays reachable).
+    // With a tray, `--minimized` starts directly in the wait loop and no
+    // window is ever created — nothing can flash on screen.
+    if hidden && tray.is_some() {
+        if let WaitAction::Exit = tray_wait(&tray, &link) {
+            return Ok(());
+        }
+    }
+
+    loop {
+        let res = eframe::run_native(
+            "vm-ui — Voicemod Linux (clean-room)",
+            eframe::NativeOptions {
+                viewport: egui::ViewportBuilder::default().with_inner_size([980.0, 640.0]),
+                // Closing the window must return here — the process keeps
+                // living in the tray — instead of calling `process::exit`.
+                run_and_return: true,
+                ..Default::default()
+            },
+            Box::new(|cc| Ok(Box::new(VmApp::new(cc, &link, &tray, &mut daemon_child, &waker)))),
+        );
+        if let Ok(mut waker) = waker.lock() {
+            *waker = None;
+        }
+        link.set_fast_levels(false); // wizard meters stop polling between windows
+        res?;
+        if close_outcome(QUIT.load(Ordering::Relaxed), tray.is_some()) == CloseOutcome::Exit {
+            break;
+        }
+        eprintln!("window closed; running in the tray (Quit lives there)");
+        if let WaitAction::Exit = tray_wait(&tray, &link) {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// `--minimized` anywhere in argv boots straight into the tray.
@@ -1368,7 +1574,8 @@ fn start_hidden_from(mut args: impl Iterator<Item = String>) -> bool {
 
 #[cfg(test)]
 mod ui_flag_tests {
-    use super::start_hidden_from;
+    use super::{close_outcome, start_hidden_from, CloseOutcome, Smoke};
+    use std::sync::atomic::AtomicBool;
 
     fn argv(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
@@ -1380,5 +1587,35 @@ mod ui_flag_tests {
         assert!(start_hidden_from(argv(&["vm-ui", "--foo", "--minimized", "--bar"]).into_iter()));
         assert!(!start_hidden_from(argv(&["vm-ui"]).into_iter()));
         assert!(!start_hidden_from(argv(&["vm-ui", "--minimize"]).into_iter()));
+    }
+
+    #[test]
+    fn close_outcome_quits_only_on_quit_or_no_tray() {
+        // "X" with a live tray: back to the tray, process + link stay up.
+        assert_eq!(close_outcome(false, true), CloseOutcome::WaitTray);
+        // Tray Quit: exit for real.
+        assert_eq!(close_outcome(true, true), CloseOutcome::Exit);
+        // Window-only mode: close behaves like a normal app close.
+        assert_eq!(close_outcome(false, false), CloseOutcome::Exit);
+        assert_eq!(close_outcome(true, false), CloseOutcome::Exit);
+    }
+
+    #[test]
+    fn smoke_deadlines_fire_once() {
+        let start = std::time::Instant::now();
+        let s = Smoke {
+            start,
+            close_after: Some(std::time::Duration::from_secs(2)),
+            show_after: None,
+            quit_after: Some(std::time::Duration::from_secs(4)),
+            close_fired: AtomicBool::new(false),
+        };
+        let at = |ms| start + std::time::Duration::from_millis(ms);
+        assert!(!s.close_due(at(1999)));
+        assert!(s.close_due(at(2000)));
+        assert!(!s.close_due(at(3000)), "close fires at most once");
+        assert!(!s.quit_due(at(3999)));
+        assert!(s.quit_due(at(4000)));
+        assert!(s.quit_due(at(5000)), "quit stays due (idempotent)");
     }
 }

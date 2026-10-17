@@ -997,3 +997,37 @@ Progresso 2026-10-17: **D, A, C e B FECHADAS — ciclo v0.4.0 completo (release 
   resolve), AUR (PKGBUILD pronto, `.SRCINFO` com `MAKEPKG_LINT_PKGBUILD=0`
   — pkgver derivado de `git describe`, sem edição na receita), issues
   do backlog pós-v0.4.0.
+
+## PÓS-0.4.0 — tray/close lifecycle da UI (2026-10-17)
+- Sintoma (reportado): fechar a janela no "X" não preservava a UI viva
+  na bandeja como esperado (tray sem resposta / app inalcançável), e o
+  boot `--minimized` podia pipocar a janela na tela.
+- Causa-raiz (duas, provadas na investigação):
+  1. winit 0.30.13 no Wayland: `Window::set_visible` é NO-OP documentado
+     ("Not possible on Wayland") e `is_visible()` devolve `None` — o
+     hide via `ViewportCommand::Visible(false)` NUNCA escondeu de fato
+     (log WAYLAND_DEBUG: superfície mapeada e pintando o run inteiro;
+     zero eventos `leave`). E o `--minimized` pinta o 1º frame →
+     `post_rendering` força `set_visible(true)` → janela aparece.
+  2. eframe 0.36: janela ociosa não agenda ticks (sem input/frame
+     callbacks; os canais do tray não acordam o egui) e `Visible(false)`
+     não muda o caminho `ui()` (que deriva de minimized/occluded, ambos
+     ausentes no Wayland) — o tray congelava em runs ociosos.
+- Correção (vm-ui): arquitetura de "janela descartável" — `main` é dono
+  do link WS, do tray e do latch `QUIT`; fechar a janela (X ou "Hide")
+  DESTRÓI a janela e o processo segue na bandeja; "Show" recria a
+  janela (`run_native` de novo; `run_and_return: true` explícito;
+  Context egui novo por janela — Context compartilhado entre runs
+  quebra texturas no renderer; waker do link repontado por janela).
+  `--minimized` não cria NENHUMA janela até um "Show" (zero flash).
+  Política pura `close_outcome` (quit OU sem tray → sair; senão volta à
+  bandeja) + self-tick 500 ms com janela aberta (menu responsivo); sem
+  janela, wait loop do `main` faz poll a 100 ms (show/mute/quit).
+- Validação: prova isolada (scratch eltest) de `run_native` sequencial
+  — retorna `Ok(())` e o event loop é recriado/reusado em runs
+  sucessivos; smoke e2e `packaging/smoke/ui-lifecycle.sh` na sessão
+  real, debug e release: SMOKE_OK — X fecha e o processo vive na
+  bandeja; Quit sem janela sai; boot `--minimized` → Show → fecha →
+  Quit; prova WAYLAND_DEBUG de zero superfícies no boot `--minimized`
+  (0 attaches, 0 xdg_toplevel) e janela real após Show. Workspace
+  184/184, clippy 0.
