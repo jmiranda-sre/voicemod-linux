@@ -1031,3 +1031,23 @@ Progresso 2026-10-17: **D, A, C e B FECHADAS — ciclo v0.4.0 completo (release 
   Quit; prova WAYLAND_DEBUG de zero superfícies no boot `--minimized`
   (0 attaches, 0 xdg_toplevel) e janela real após Show. Workspace
   184/184, clippy 0.
+
+## F-0.4.1.A — integração janela/menu/ícone (2026-10-17)
+- app_id canônico: a janela Wayland passa a anunciar
+  `io.github.voicemodlinux.vm` (`ViewportBuilder::with_app_id`) em vez do
+  título inteiro — é o que faz o compositor parear a janela com
+  `io.github.voicemodlinux.vm.desktop` e seu ícone (doc do egui: "should
+  match the .desktop file distributed with your program"). Título
+  simplificado para "Voicemod Linux". No X11 o egui-winit ignora o
+  app_id e o WM_CLASS cai no nome do binário (`vm-ui`) — o
+  `StartupWMClass` do .desktop segue correto.
+- .desktop: `StartupNotify=true` + Desktop Action "Start minimized"
+  (`vm-ui --minimized`), exibida no submenu do ícone no menu de apps.
+- Ícones: árvore `packaging/icons/hicolor/{scalable,256x256,512x512}/apps/`
+  (SVG movido do flat; PNGs 256/512 renderizados do mesmo SVG com
+  rsvg-convert). PKGBUILD, build-inside.sh (Flatpak) e appimage/build.sh
+  atualizados; no AppImage o sed do Exec foi restrito à seção principal
+  (`0,/^Exec=/`) para não engolir o Exec da ação.
+- Validação: `desktop-file-validate` OK; `appstreamcli validate` OK;
+  WAYLAND_DEBUG na sessão real: `set_app_id("io.github.voicemodlinux.vm")`
+  + `set_title("Voicemod Linux")`; workspace 184/184, clippy 0.

@@ -9,5 +9,14 @@ Icon=io.github.voicemodlinux.vm
 Terminal=false
 Categories=AudioVideo;Audio;Mixer;
 Keywords=voice;changer;microphone;pitch;effects;soundboard;pipewire;
+StartupNotify=true
+# X11 groups the window by WM_CLASS (the binary name). On Wayland the window
+# sets app_id=io.github.voicemodlinux.vm (this file's ID), which is what
+# compositors pair with this entry to find the icon.
 StartupWMClass=vm-ui
 SingleMainWindow=true
+Actions=StartMinimized;
+
+[Desktop Action StartMinimized]
+Name=Start minimized
+Exec=vm-ui --minimized

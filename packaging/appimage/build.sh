@@ -40,7 +40,9 @@ BASE_LIBS="^(ld-linux|libc|libm|libgcc_s|libdl|libpthread|librt|libstdc\+\+|libr
 
 echo "== assembling AppDir at $APPDIR"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib" "$APPDIR/usr/share/applications" \
-         "$APPDIR/usr/share/icons/hicolor/scalable/apps"
+         "$APPDIR/usr/share/icons/hicolor/scalable/apps" \
+         "$APPDIR/usr/share/icons/hicolor/256x256/apps" \
+         "$APPDIR/usr/share/icons/hicolor/512x512/apps"
 
 for bin in vm vm-daemon vm-ui; do
   install -Dm755 "target/release/$bin" "$APPDIR/usr/bin/$bin"
@@ -84,13 +86,19 @@ done
 echo "== bundled libraries:"
 (cd "$APPDIR/usr/lib" && ls -1 || true)
 
-install -Dm644 packaging/io.github.voicemodlinux.vm.svg \
+ICONS="packaging/icons/hicolor"
+install -Dm644 "$ICONS/scalable/apps/io.github.voicemodlinux.vm.svg" \
   "$APPDIR/usr/share/icons/hicolor/scalable/apps/io.github.voicemodlinux.vm.svg"
+install -Dm644 "$ICONS/256x256/apps/io.github.voicemodlinux.vm.png" \
+  "$APPDIR/usr/share/icons/hicolor/256x256/apps/io.github.voicemodlinux.vm.png"
+install -Dm644 "$ICONS/512x512/apps/io.github.voicemodlinux.vm.png" \
+  "$APPDIR/usr/share/icons/hicolor/512x512/apps/io.github.voicemodlinux.vm.png"
 
-# Desktop entry: plain Exec (the AppRun wrapper handles the daemon).
-sed "s|^Exec=.*|Exec=vm-ui %U|" \
+# Desktop entry: plain Exec (the AppRun wrapper handles the daemon). Narrow the
+# sed to the main section only, so Desktop Actions keep their own Exec lines.
+sed "0,/^Exec=.*/s|^Exec=.*|Exec=vm-ui %U|" \
   packaging/io.github.voicemodlinux.vm.desktop > "$APPDIR/vm-ui.desktop"
-install -Dm644 packaging/io.github.voicemodlinux.vm.svg \
+install -Dm644 "$ICONS/scalable/apps/io.github.voicemodlinux.vm.svg" \
   "$APPDIR/io.github.voicemodlinux.vm.svg"
 
 cat > "$APPDIR/AppRun" <<'EOF'

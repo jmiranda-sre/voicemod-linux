@@ -26,7 +26,11 @@ install -Dm644 packaging/io.github.voicemodlinux.vm.desktop \
   /app/share/applications/io.github.voicemodlinux.vm.desktop
 install -Dm644 packaging/io.github.voicemodlinux.vm.metainfo.xml \
   /app/share/metainfo/io.github.voicemodlinux.vm.metainfo.xml
-install -Dm644 packaging/io.github.voicemodlinux.vm.svg \
+install -Dm644 packaging/icons/hicolor/scalable/apps/io.github.voicemodlinux.vm.svg \
   /app/share/icons/hicolor/scalable/apps/io.github.voicemodlinux.vm.svg
+install -Dm644 packaging/icons/hicolor/256x256/apps/io.github.voicemodlinux.vm.png \
+  /app/share/icons/hicolor/256x256/apps/io.github.voicemodlinux.vm.png
+install -Dm644 packaging/icons/hicolor/512x512/apps/io.github.voicemodlinux.vm.png \
+  /app/share/icons/hicolor/512x512/apps/io.github.voicemodlinux.vm.png
 
 echo "build-inside: OK"

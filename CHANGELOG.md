@@ -6,6 +6,19 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Changed (desktop integration, F-0.4.1.A)
+
+- The window is now a first-class desktop citizen: the Wayland window
+  announces the canonical `io.github.voicemodlinux.vm` app-id (the
+  AppStream/desktop ID) instead of its full title, so compositors pair
+  the window with the installed `.desktop` entry — and therefore its
+  icon — in menus, taskbars and stores; the title is now simply
+  "Voicemod Linux". The desktop entry gained `StartupNotify=true` and a
+  "Start minimized" action (`vm-ui --minimized`, boots straight to the
+  tray) in the icon's context menu, and the app icon now ships as the
+  SVG plus 256/512 px PNGs under `packaging/icons/hicolor/` for every
+  packaging path (AUR, Flatpak, AppImage).
+
 ### Fixed (tray / close lifecycle, vm-ui)
 
 - The window "X" now hides for real: the window is a disposable

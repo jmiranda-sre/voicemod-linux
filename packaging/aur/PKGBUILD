@@ -65,8 +65,12 @@ package() {
 
   install -Dm644 packaging/io.github.voicemodlinux.vm.desktop \
     "$pkgdir/usr/share/applications/io.github.voicemodlinux.vm.desktop"
-  install -Dm644 packaging/io.github.voicemodlinux.vm.svg \
+  install -Dm644 packaging/icons/hicolor/scalable/apps/io.github.voicemodlinux.vm.svg \
     "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.voicemodlinux.vm.svg"
+  install -Dm644 packaging/icons/hicolor/256x256/apps/io.github.voicemodlinux.vm.png \
+    "$pkgdir/usr/share/icons/hicolor/256x256/apps/io.github.voicemodlinux.vm.png"
+  install -Dm644 packaging/icons/hicolor/512x512/apps/io.github.voicemodlinux.vm.png \
+    "$pkgdir/usr/share/icons/hicolor/512x512/apps/io.github.voicemodlinux.vm.png"
   install -Dm644 packaging/io.github.voicemodlinux.vm.metainfo.xml \
     "$pkgdir/usr/share/metainfo/io.github.voicemodlinux.vm.metainfo.xml"
 

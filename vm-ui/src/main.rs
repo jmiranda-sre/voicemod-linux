@@ -1541,9 +1541,14 @@ fn main() -> eframe::Result<()> {
 
     loop {
         let res = eframe::run_native(
-            "vm-ui — Voicemod Linux (clean-room)",
+            "Voicemod Linux",
             eframe::NativeOptions {
-                viewport: egui::ViewportBuilder::default().with_inner_size([980.0, 640.0]),
+                viewport: egui::ViewportBuilder::default()
+                    .with_inner_size([980.0, 640.0])
+                    // Must equal the AppStream/desktop ID: Wayland compositors
+                    // pair the window with io.github.voicemodlinux.vm.desktop
+                    // (and its icon) through this app_id.
+                    .with_app_id("io.github.voicemodlinux.vm"),
                 // Closing the window must return here — the process keeps
                 // living in the tray — instead of calling `process::exit`.
                 run_and_return: true,
