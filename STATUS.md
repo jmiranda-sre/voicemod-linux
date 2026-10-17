@@ -971,3 +971,29 @@ Progresso 2026-10-17: **D, A, C e B FECHADAS — ciclo v0.4.0 completo (release 
   (REPLAY wav de 5 s real, MOVE p/ vm-passthrough, INJECT no sink,
   BOOT_APPLY pós-restart, RESTORE no disable; EE pausado no teste por
   conflito conhecido).
+
+## PUBLICADO — v0.4.0 no ar (2026-10-17)
+- Ritual RELEASE.md seguido: 182/182 testes workspace, release build,
+  `appstreamcli validate` ✔, AppImage, smokes, commit+tag+push+release.
+- Bump em 4 pontos (workspace Cargo.toml, manifest Flatpak `tag:
+  v0.4.0`, metainfo + entrada 0.4.0, CHANGELOG [Unreleased]→[0.4.0]
+  com nova stub [Unreleased]); RELEASE.md atualizado (182/182, 49
+  ações); PKGBUILD intacto (pkgver via `git describe`).
+- BUG DE PACKAGING achado na validação do artefato: as libs bundladas
+  existiam só com o nome versionado (sem symlink de SONAME) → o loader
+  ignorava o bundle e usava a lib do sistema. `build.sh` agora cria os
+  symlinks; `ldd` no AppImage extraído resolve DENTRO do bundle
+  (`libpipewire-0.3.so.0` → `usr/lib` do AppDir), e `vm actions` = 49.
+- AppImage: `VoicemodLinux-0.4.0-x86_64.AppImage` (18.164.216 bytes).
+- Smoke pós-build (release, stub, dir novo): 7 presets semeados,
+  select robot ok, health 4 nós / latencyMs 70.67, addHotkey SaveReplay
+  ok, setMuted ok, getVoices = 7, `vm actions` = 49; f04b stub smoke
+  completo (clamp, rollback, config v4, hotkey) ✔.
+- Commits até `c4d6a90` + tag anotada `v0.4.0`; push main + tag OK.
+  Release github.com/jmiranda-sre/voicemod-linux/releases/tag/v0.4.0
+  (não-draft, não-prerelease) com AppImage + notas do CHANGELOG
+  (ciclo completo F-0.4.D/A/C/B).
+- Próximo (do usuário): PR no Flathub (manifest pronto, tag v0.4.0
+  resolve), AUR (PKGBUILD pronto, `.SRCINFO` com `MAKEPKG_LINT_PKGBUILD=0`
+  — pkgver derivado de `git describe`, sem edição na receita), issues
+  do backlog pós-v0.4.0.

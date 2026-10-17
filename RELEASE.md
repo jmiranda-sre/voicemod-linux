@@ -59,6 +59,9 @@ gh release create vX.Y.Z \
 
 ## Distribution channels
 
+Current release: **v0.4.0** (2026-10-17) — Flatpak `tag`, metainfo
+entry and CHANGELOG are in sync with it.
+
 | Channel | Status | Action |
 | --- | --- | --- |
 | Flathub | manifest ready (`tag` tracks the latest release) | open a PR to `flathub/flathub` adding the repo (manifest + `flathub.json` under the app ID) |
