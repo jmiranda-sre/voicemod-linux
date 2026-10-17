@@ -52,6 +52,17 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.4.1" date="2026-10-17">
+      <description>
+        <p>Desktop integration and GUI-first cycle: canonical app-id with
+        hicolor icons and a "Start minimized" action, an autostart toggle
+        in a new Preferences dialog (one implementation shared with the
+        CLI), a polished first-run wizard and About dialog, empty-state
+        messages on every tab, and catalog-grade AppStream metadata with
+        real screenshots for GNOME Software, KDE Discover and Flathub.
+        The full CLI stays first-class: every action remains scriptable.</p>
+      </description>
+    </release>
     <release version="0.4.0" date="2026-10-17">
       <description>
         <p>Routing and UX cycle: per-application passthrough into the

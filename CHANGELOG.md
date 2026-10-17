@@ -6,6 +6,8 @@ semantic versioning.
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-10-17
+
 ### Changed (desktop integration, F-0.4.1.A)
 
 - The window is now a first-class desktop citizen: the Wayland window

@@ -94,6 +94,27 @@ top bar offers **Launch daemon** (starts a local instance); when a daemon is
 already answering (e.g. a `systemd --user` instance), the UI shows
 `daemon running` and never spawns a second one.
 
+## UI or CLI — your call
+
+**GUI-first, CLI intact.** Everyday use happens in the window — no
+terminal needed — and everything the window does maps to a CLI command
+against the same daemon, so scripts and power users keep every option.
+
+| Task | GUI (`vm-ui`) | CLI (`vm`) |
+| --- | --- | --- |
+| Load a voice | click a preset in **Voices** | `vm call '{"action":"selectVoice","voice":"robot"}'` |
+| Play a sound | click a pad in **Soundboard** | `vm call '{"action":"playSound","sound":"sting"}'` |
+| Measure the room | **Setup wizard** | `vm call '{"action":"captureNoiseProfile","node":"denoise"}'` |
+| Autostart at login | **⚙ Preferences** checkbox | `vm autostart status\|enable\|disable` |
+| Health and levels | **Health** tab | `vm call '{"action":"getHealth"}'` |
+| Whole API | — | `vm actions` lists every action for scripting |
+
+Where it matters the sharing goes deeper than the daemon: the autostart
+toggle is one `vm-control` module used by both front-ends (the CLI
+output stays byte-identical to what it always was), so GUI and CLI can
+never disagree. Existing scripts, hotkey daemons and `vm call` pipelines
+keep working exactly as before.
+
 ### Virtual microphone
 
 The daemon creates a null-sink named **`vm-mic`** (plus `vm-monitor`) and links

@@ -8,13 +8,17 @@ manifest, CHANGELOG and this documentation. (The Flatpak app ID
 `voicemodlinux` organization, a repository transfer keeps the old links
 working and only these references need updating.)
 
-## Per-release procedure (followed through v0.4.0)
+## Per-release procedure (followed through v0.4.1)
 
 ```bash
 # 0. Everything green first:
-cargo test --workspace            # 182/182 on v0.4.0
+cargo test --workspace            # 189/189 on v0.4.1
 cargo build --release
+cargo clippy --workspace --all-targets -- -D warnings
 appstreamcli validate packaging/io.github.voicemodlinux.vm.metainfo.xml
+# ^ validates the raw-URL screenshots over the network (passes once the
+#   release commit is pushed; `--no-net` skips the URL check)
+desktop-file-validate packaging/io.github.voicemodlinux.vm.desktop
 
 # Optional: neural DeepFilterNet variant (opt-in feature; sharpens the
 # AppImage only if shipped — the default build keeps `deepfilter` off
@@ -40,10 +44,10 @@ packaging/appimage/build.sh
 # 3. Smoke the release binaries (fresh VM_CONFIG_DIR, stub backend):
 VM_CONFIG_DIR=/tmp/vm-rel target/release/vm-daemon &
 # selectVoice / getHealth / hotkey + profile actions over ws://127.0.0.1:8765
-target/release/vm actions   # must list the full catalogue (49 on v0.4.0)
+target/release/vm actions   # must list the full catalogue (49 on v0.4.1)
 
-# 3b. Tray lifecycle smoke (desktop session with a StatusNotifier host;
-#     CI/VMs skip it cleanly):
+# 3b. Tray/UI lifecycle smoke — release gate since v0.4.1 (desktop
+#     session with a StatusNotifier host; CI/VMs skip it cleanly):
 cargo build --release -p vm-ui
 UI=target/release/vm-ui packaging/smoke/ui-lifecycle.sh   # -> SMOKE_OK
 
@@ -64,7 +68,7 @@ gh release create vX.Y.Z \
 
 ## Distribution channels
 
-Current release: **v0.4.0** (2026-10-17) — Flatpak `tag`, metainfo
+Current release: **v0.4.1** (2026-10-17) — Flatpak `tag`, metainfo
 entry and CHANGELOG are in sync with it.
 
 | Channel | Status | Action |

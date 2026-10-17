@@ -36,7 +36,7 @@
         {
           "type": "git",
           "url": "https://github.com/jmiranda-sre/voicemod-linux.git",
-          "tag": "v0.4.0",
+          "tag": "v0.4.1",
           "x-checker-data": {
             "type": "json",
             "url": "https://api.github.com/repos/jmiranda-sre/voicemod-linux/releases/latest",

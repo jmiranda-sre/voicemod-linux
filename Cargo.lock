@@ -5283,7 +5283,7 @@ dependencies = [
 
 [[package]]
 name = "vm-audio"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "libc",
  "pipewire",
@@ -5293,7 +5293,7 @@ dependencies = [
 
 [[package]]
 name = "vm-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "clap 4.6.7",
  "futures-util",
@@ -5308,7 +5308,7 @@ dependencies = [
 
 [[package]]
 name = "vm-control"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "evdev",
  "futures-util",
@@ -5320,7 +5320,7 @@ dependencies = [
 
 [[package]]
 name = "vm-daemon"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "futures-util",
  "serde_json",
@@ -5337,7 +5337,7 @@ dependencies = [
 
 [[package]]
 name = "vm-dsp"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "deep_filter",
  "flate2",
@@ -5353,7 +5353,7 @@ dependencies = [
 
 [[package]]
 name = "vm-midi"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "midir",
  "vm-control",
@@ -5361,7 +5361,7 @@ dependencies = [
 
 [[package]]
 name = "vm-obs"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "base64",
  "futures-util",
@@ -5373,7 +5373,7 @@ dependencies = [
 
 [[package]]
 name = "vm-preset"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5381,7 +5381,7 @@ dependencies = [
 
 [[package]]
 name = "vm-soundboard"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "audiopus",
  "rubato",
@@ -5390,7 +5390,7 @@ dependencies = [
 
 [[package]]
 name = "vm-ui"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "eframe",
  "futures-util",

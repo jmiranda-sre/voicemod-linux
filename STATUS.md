@@ -1142,3 +1142,36 @@ Progresso 2026-10-17: **D, A, C e B FECHADAS — ciclo v0.4.0 completo (release 
 - Gates: clippy 0, workspace 189/189 (5 novos rodadas de captura não
   alteraram contagem). VM_CONTROL/`vm autostart` byte-idênticos não
   foram tocados nesta frente.
+
+## F-0.4.1.D — consolidação e release v0.4.1 (2026-10-17)
+- README: seção nova **"UI or CLI — your call"** (logo após o bloco de
+  `Running`): tabela tarefa→GUI/CLI (voice, soundpad, wizard,
+  autostart, health, `vm actions`) + filosofia "GUI-first, CLI intact"
+  — usuário comum não abre terminal, power user não perde opção;
+  autostart citado como exemplo do MESMO módulo `vm-control`
+  compartilhado pelos dois front-ends (saída CLI byte-idêntica).
+- RELEASE.md refresh: procedimento "followed through v0.4.1" (189/189
+  no passo 0), gates atualizados — `appstreamcli validate` agora valida
+  as screenshots por URL raw (precisa de rede; `--no-net` pula), novo
+  `desktop-file-validate` no passo 0, clippy adicionado, e o passo 3b
+  (`ui-lifecycle.sh`) promovido a GATE de release desde v0.4.1.
+  Contagem de ações: 49 em v0.4.1 (inalterada).
+- Bump 0.4.1 em todos os pontos do ritual: workspace `Cargo.toml` (+
+  `Cargo.lock` regenerado), Flatpak manifest `"tag": "v0.4.1"`,
+  metainfo com entrada `<release version="0.4.1">` (resumo do ciclo),
+  `CHANGELOG.md` [Unreleased]→[0.4.1] com stub novo [Unreleased];
+  PKGBUILD intacto (pkgver via `git describe`).
+- Gates: workspace **189/189**, clippy 0, `appstreamcli validate` ✔
+  (com rede — URLs raw das screenshots resolvendo) e
+  `desktop-file-validate` ✔.
+- Smoke release (stub, dirs novos): `vm actions` = **49**; selectVoice
+  robot ok; getHealth ok (voice robot); 7 presets semeados; setMuted
+  ok; getVoices ok; getInstantReplay (enabled, 30 s); addHotkey
+  PushToTalk + SaveReplay ok (shape `codes` evdev) e listHotkeys = 2.
+- `packaging/smoke/ui-lifecycle.sh` na sessão real com o vm-ui release:
+  **SMOKE_OK** — close→tray ("running in the tray"), boot `--minimized`
+  → Show → close → Quit, boot windowless provado (attaches=0 toplevels=0)
+  e Show real (attaches=32).
+- AppImage: `VoicemodLinux-0.4.1-x86_64.AppImage` (18.233.848 bytes),
+  extração + `ldd vm-ui` sem "not found" (bundle resolve as libs) +
+  `vm actions` = 49 dentro do AppDir.
