@@ -19,6 +19,19 @@ semantic versioning.
   SVG plus 256/512 px PNGs under `packaging/icons/hicolor/` for every
   packaging path (AUR, Flatpak, AppImage).
 
+### Added (autostart from the UI, F-0.4.1.B)
+
+- "Start with the system" is now a checkbox in a new "⚙ Preferences"
+  dialog in vm-ui (top bar): it installs/removes the XDG autostart
+  entry (`vm-ui --minimized` at login), reports enable/disable warnings
+  inline, and shows the live daemon unit state. In the Flatpak sandbox
+  the switch gives way to an explanation (autostart belongs to the
+  permission store there). The dialog and `vm autostart
+  enable|disable|status` are two front-ends of the SAME code: the
+  autostart module moved from vm-cli into vm-control (tests came
+  along), the CLI output stays byte-identical, and both can never
+  disagree again.
+
 ### Fixed (tray / close lifecycle, vm-ui)
 
 - The window "X" now hides for real: the window is a disposable

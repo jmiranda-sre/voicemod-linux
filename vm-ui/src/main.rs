@@ -66,6 +66,13 @@ struct VmApp<'a> {
     wizard: wizard::Wizard,
     /// Fast level polling currently requested (mirrors `wizard.open`).
     wizard_fast: bool,
+    /// Preferences dialog (F-0.4.1.B): XDG autostart toggle + daemon
+    /// unit state, backed by `vm_control::autostart` — the same code
+    /// `vm autostart` runs on the CLI.
+    prefs_open: bool,
+    prefs_status: Option<vm_control::autostart::Status>,
+    /// Last enable/disable outcome: (is_error, text).
+    prefs_note: Option<(bool, String)>,
 }
 
 impl<'a> VmApp<'a> {
@@ -108,6 +115,9 @@ impl<'a> VmApp<'a> {
             eq_selected: None,
             wizard: wizard::Wizard::first_run(&Self::config_dir()),
             wizard_fast: false,
+            prefs_open: false,
+            prefs_status: None,
+            prefs_note: None,
         };
         app.refresh_presets();
         app
@@ -439,6 +449,13 @@ impl eframe::App for VmApp<'_> {
                 if ui.button("Setup wizard").clicked() {
                     self.wizard.open = true;
                 }
+                if ui.button("⚙ Preferences").clicked() {
+                    // Load fresh state right when the dialog opens (the
+                    // CLI may have changed things since boot).
+                    self.prefs_open = true;
+                    self.prefs_status = Some(vm_control::autostart::status());
+                    self.prefs_note = None;
+                }
                 ui.separator();
                 if self.daemon_child.is_some() {
                     if ui.button("Stop daemon").clicked() {
@@ -503,6 +520,13 @@ impl eframe::App for VmApp<'_> {
             self.wizard.feed(snap.levels.mic_db, dt);
             let ctx = ui.ctx().clone();
             self.wizard_ui(&ctx, &snap);
+        }
+
+        // Preferences dialog (F-0.4.1.B) — independent of the daemon
+        // link: autostart is a local file + systemctl --user operation.
+        if self.prefs_open {
+            let ctx = ui.ctx().clone();
+            self.prefs_ui(&ctx);
         }
     }
 }
@@ -1089,6 +1113,95 @@ impl VmApp<'_> {
                 if snap.midi.learning { " · capturing…" } else { "" }
             ));
         });
+    }
+
+    /// Preferences dialog (F-0.4.1.B): "Start with the system" toggle
+    /// for the XDG autostart entry plus the daemon unit state.
+    /// All the work happens in `vm_control::autostart` — the same code
+    /// `vm autostart` runs on the CLI, so both fronts always agree.
+    fn prefs_ui(&mut self, ctx: &egui::Context) {
+        let status = self
+            .prefs_status
+            .clone()
+            .unwrap_or_else(vm_control::autostart::status);
+        let mut open = self.prefs_open;
+        let mut toggle: Option<bool> = None;
+        let mut refresh = false;
+        egui::Window::new("Preferences")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.strong("Startup");
+                ui.add_space(2.0);
+                if status.sandboxed {
+                    ui.label(vm_control::autostart::sandbox_guidance());
+                } else {
+                    let mut on = status.desktop_installed;
+                    if ui
+                        .checkbox(
+                            &mut on,
+                            "Start with the system (starts minimized to the tray)",
+                        )
+                        .on_hover_text(
+                            "Install an XDG autostart entry running `vm-ui --minimized` at login",
+                        )
+                        .changed()
+                    {
+                        toggle = Some(on);
+                    }
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.label(status.daemon_summary());
+                        if ui.small_button("refresh").clicked() {
+                            refresh = true;
+                        }
+                    });
+                }
+                if let Some((is_err, text)) = &self.prefs_note {
+                    ui.add_space(6.0);
+                    let color = if *is_err {
+                        egui::Color32::RED
+                    } else {
+                        egui::Color32::GRAY
+                    };
+                    ui.colored_label(color, text);
+                }
+            });
+        self.prefs_open = open;
+        if refresh {
+            self.prefs_status = Some(vm_control::autostart::status());
+        }
+        if let Some(on) = toggle {
+            self.prefs_note = Some(if on {
+                Self::autostart_enable()
+            } else {
+                Self::autostart_disable()
+            });
+            // Reflect the real outcome immediately (install may warn).
+            self.prefs_status = Some(vm_control::autostart::status());
+        }
+    }
+
+    /// Shapes `autostart::enable()`'s outcome for the dialog.
+    fn autostart_enable() -> (bool, String) {
+        match vm_control::autostart::enable() {
+            Ok(notes) => (
+                notes.iter().any(|n| n.starts_with("WARNING")),
+                notes.join("\n"),
+            ),
+            Err(e) => (true, format!("enable failed: {e}")),
+        }
+    }
+
+    /// Shapes `autostart::disable()`'s outcome for the dialog.
+    fn autostart_disable() -> (bool, String) {
+        let notes = vm_control::autostart::disable();
+        (
+            notes.iter().any(|n| n.starts_with("WARNING")),
+            notes.join("\n"),
+        )
     }
 
     /// Setup wizard modal (F-0.4.B item 29).

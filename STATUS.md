@@ -1051,3 +1051,40 @@ Progresso 2026-10-17: **D, A, C e B FECHADAS — ciclo v0.4.0 completo (release 
 - Validação: `desktop-file-validate` OK; `appstreamcli validate` OK;
   WAYLAND_DEBUG na sessão real: `set_app_id("io.github.voicemodlinux.vm")`
   + `set_title("Voicemod Linux")`; workspace 184/184, clippy 0.
+
+## F-0.4.1.B — autostart pela UI (2026-10-17)
+- Módulo MOVIDO: `vm-cli/src/autostart.rs` → `vm-control/src/autostart.rs`
+  (`pub mod autostart`) — uma implementação só para CLI e UI; o vm-cli
+  virou consumidor (`use vm_control::autostart`) e o arquivo local foi
+  removido. Saída de `vm autostart status|enable|disable` provada
+  BYTE-IDÊNTICA: baseline capturada antes do refactor e diffada depois
+  (`enable`/`disable` com HOME + XDG_CONFIG_HOME fakes — a sessão real
+  nunca foi tocada; nesta máquina a unit não existe, então o ramo do
+  systemctl nem é alcançado pelo `enable`).
+- API estruturada: `Status { sandboxed, desktop_installed, desktop_path,
+  unit_path, unit_enabled, unit_active }` + `status()`,
+  `enable() -> Result<Vec<String>, String>`, `disable() -> Vec<String>`,
+  `sandbox_guidance()`, `sandboxed()` (FLATPAK_ID || /.flatpak-info,
+  igual ao hotkeys). `Status::daemon_summary()` é mapeador puro
+  estado→rótulo do diálogo. Internos `_with` recebem `systemctl` por
+  injeção (runner) — testes usam mocks e NUNCA tocam a sessão (nenhum
+  teste executa enable/disable reais; o sandbox branch nem chama
+  systemctl).
+- UI: botão "⚙ Preferences" na top bar (entre wizard e daemon) abre
+  diálogo egui (padrão modal do wizard): checkbox "Start with the
+  system (starts minimized to the tray)", linha do daemon
+  (`daemon_summary`) + `refresh`, nota do último enable/disable (RED p/
+  erro/WARNING), e no Flatpak o toggle dá lugar ao `sandbox_guidance()`.
+  Estado lido ao abrir o diálogo e re-lido após cada mudança (CLI pode
+  ter mexido entre aberturas). `enable()` usa `current_exe()`
+  (ui_exec do módulo) — o Exec gravado aponta para o binário em uso.
+- Testes: 4 migrados + 5 novos (enable sem unit não chama systemctl;
+  enable com unit chama `enable --now` via mock; disable cobre os 3
+  ramos; status mapeia e pula systemctl no sandbox; variantes de
+  daemon_summary). Workspace 189/189, clippy 0.
+- Prova visual (sessão real): diálogo capturado via KWin Scripting
+  (script ativa a janela por caption EXATO + keepAbove; spectacle -a
+  captura a janela ativa) — checkbox, "daemon autostart: not installed"
+  e refresh renderizando; botão na top bar e título "Voicemod Linux"
+  na mesma captura. Patch temporário de abertura automática revertido
+  (grep TEMP-SMOKE = 0); keepAbove do Konsole restaurado pelo script.

@@ -6,6 +6,7 @@
 //! - Hotkeys via Linux `evdev` (replaces RawInput).
 
 pub mod actions;
+pub mod autostart;
 pub mod hotkeys;
 pub mod server;
 pub mod settings;

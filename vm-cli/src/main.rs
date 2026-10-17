@@ -4,11 +4,11 @@
 //! moves this onto the WebSocket Control API as its first client).
 
 mod api;
-mod autostart;
 
 use clap::{Parser, Subcommand};
 use vm_audio::backend::stub::StubBackend;
 use vm_audio::{AudioBackend, StreamTopology, DeviceUid};
+use vm_control::autostart;
 
 #[derive(Debug, Parser)]
 #[command(name = "vm", about = "Voicemod-Linux headless control (clean-room)")]
