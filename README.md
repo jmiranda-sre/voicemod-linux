@@ -252,7 +252,10 @@ unaffected. Left-click (or the menu) shows it again; the menu carries
 a live mute checkmark and Quit. `vm-ui --minimized` boots straight
 into the tray. No tray in the Flatpak sandbox (no SNI host there by
 design): the window stays a normal window and autostart is owned by
-the Flatpak Background permission instead.
+the Flatpak Background permission instead. Tabs: *Voices* (presets,
+parameters, EQ), *Soundboard* (sounds, instant replay, passthrough),
+*Devices* (input / output / virtual+monitor), *Integrations* (monitor
+mix, ducking, OBS, MIDI) and *Health*.
 
 ### Presets and soundboard
 
@@ -279,6 +282,50 @@ xruns and watchdog restarts — the same data `getHealth` returns over
 the Control API. If the link dies or xruns storm, the daemon's watchdog
 reopens the pipeline automatically (10 s attempt cooldown) and records
 the reason there.
+
+### Route an app through the soundboard bus (passthrough)
+
+Feed any application — a call, a game, music — through the same
+pipeline the soundboard uses, and out through the output you choose:
+
+```bash
+vm call '{"action":"listPassthroughApps"}'         # pickable streams
+vm call '{"action":"setPassthrough","enabled":true,"app":"Firefox"}'
+vm call '{"action":"setPassthrough","device":""}'  # "" = system default
+vm call '{"action":"getPassthrough"}'
+```
+
+The daemon creates a `vm-passthrough` sink and a 20 ms loopback to the
+target output; exactly the selected app is moved onto the sink and
+every other stream is restored to where it was. The action is
+declarative — re-running it converges — and an unknown app name fails
+loudly, with both the config and the backend rolled back. While it is
+on, soundboard sounds are injected into the same sink (`vm-inject`),
+so your listeners hear them too; a daemon restart re-applies the saved
+state and stale sinks from a crashed session are adopted and cleaned.
+
+EasyEffects note: its *Process all output streams* option re-routes
+every stream to `easyeffects_sink` and will fight any third-party move
+(pavucontrol, Soundux, this feature) — disable that option or
+blocklist the app to use passthrough.
+
+### Instant replay (30 s)
+
+Every output frame lands in a rolling 30-second ring (tapped after the
+master mute, so muted audio never sneaks into the file). Save the last
+window — a quote from the call, a clutch play — whenever you want:
+
+```bash
+vm call '{"action":"setInstantReplay","enabled":true,"seconds":30}'
+vm call '{"action":"getInstantReplay"}'   # enabled, seconds, buffered_seconds
+vm call '{"action":"saveInstantReplay"}'  # → ~/.config/vm/replays/replay-<unix>.wav
+```
+
+Or bind the `SaveReplay` hotkey and never touch the terminal. Files
+are PCM16 stereo 48 kHz written with no extra dependencies; the
+real-time thread only snapshots the ring under `try_lock` and the WAV
+write happens off the audio path. Disabling the feature clears the
+buffer.
 
 ### Ready-made mic preset
 
@@ -322,6 +369,30 @@ a switch drops live channel state while carrying the learned floor
 across (re-capture the profile afterwards anyway for the exact room).
 The *Health* tab proves the gain: per-node `lat ms` plus the chain
 total, next to the µs CPU cost.
+
+### First-run setup wizard
+
+The first UI launch opens a guided calibration ("perfect audio in a
+minute"): a visual microphone test, a 3-second room-noise measurement,
+a suggested gate threshold (measured floor + 6 dB, clamped to the
+preset's declared range), a speech-level pass that sizes the makeup
+gain toward −18 dBFS, and a limiter trim — every suggestion applies
+with one click, and measuring the noise floor also captures the
+denoiser's noise profile into the active preset. A `wizard.json`
+marker in the config dir remembers the run; *Setup wizard* in the top
+bar reopens it any time. Levels refresh at 100 ms while it is open and
+return to the normal pace afterwards.
+
+### Graphic EQ
+
+Every biquad in the active voice appears as a draggable handle on the
+response curve in the *Voices* tab: horizontal = frequency, vertical =
+gain (double-click resets it), and the sliders under the canvas
+fine-tune frequency, Q and gain of the selected band. The curve is
+computed with the same biquad math the DSP runs
+(`biquad_magnitude_db`), so what you see is what you hear — the
+analytic response is cross-checked against the measured filter in the
+test suite.
 
 ### Studio-grade DSP nodes
 

@@ -1,8 +1,9 @@
-//! Settings schemas for the F-0.4.C integrations: hear-myself monitor,
-//! sidechain ducking, obs-websocket and MIDI learn.
+//! Settings schemas for the F-0.4.C integrations (hear-myself monitor,
+//! sidechain ducking, obs-websocket and MIDI learn) and the F-0.4.B
+//! additions (instant replay, per-application passthrough).
 //!
 //! These types are at once the wire shape of their control actions and
-//! (config schema v3) sections of `config.json`. Field names stay
+//! (config schema v3/v4) sections of `config.json`. Field names stay
 //! snake_case on the wire, matching the rest of the catalogue.
 
 use serde::{Deserialize, Serialize};
@@ -224,6 +225,57 @@ fn default_true() -> bool {
     true
 }
 
+/// F-0.4.B item 20 — Instant Replay: a rolling ring buffer of the final
+/// `vm-mic` mix; the `saveInstantReplay` action (or a hotkey) writes the
+/// last `seconds` to a WAV under `<config>/replays/`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReplayConfig {
+    pub enabled: bool,
+    /// Rolling window length in seconds; clamped to 5..=120.
+    pub seconds: u32,
+}
+
+impl Default for ReplayConfig {
+    fn default() -> Self {
+        // Always-on by default: capture costs one interleaved memcpy per
+        // quantum and makes the feature "just work" on first keypress.
+        Self { enabled: true, seconds: 30 }
+    }
+}
+
+impl ReplayConfig {
+    /// Sanitize API-supplied values.
+    pub fn clamp(&mut self) {
+        self.seconds = self.seconds.clamp(5, 120);
+    }
+}
+
+/// F-0.4.B item 18 — per-application passthrough (Soundux-style): a
+/// `vm-passthrough` virtual sink receives the target application's audio
+/// plus the soundboard bus, and a loopback forwards the mix to a real
+/// output. The application may be moved automatically (pulse clients) or
+/// pick the sink manually in its own settings.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PassthroughConfig {
+    pub enabled: bool,
+    /// Output sink **name** (pactl world, e.g. `alsa_output.pci-...`);
+    /// empty = system default sink.
+    pub device: String,
+    /// Application name (pulse `application.name`) to route through the
+    /// passthrough sink; empty = move nothing (manual device selection).
+    pub app: String,
+}
+
+impl PassthroughConfig {
+    /// Sanitize API-supplied values.
+    pub fn clamp(&mut self) {
+        self.device = self.device.trim().to_string();
+        self.app = self.app.trim().to_string();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +348,38 @@ mod tests {
             ..cfg.bindings[0].clone()
         };
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn replay_defaults_and_clamp() {
+        let r = ReplayConfig::default();
+        assert!(r.enabled, "instant replay is always-on by default");
+        assert_eq!(r.seconds, 30);
+        let mut r = ReplayConfig { enabled: false, seconds: 1000 };
+        r.clamp();
+        assert_eq!(r.seconds, 120, "window clamps to 120 s");
+        let mut r = ReplayConfig { seconds: 1, ..Default::default() };
+        r.clamp();
+        assert_eq!(r.seconds, 5, "floor is 5 s");
+        let v = serde_json::to_value(ReplayConfig::default()).unwrap();
+        assert_eq!(v, serde_json::json!({ "enabled": true, "seconds": 30 }));
+    }
+
+    #[test]
+    fn passthrough_defaults_and_clamp() {
+        let p = PassthroughConfig::default();
+        assert!(!p.enabled, "passthrough is opt-in");
+        assert!(p.device.is_empty() && p.app.is_empty());
+        let mut p = PassthroughConfig {
+            enabled: true,
+            device: "  alsa_output.pci-0000:00:1f.3  ".into(),
+            app: " Discord ".into(),
+        };
+        p.clamp();
+        assert_eq!(p.device, "alsa_output.pci-0000:00:1f.3");
+        assert_eq!(p.app, "Discord");
+        let v = serde_json::to_value(PassthroughConfig::default()).unwrap();
+        assert_eq!(v, serde_json::json!({ "enabled": false, "device": "", "app": "" }));
     }
 
     #[test]

@@ -23,6 +23,8 @@ pub const RT_PRIORITY: i32 = 70;
 pub const VIRTUAL_SOURCE_NAME: &str = "vm-mic";
 /// Name of the local monitor sink (hear-myself path).
 pub const MONITOR_SINK_NAME: &str = "vm-monitor";
+/// Name of the per-application passthrough sink (F-0.4.B item 18).
+pub const PASSTHROUGH_SINK_NAME: &str = "vm-passthrough";
 
 /// Device role in the streaming topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -33,6 +35,9 @@ pub enum DeviceRole {
     Virtual,
     /// Local monitor / hear-myself output.
     Monitor,
+    /// Physical playback device — speakers/headphones (F-0.4.B, sinks
+    /// are selectable targets for monitor and passthrough).
+    Sink,
 }
 
 /// Opaque device identifier (UID string, compared by exact match).
@@ -76,6 +81,9 @@ pub enum StreamKind {
     HalfDuplexPlayback,
     /// DSP → local monitor.
     Monitor,
+    /// Soundboard bus → passthrough sink (F-0.4.B item 18). Auxiliary:
+    /// its xruns never feed the core-pipeline watchdog.
+    Inject,
 }
 
 /// Why a stream stopped / needs restart.
@@ -219,6 +227,15 @@ pub trait StreamProcessor: Send {
     fn monitor_bus(&self) -> &[f32] {
         &[]
     }
+
+    /// Interleaved **stereo** soundboard bus (frames × 2, L/R) for the
+    /// per-application passthrough sink (F-0.4.B item 18): the full
+    /// soundboard mix (VAD-routed + monitor-only), post ducking, without
+    /// the mic voice. Empty slice = silence. Same RT constraints as
+    /// [`StreamProcessor::monitor_bus`].
+    fn inject_bus(&self) -> &[f32] {
+        &[]
+    }
 }
 
 /// Hear-myself monitor settings (F-0.4.C item 15). `mix` blends the raw
@@ -250,8 +267,37 @@ impl MonitorSettings {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-application passthrough (F-0.4.B item 18).
+// ---------------------------------------------------------------------------
+
+/// One application output stream (pulse `sink-input`) as seen by the
+/// passthrough picker.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AppStream {
+    /// Pulse sink-input index (stable for the stream's lifetime).
+    pub id: u32,
+    /// `application.name` (e.g. "Discord").
+    pub app: String,
+    /// `media.name` (stream description; may be empty).
+    pub name: String,
+    /// Current sink **name** (pactl world).
+    pub sink: String,
+}
+
+/// Passthrough settings: `device` is the target sink **name** (empty =
+/// system default), `app` is the `application.name` to move onto the
+/// `vm-passthrough` sink (empty = move nothing).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PassthroughSettings {
+    pub enabled: bool,
+    pub device: String,
+    pub app: String,
+}
+
 /// Audio backend: enumerate → open(topology) → start/stop, with hotplug.
-pub trait AudioBackend: Send {    fn enumerate(&mut self) -> Result<Vec<AudioDevice>, AudioError>;
+pub trait AudioBackend: Send {
+    fn enumerate(&mut self) -> Result<Vec<AudioDevice>, AudioError>;
     fn open(&mut self, topology: &StreamTopology) -> Result<(), AudioError>;
     fn start(&mut self) -> Result<(), AudioError>;
     fn stop(&mut self, reason: StreamStopReason) -> Result<(), AudioError>;
@@ -275,6 +321,20 @@ pub trait AudioBackend: Send {    fn enumerate(&mut self) -> Result<Vec<AudioDev
     /// as a no-op (backends without a monitor path, e.g. the stub).
     fn set_monitor(&mut self, _settings: &MonitorSettings) -> Result<(), AudioError> {
         Ok(())
+    }
+
+    /// List application output streams (pulse sink-inputs) for the
+    /// passthrough picker (F-0.4.B item 18). Default: unsupported.
+    fn output_streams(&mut self) -> Result<Vec<AppStream>, AudioError> {
+        Err(AudioError::Backend("no output-stream enumeration support".into()))
+    }
+
+    /// Converge the per-application passthrough to `settings` (F-0.4.B
+    /// item 18): `vm-passthrough` sink + loopback to `device` + optional
+    /// app move + soundboard injection stream. Idempotent. Default:
+    /// unsupported (the stub overrides it with an in-memory model).
+    fn set_passthrough(&mut self, _settings: &PassthroughSettings) -> Result<(), AudioError> {
+        Err(AudioError::Backend("no passthrough support".into()))
     }
 
     /// Create the virtual source if missing; returns its uid either way.

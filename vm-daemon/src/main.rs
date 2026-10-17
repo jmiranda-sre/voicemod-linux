@@ -4,6 +4,9 @@
 //! API + global hotkeys. `--live` selects the real PipeWire backend
 //! (falls back to the stub with a clear message when unreachable).
 
+mod replay;
+
+use replay::{replay_path, write_wav_pcm16, ReplayRing};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
@@ -11,13 +14,13 @@ use std::sync::{
     Arc, Mutex,
 };
 use vm_audio::{
-    AudioBackend, DeviceRole, MonitorSettings, StreamProcessor, StreamStopReason, StreamTopology,
-    SAMPLE_RATE,
+    AudioBackend, DeviceRole, MonitorSettings, PassthroughSettings, StreamProcessor,
+    StreamStopReason, StreamTopology, SAMPLE_RATE,
 };
 use vm_control::{
     Action, ControlApiServer, ControlEvent, ControlHandler, ControlReply, DuckingConfig,
     HotkeyManager, HotkeyTarget, Keybind, MidiBinding, MidiConfig, MidiEvent, MidiKind,
-    MidiTarget, MonitorConfig, ObsConfig, ServerConfig,
+    MidiTarget, MonitorConfig, ObsConfig, PassthroughConfig, ReplayConfig, ServerConfig,
 };
 use vm_dsp::{Graph, NodeConstructorContext, NodeFactory, NodeId, ProcessContext};
 
@@ -94,12 +97,21 @@ struct GraphProcessor {
     /// Interleaved stereo monitor-only bus (`mon − vad`), returned by
     /// `monitor_bus()` for the hear-myself mix.
     mon_extra: Vec<f32>,
+    /// Interleaved stereo full soundboard bus (post ducking, no voice)
+    /// returned by `inject_bus()` for the passthrough injection (18).
+    inj_extra: Vec<f32>,
+    /// Instant replay ring (F-0.4.B item 20): the final outputs are
+    /// appended under `try_lock` (a contended lock skips the quantum).
+    replay: Arc<Mutex<ReplayRing>>,
     /// Smoothed duck gain in dB (0 = unity).
     duck_db: f32,
     speech: bool,
 }
 
 impl GraphProcessor {
+    // Each store is an independent RT-shared handle; bundling them in a
+    // struct would only add a name for the same wiring.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         graph: Arc<Mutex<Graph>>,
         voice_enabled: Arc<AtomicBool>,
@@ -108,6 +120,7 @@ impl GraphProcessor {
         mixer: Arc<Mutex<vm_soundboard::SoundboardMixer>>,
         ducking: Arc<DuckingRt>,
         levels: Arc<Mutex<LevelsSnapshot>>,
+        replay: Arc<Mutex<ReplayRing>>,
     ) -> Self {
         Self {
             graph,
@@ -122,6 +135,8 @@ impl GraphProcessor {
             vad_bus: vm_soundboard::StereoBus::default(),
             mon_bus: vm_soundboard::StereoBus::default(),
             mon_extra: Vec::new(),
+            inj_extra: Vec::new(),
+            replay,
             duck_db: 0.0,
             speech: false,
         }
@@ -138,6 +153,7 @@ impl GraphProcessor {
             state.mixer.clone(),
             state.ducking_rt.clone(),
             state.levels.clone(),
+            state.replay_ring.clone(),
         )
     }
 
@@ -226,6 +242,13 @@ impl GraphProcessor {
             self.mon_extra[f * 2] = l;
             self.mon_extra[f * 2 + 1] = r;
         }
+        // Full soundboard bus for the passthrough injection: the monitor
+        // bus verbatim (post ducking; no mic voice rides either bus).
+        self.inj_extra.resize(frames * 2, 0.0);
+        for f in 0..frames {
+            self.inj_extra[f * 2] = self.mon_bus.left.get(f).copied().unwrap_or(0.0);
+            self.inj_extra[f * 2 + 1] = self.mon_bus.right.get(f).copied().unwrap_or(0.0);
+        }
     }
 }
 
@@ -294,6 +317,15 @@ impl StreamProcessor for GraphProcessor {
                 dst[..n].fill(0.0);
             }
         }
+        // Instant replay (20) taps the final output — post mute, i.e.
+        // exactly what left the vm-mic. `try_lock` keeps a saving thread
+        // out of the RT path (a contended lock skips this quantum).
+        if outputs.len() >= 2 {
+            let n = frames.min(outputs[0].len()).min(outputs[1].len());
+            if let Ok(mut ring) = self.replay.try_lock() {
+                ring.push_stereo(&outputs[0][..n], &outputs[1][..n]);
+            }
+        }
         if let Ok(mut lv) = self.levels.try_lock() {
             lv.mic_db = mic_db;
             lv.out_db = self.output_level(outputs, frames);
@@ -303,6 +335,10 @@ impl StreamProcessor for GraphProcessor {
 
     fn monitor_bus(&self) -> &[f32] {
         &self.mon_extra
+    }
+
+    fn inject_bus(&self) -> &[f32] {
+        &self.inj_extra
     }
 }
 
@@ -348,6 +384,12 @@ struct DaemonState {
     midi: Mutex<MidiConfig>,
     /// MIDI input runtime state (learn target + connected flag).
     midi_runtime: Arc<Mutex<MidiRuntime>>,
+    /// Instant replay settings (persisted config v4, F-0.4.B 20).
+    replay: Mutex<ReplayConfig>,
+    /// Instant replay ring shared with the RT processor.
+    replay_ring: Arc<Mutex<ReplayRing>>,
+    /// Per-application passthrough settings (persisted config v4, 18).
+    passthrough: Mutex<PassthroughConfig>,
     /// Live level snapshot (mic/output RMS + speech) for `getLevels`.
     levels: Arc<Mutex<LevelsSnapshot>>,
     /// watch channel notifying the obs-websocket bridge of config changes.
@@ -508,6 +550,8 @@ impl DaemonState {
             ducking: self.ducking.lock().unwrap().clone(),
             obs: self.obs.lock().unwrap().clone(),
             midi: self.midi.lock().unwrap().clone(),
+            replay: self.replay.lock().unwrap().clone(),
+            passthrough: self.passthrough.lock().unwrap().clone(),
         }
     }
 
@@ -543,6 +587,57 @@ impl DaemonState {
         })
     }
 
+    /// Mirror replay settings into the shared ring (boot + every set).
+    fn apply_replay(&self, cfg: &ReplayConfig) {
+        let mut ring = self.replay_ring.lock().unwrap();
+        ring.configure(cfg.seconds, SAMPLE_RATE);
+        ring.set_enabled(cfg.enabled);
+    }
+
+    /// Apply passthrough settings to the backend (moves apps, loads the
+    /// loopback) and return the broadcast event for the new state.
+    fn apply_passthrough(&self, cfg: &PassthroughConfig) -> Result<ControlEvent, String> {
+        let settings = PassthroughSettings {
+            enabled: cfg.enabled,
+            device: cfg.device.clone(),
+            app: cfg.app.clone(),
+        };
+        let mut audio = self.audio.lock().unwrap();
+        audio.set_passthrough(&settings).map_err(|e| e.to_string())?;
+        Ok(ControlEvent::PassthroughChanged {
+            enabled: cfg.enabled,
+            device: cfg.device.clone(),
+            app: cfg.app.clone(),
+        })
+    }
+
+    /// Snapshot the replay ring and write `<config>/replays/replay-<unix>.wav`.
+    /// The copy happens under the ring lock; the file write outside it.
+    fn save_replay(&self) -> Result<(String, ControlEvent), String> {
+        let cfg = self.replay.lock().unwrap().clone();
+        if !cfg.enabled {
+            return Err("instant replay is disabled".into());
+        }
+        let snap = self.replay_ring.lock().unwrap().snapshot();
+        if snap.is_empty() {
+            return Err("replay buffer is empty (stream not running?)".into());
+        }
+        let config_dir = self
+            .config_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let path = replay_path(&config_dir, unix_now());
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("create {}: {e}", dir.display()))?;
+        }
+        write_wav_pcm16(&path, &snap, SAMPLE_RATE, replay::WAV_CHANNELS)
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+        let shown = path.display().to_string();
+        Ok((shown.clone(), ControlEvent::ReplaySaved { path: shown }))
+    }
+
     fn obs_status_json(&self) -> serde_json::Value {
         let st = self.obs_status.lock().unwrap();
         // Before the bridge connects, report the configured endpoint so
@@ -556,6 +651,7 @@ impl DaemonState {
             "connected": st.connected,
             "scene": st.scene,
             "url": url,
+            "enabled": self.obs.lock().unwrap().enabled,
         })
     }
 
@@ -1352,6 +1448,112 @@ impl ControlHandler for DaemonState {
                 let v = serde_json::to_value(&*cfg).unwrap_or(serde_json::Value::Null);
                 (ControlReply::ok_data(v), Vec::new())
             }
+            Action::SetInstantReplay { enabled, seconds } => {
+                let next = {
+                    let cfg = self.replay.lock().unwrap();
+                    let mut n = cfg.clone();
+                    if let Some(v) = enabled {
+                        n.enabled = *v;
+                    }
+                    if let Some(v) = seconds {
+                        n.seconds = *v;
+                    }
+                    n.clamp();
+                    n
+                };
+                match self.transact_section(&self.replay, |c| {
+                    *c = next.clone();
+                    Ok(())
+                }) {
+                    Ok(()) => {
+                        self.apply_replay(&next);
+                        let v = serde_json::json!({
+                            "enabled": next.enabled,
+                            "seconds": next.seconds,
+                        });
+                        (ControlReply::ok_data(v), Vec::new())
+                    }
+                    Err(e) => (ControlReply::err(e), Vec::new()),
+                }
+            }
+            Action::GetInstantReplay => {
+                let cfg = self.replay.lock().unwrap().clone();
+                let buffered = self.replay_ring.lock().unwrap().filled_frames() as f64
+                    / SAMPLE_RATE as f64;
+                let mut v = serde_json::to_value(&cfg).unwrap_or(serde_json::Value::Null);
+                if let Some(o) = v.as_object_mut() {
+                    o.insert(
+                        "buffered_seconds".into(),
+                        serde_json::json!((buffered * 100.0).round() / 100.0),
+                    );
+                }
+                (ControlReply::ok_data(v), Vec::new())
+            }
+            Action::SaveInstantReplay => match self.save_replay() {
+                Ok((path, evt)) => (
+                    ControlReply::ok_data(serde_json::json!({ "path": path })),
+                    vec![evt],
+                ),
+                Err(e) => (ControlReply::err(e), Vec::new()),
+            },
+            Action::ListPassthroughApps => {
+                // Lock released before serializing: the backend call may
+                // block on pactl, the reply building never holds it.
+                let res = self.audio.lock().unwrap().output_streams();
+                match res {
+                    Ok(apps) => (
+                        ControlReply::ok_data(serde_json::json!({ "apps": apps })),
+                        Vec::new(),
+                    ),
+                    Err(e) => (ControlReply::err(e.to_string()), Vec::new()),
+                }
+            }
+            Action::GetPassthrough => {
+                let cfg = self.passthrough.lock().unwrap();
+                let v = serde_json::to_value(&*cfg).unwrap_or(serde_json::Value::Null);
+                (ControlReply::ok_data(v), Vec::new())
+            }
+            Action::SetPassthrough { enabled, device, app } => {
+                let next = {
+                    let cfg = self.passthrough.lock().unwrap();
+                    let mut n = cfg.clone();
+                    if let Some(v) = enabled {
+                        n.enabled = *v;
+                    }
+                    if let Some(v) = device {
+                        n.device = v.clone();
+                    }
+                    if let Some(v) = app {
+                        n.app = v.clone();
+                    }
+                    n.clamp();
+                    n
+                };
+                let prev = self.passthrough.lock().unwrap().clone();
+                // Same discipline as `setMonitor`: persist, then apply; a
+                // failing apply rolls the section back so disk and system
+                // can never disagree.
+                match self.transact_section(&self.passthrough, |c| {
+                    *c = next.clone();
+                    Ok(())
+                }) {
+                    Ok(()) => match self.apply_passthrough(&next) {
+                        Ok(evt) => (ControlReply::ok(), vec![evt]),
+                        Err(e) => {
+                            // Restore disk *and* re-converge the backend:
+                            // a mid-apply failure can leave apps moved
+                            // (e.g. the picked app just closed).
+                            let _ = self.transact_section(&self.passthrough, |c| {
+                                *c = prev.clone();
+                                Ok(())
+                            });
+                            let _ = self.apply_passthrough(&prev);
+                            (ControlReply::err(format!("passthrough: {e}")), Vec::new())
+                        }
+                    },
+                    Err(e) => (ControlReply::err(e), Vec::new()),
+                }
+            }
             Action::SetDucking { enabled, depth_db, threshold_db, attack_ms, release_ms } => {
                 let next = {
                     let cfg = self.ducking.lock().unwrap();
@@ -1479,6 +1681,7 @@ impl ControlHandler for DaemonState {
                         "learning": rt.learn.is_some(),
                         "port": cfg.port,
                         "bindings": cfg.bindings.len(),
+                        "enabled": cfg.enabled,
                     })),
                     Vec::new(),
                 )
@@ -1590,6 +1793,7 @@ fn hotkey_action(target: &HotkeyTarget, pressed: bool, state: &DaemonState) -> O
             Some(Action::SelectVoice { voice: name.clone() })
         }
         HotkeyTarget::StopAllSounds if pressed => Some(Action::StopAllSounds),
+        HotkeyTarget::SaveReplay if pressed => Some(Action::SaveInstantReplay),
         _ => None,
     }
 }
@@ -1861,6 +2065,8 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
     let mut ducking = DuckingConfig::default();
     let mut obs = ObsConfig::default();
     let mut midi = MidiConfig::default();
+    let mut replay = ReplayConfig::default();
+    let mut passthrough = PassthroughConfig::default();
     match load_daemon_config_file(&config_path) {
         Ok(cfg) => {
             if !cfg.hotkeys.is_empty() {
@@ -1883,12 +2089,19 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
             ducking = cfg.ducking;
             obs = cfg.obs;
             midi = cfg.midi;
+            replay = cfg.replay;
+            passthrough = cfg.passthrough;
         }
         Err(e) => eprintln!("config: {e} (starting empty)"),
     }
 
     let ducking_rt = Arc::new(DuckingRt::default());
     let (obs_tx, obs_rx) = tokio::sync::watch::channel(obs.clone());
+    let replay_ring = {
+        let mut ring = ReplayRing::new(replay.seconds, SAMPLE_RATE);
+        ring.set_enabled(replay.enabled);
+        Arc::new(Mutex::new(ring))
+    };
     let state = Arc::new(DaemonState {
         graph: Arc::new(Mutex::new(Graph::new())),
         node_ids: Mutex::new(HashMap::new()),
@@ -1912,6 +2125,9 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
         obs_status: Arc::new(Mutex::new(ObsStatus::default())),
         midi: Mutex::new(midi),
         midi_runtime: Arc::new(Mutex::new(MidiRuntime::default())),
+        replay: Mutex::new(replay),
+        replay_ring: replay_ring.clone(),
+        passthrough: Mutex::new(passthrough),
         levels: Arc::new(Mutex::new(LevelsSnapshot::default())),
         obs_tx,
     });
@@ -1935,6 +2151,7 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
         state.mixer.clone(),
         state.ducking_rt.clone(),
         state.levels.clone(),
+        state.replay_ring.clone(),
     )));
     // Preload sounds (decode+resample now; never on the trigger path).
     {
@@ -1996,6 +2213,21 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
         topo
     };
     *state.topology.lock().unwrap() = Some(topo.clone());
+    // Boot-apply the persisted sections the backend owns (monitor 15,
+    // passthrough 18): loading the config into memory is not enough — a
+    // reboot must reproduce the last known-good routing.
+    {
+        let cfg = state.monitor.lock().unwrap().clone();
+        if let Err(e) = state.apply_monitor(&cfg) {
+            eprintln!("monitor: boot apply failed: {e}");
+        }
+    }
+    if state.passthrough.lock().unwrap().enabled {
+        let cfg = state.passthrough.lock().unwrap().clone();
+        if let Err(e) = state.apply_passthrough(&cfg) {
+            eprintln!("passthrough: boot apply failed: {e}");
+        }
+    }
     // Boot device profile: a bound input starts on its voice instead of
     // the default (new hardware keeps sounding right across restarts).
     {
@@ -2213,6 +2445,9 @@ fn test_state() -> Arc<DaemonState> {
         obs_status: Arc::new(Mutex::new(ObsStatus::default())),
         midi: Mutex::new(MidiConfig::default()),
         midi_runtime: Arc::new(Mutex::new(MidiRuntime::default())),
+        replay: Mutex::new(ReplayConfig::default()),
+        replay_ring: Arc::new(Mutex::new(ReplayRing::new(30, SAMPLE_RATE))),
+        passthrough: Mutex::new(PassthroughConfig::default()),
         levels: Arc::new(Mutex::new(LevelsSnapshot::default())),
         obs_tx: tokio::sync::watch::channel(ObsConfig::default()).0,
     });
@@ -2567,9 +2802,9 @@ mod hotkey_api_tests {
         // Persisted to config.json with schema version.
         let text = std::fs::read_to_string(&state.config_path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v["version"], 3);
+        assert_eq!(v["version"], 4);
         assert_eq!(v["hotkeys"].as_array().unwrap().len(), 1);
-        // F-0.4.C: the v3 schema always carries the integration sections.
+        // F-0.4.C/B: the v4 schema always carries the integration sections.
         assert!(v["monitor"].is_object());
         assert!(v["ducking"].is_object());
         assert!(v["obs"].is_object());
@@ -3160,7 +3395,7 @@ mod device_profile_tests {
     }
 
     #[test]
-    fn profile_crud_persists_v3() {
+    fn profile_crud_persists_v4() {
         let state = test_state();
         // Empty values rejected.
         let (reply, _) = state.handle(&Action::SetDeviceProfile {
@@ -3179,12 +3414,15 @@ mod device_profile_tests {
             reply.data.unwrap()["profiles"],
             serde_json::json!([{"device": "stub:input:0", "voice": "example-drive"}])
         );
-        // File is schema v3 with the profile + integration sections.
+        // File is schema v4 with the profile + integration sections.
         let text = std::fs::read_to_string(&state.config_path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v["version"], 3);
+        assert_eq!(v["version"], 4);
         assert_eq!(v["device_profiles"]["stub:input:0"], "example-drive");
         assert_eq!(v["ducking"]["enabled"], true, "ducking defaults on");
+        assert_eq!(v["replay"]["enabled"], true, "replay defaults on");
+        assert_eq!(v["replay"]["seconds"], 30);
+        assert_eq!(v["passthrough"]["enabled"], false, "passthrough defaults off");
         // Reload survives a reboot.
         let cfg = load_daemon_config_file(&state.config_path).expect("reload");
         assert_eq!(cfg.device_profiles["stub:input:0"], "example-drive");
@@ -3929,5 +4167,206 @@ mod f04c_tests {
         let (reply, _) = state.handle(&Action::GetMidiStatus);
         assert!(reply.ok);
         assert_eq!(reply.data.unwrap()["bindings"], 1);
+    }
+}
+
+#[cfg(test)]
+mod f04b_tests {
+    use super::*;
+
+    fn run_block(proc: &mut GraphProcessor, input: &[Vec<f32>; 2], out: &mut [Vec<f32>; 2]) {
+        let ins: Vec<&[f32]> = input.iter().map(Vec::as_slice).collect();
+        let mut outs: Vec<&mut [f32]> = out.iter_mut().map(Vec::as_mut_slice).collect();
+        proc.process(48_000, &ins, &mut outs);
+    }
+
+    #[test]
+    fn replay_set_get_clamps_and_persists() {
+        let state = test_state();
+        // Default: always-on, 30 s (the feature "just works").
+        let (reply, _) = state.handle(&Action::GetInstantReplay);
+        let d = reply.data.unwrap();
+        assert_eq!(d["enabled"], true);
+        assert_eq!(d["seconds"], 30);
+        assert_eq!(d["buffered_seconds"], 0.0, "fresh ring is empty");
+
+        let (reply, _) = state.handle(&Action::SetInstantReplay { enabled: None, seconds: Some(1) });
+        assert!(reply.ok, "{:?}", reply.error);
+        assert_eq!(reply.data.unwrap()["seconds"], 5, "clamped to 5..=120");
+
+        let cfg = load_daemon_config_file(&state.config_path).expect("reload");
+        assert!(cfg.replay.enabled);
+        assert_eq!(cfg.replay.seconds, 5);
+    }
+
+    #[test]
+    fn replay_save_writes_wav_when_fed() {
+        let state = test_state();
+        let (reply, _) = state.handle(&Action::SetInstantReplay { enabled: Some(true), seconds: Some(5) });
+        assert!(reply.ok);
+        // Streaming path: dry passthrough makes the output equal the input.
+        state.voice_enabled.store(false, Ordering::Relaxed);
+        let mut proc = GraphProcessor::for_state(&state);
+        let input = [vec![0.25f32; 960], vec![-0.25f32; 960]];
+        let mut out = [vec![0.0f32; 960], vec![0.0f32; 960]];
+        run_block(&mut proc, &input, &mut out);
+
+        let (reply, _) = state.handle(&Action::GetInstantReplay);
+        let buffered = reply.data.unwrap()["buffered_seconds"].as_f64().unwrap();
+        assert!(buffered > 0.0, "ring must report buffered audio");
+
+        // Mute is part of the final output: the tap sits post-mute.
+        state.muted.store(true, Ordering::Relaxed);
+        run_block(&mut proc, &input, &mut out);
+        state.muted.store(false, Ordering::Relaxed);
+        let snap = state.replay_ring.lock().unwrap().snapshot();
+        assert!((snap[snap.len() - 2] - 0.0).abs() < 1e-9, "muted tail must be silence");
+        assert!((snap[0] - 0.25).abs() < 1e-6, "unmuted head keeps the signal");
+
+        let (reply, evts) = state.handle(&Action::SaveInstantReplay);
+        assert!(reply.ok, "{:?}", reply.error);
+        let path = reply.data.unwrap()["path"].as_str().unwrap().to_string();
+        assert!(path.ends_with(".wav"), "{path}");
+        match &evts[0] {
+            ControlEvent::ReplaySaved { path: p } => assert_eq!(p, &path),
+            other => panic!("expected ReplaySaved, got {other:?}"),
+        }
+        let bytes = std::fs::read(&path).expect("replay file");
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        // Two fed blocks of 960 frames each: 1920 stereo frames of PCM16.
+        assert_eq!(bytes.len(), 44 + 1920 * 2 * 2);
+        assert_eq!(
+            i16::from_le_bytes([bytes[44], bytes[45]]),
+            (0.25f32 * 32767.0).round() as i16
+        );
+        assert_eq!(
+            i16::from_le_bytes([bytes[46], bytes[47]]),
+            (-0.25f32 * 32767.0).round() as i16
+        );
+    }
+
+    #[test]
+    fn replay_save_errors_are_clear() {
+        let state = test_state();
+        // Enabled but nothing fed yet: empty buffer.
+        let (reply, _) = state.handle(&Action::SaveInstantReplay);
+        assert!(!reply.ok);
+        assert!(reply.error.unwrap().contains("empty"));
+        // Disabled: says so instead of writing a silent file.
+        let (reply, _) = state.handle(&Action::SetInstantReplay { enabled: Some(false), seconds: None });
+        assert!(reply.ok);
+        let (reply, _) = state.handle(&Action::SaveInstantReplay);
+        assert!(!reply.ok);
+        assert!(reply.error.unwrap().contains("disabled"));
+    }
+
+    #[test]
+    fn replay_hotkey_maps_to_save_action() {
+        let state = test_state();
+        assert_eq!(
+            hotkey_action(&HotkeyTarget::SaveReplay, true, &state),
+            Some(Action::SaveInstantReplay)
+        );
+        assert_eq!(hotkey_action(&HotkeyTarget::SaveReplay, false, &state), None);
+    }
+
+    #[test]
+    fn inject_bus_carries_full_soundboard_mix() {
+        let state = test_state();
+        state.voice_enabled.store(false, Ordering::Relaxed);
+        {
+            // A VAD-routed tone: it reaches vm-mic *and* the inject bus.
+            let mut m = state.mixer.lock().unwrap();
+            m.add_sound(vm_soundboard::LoadedSound {
+                id: vm_soundboard::SoundHashId(21),
+                name: "vad-tone".into(),
+                rate: 48_000,
+                channels: vec![vec![0.4; 256]],
+            });
+            let opts = vm_soundboard::SoundOptions { send_to_vad: true, ..Default::default() };
+            m.play(vm_soundboard::SoundHashId(21), opts).unwrap();
+        }
+        let mut proc = GraphProcessor::for_state(&state);
+        let silent = [vec![0.0f32; 64], vec![0.0f32; 64]];
+        let mut out = [vec![0.0f32; 64], vec![0.0f32; 64]];
+        run_block(&mut proc, &silent, &mut out);
+        let inj = proc.inject_bus();
+        assert_eq!(inj.len(), 128, "interleaved stereo");
+        assert!((inj[0] - 0.4).abs() < 1e-6, "vad sound on inject bus: {}", inj[0]);
+        assert!((inj[1] - 0.4).abs() < 1e-6, "right channel too");
+    }
+
+    #[test]
+    fn passthrough_flow_moves_restores_and_persists() {
+        let state = test_state();
+        // Stub app model advertises Discord.
+        let (reply, _) = state.handle(&Action::ListPassthroughApps);
+        assert!(reply.ok, "{:?}", reply.error);
+        let apps = reply.data.unwrap()["apps"].as_array().unwrap().clone();
+        assert!(apps.iter().any(|a| a["app"] == "Discord"));
+
+        // Enable, targeting Discord on the stub sink.
+        let (reply, evts) = state.handle(&Action::SetPassthrough {
+            enabled: Some(true),
+            device: Some("stub-sink".into()),
+            app: Some("Discord".into()),
+        });
+        assert!(reply.ok, "{:?}", reply.error);
+        match &evts[0] {
+            ControlEvent::PassthroughChanged { enabled, device, app } => {
+                assert!(*enabled);
+                assert_eq!(device, "stub-sink");
+                assert_eq!(app, "Discord");
+            }
+            other => panic!("expected PassthroughChanged, got {other:?}"),
+        }
+        let moved = state.audio.lock().unwrap().output_streams().unwrap();
+        assert_eq!(
+            moved.iter().find(|a| a.app == "Discord").unwrap().sink,
+            "vm-passthrough"
+        );
+        assert_eq!(
+            moved.iter().find(|a| a.app == "FakePlayer").unwrap().sink,
+            "stub-sink",
+            "untargeted apps stay put"
+        );
+
+        // Unknown app: error, config rolled back, backend re-converged.
+        let (reply, _) = state.handle(&Action::SetPassthrough {
+            enabled: None,
+            device: None,
+            app: Some("Ghost".into()),
+        });
+        assert!(!reply.ok);
+        assert!(reply.error.unwrap().contains("Ghost"));
+        let cfg = load_daemon_config_file(&state.config_path).expect("reload");
+        assert_eq!(cfg.passthrough.app, "Discord", "failed set rolled back");
+        assert!(cfg.passthrough.enabled);
+        let after = state.audio.lock().unwrap().output_streams().unwrap();
+        assert_eq!(
+            after.iter().find(|a| a.app == "Discord").unwrap().sink,
+            "vm-passthrough",
+            "backend re-converged to the previous settings"
+        );
+
+        // Disable: app restored, config persisted.
+        let (reply, _) = state.handle(&Action::SetPassthrough {
+            enabled: Some(false),
+            device: None,
+            app: None,
+        });
+        assert!(reply.ok, "{:?}", reply.error);
+        let restored = state.audio.lock().unwrap().output_streams().unwrap();
+        assert_eq!(
+            restored.iter().find(|a| a.app == "Discord").unwrap().sink,
+            "stub-sink"
+        );
+        let (reply, _) = state.handle(&Action::GetPassthrough);
+        let d = reply.data.unwrap();
+        assert_eq!(d["enabled"], false);
+        assert_eq!(d["app"], "Discord", "target kept for next enable");
+        let cfg = load_daemon_config_file(&state.config_path).expect("reload");
+        assert!(!cfg.passthrough.enabled);
     }
 }

@@ -94,6 +94,19 @@ pub enum Action {
     },
     MidiBindRemove { midi_id: u32 },
     ListMidiBindings,
+    /// Instant replay ring (F-0.4.B item 20): rolling window of the final
+    /// `vm-mic` mix. Partial update like the other settings actions.
+    SetInstantReplay { enabled: Option<bool>, seconds: Option<u32> },
+    GetInstantReplay,
+    /// Write the current window to `<config>/replays/replay-*.wav`.
+    SaveInstantReplay,
+    /// Per-application passthrough (F-0.4.B item 18): list pulse output
+    /// streams (apps) with their current sink.
+    ListPassthroughApps,
+    GetPassthrough,
+    /// Partial update: enable/disable the `vm-passthrough` sink + loopback
+    /// and (optionally) move one application onto it.
+    SetPassthrough { enabled: Option<bool>, device: Option<String>, app: Option<String> },
 }
 
 /// Every action name the daemon understands, in catalogue order — the
@@ -144,6 +157,12 @@ pub const ALL_ACTIONS: &[&str] = &[
     "midiBindAdd",
     "midiBindRemove",
     "listMidiBindings",
+    "setInstantReplay",
+    "getInstantReplay",
+    "saveInstantReplay",
+    "listPassthroughApps",
+    "getPassthrough",
+    "setPassthrough",
 ];
 
 /// Inbound control message: action + auth token + optional request id.
@@ -211,6 +230,10 @@ pub enum ControlEvent {
     MidiLearned { midi_id: u32, kind: MidiKind, number: u8, channel: Option<u8>, target: MidiTarget },
     /// MIDI mapping was added or removed.
     MidiBindingsChanged,
+    /// Instant replay window written to disk.
+    ReplaySaved { path: String },
+    /// Passthrough settings changed (full new state).
+    PassthroughChanged { enabled: bool, device: String, app: String },
 }
 
 /// Implemented by whoever owns the live pipeline (the daemon).
@@ -299,8 +322,14 @@ mod action_shape_tests {
             },
             Action::MidiBindRemove { midi_id: 0 },
             Action::ListMidiBindings,
+            Action::SetInstantReplay { enabled: None, seconds: None },
+            Action::GetInstantReplay,
+            Action::SaveInstantReplay,
+            Action::ListPassthroughApps,
+            Action::GetPassthrough,
+            Action::SetPassthrough { enabled: None, device: None, app: None },
         ];
-        assert_eq!(all.len(), 43, "keep this list in sync with the catalogue");
+        assert_eq!(all.len(), 49, "keep this list in sync with the catalogue");
         let names: Vec<String> = all
             .iter()
             .map(|a| {
@@ -360,5 +389,23 @@ mod action_shape_tests {
         // Remove-by-id must never shadow the envelope `id`.
         let v = serde_json::to_value(Action::MidiBindRemove { midi_id: 7 }).unwrap();
         assert_eq!(v["midi_id"], 7);
+    }
+
+    #[test]
+    fn replay_and_passthrough_partial_updates_deserialize() {
+        let a: Action = serde_json::from_str(r#"{"action":"setInstantReplay","seconds":45}"#).unwrap();
+        assert_eq!(a, Action::SetInstantReplay { enabled: None, seconds: Some(45) });
+        let a: Action =
+            serde_json::from_str(r#"{"action":"setPassthrough","enabled":true,"app":"Discord"}"#)
+                .unwrap();
+        assert_eq!(
+            a,
+            Action::SetPassthrough { enabled: Some(true), device: None, app: Some("Discord".into()) }
+        );
+        let v = serde_json::to_value(Action::SetInstantReplay { enabled: Some(false), seconds: None })
+            .unwrap();
+        assert_eq!(v["action"], "setInstantReplay");
+        assert_eq!(v["enabled"], false);
+        assert_eq!(v["seconds"], serde_json::Value::Null);
     }
 }

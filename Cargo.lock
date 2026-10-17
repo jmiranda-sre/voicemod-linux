@@ -5400,6 +5400,7 @@ dependencies = [
  "tokio-tungstenite",
  "tray-icon",
  "vm-control",
+ "vm-dsp",
  "vm-preset",
 ]
 

@@ -18,5 +18,5 @@ pub use hotkeys::{
 pub use server::{dispatch, ControlApiServer, ServerConfig};
 pub use settings::{
     DuckingConfig, MidiBinding, MidiConfig, MidiEvent, MidiKind, MidiTarget, MonitorConfig,
-    ObsConfig,
+    ObsConfig, PassthroughConfig, ReplayConfig,
 };

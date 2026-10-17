@@ -33,4 +33,5 @@ pub use buffer::ResizableFrameBuffer;
 pub use factory::{NodeConstructorContext, NodeFactory};
 pub use graph::{Edge, Graph, NodeId, NodeTelemetry};
 pub use node::{AudioNode, ParamError, ProcessContext};
+pub use nodes::{biquad_coeffs, biquad_magnitude_db, BqType};
 pub use param::{Modulation, ParamValue, PublicParam, RangedParam};

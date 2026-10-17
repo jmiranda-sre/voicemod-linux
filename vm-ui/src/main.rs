@@ -3,8 +3,10 @@
 //! The UI owns no audio: presets come from `~/.config/vm/presets` (parsed
 //! with `vm-preset` for ranges), everything else flows through actions.
 
+mod eq;
 mod link;
 mod tray;
+mod wizard;
 
 use eframe::egui;
 use link::{Snapshot, UiLink};
@@ -17,6 +19,7 @@ enum Tab {
     Voices,
     Soundboard,
     Devices,
+    Integrations,
     Health,
 }
 
@@ -41,6 +44,14 @@ struct VmApp {
     tray_sync: (bool, bool),
     visible: bool,
     quit_requested: bool,
+    /// EQ canvas bands (rebuilt on preset load; values refreshed from the
+    /// slider mirrors every frame).
+    eq_bands: Vec<eq::EqBand>,
+    eq_selected: Option<usize>,
+    /// First-run setup wizard state machine.
+    wizard: wizard::Wizard,
+    /// Fast level polling currently requested (mirrors `wizard.open`).
+    wizard_fast: bool,
 }
 
 impl VmApp {
@@ -80,6 +91,10 @@ impl VmApp {
             tray_sync: (visible, false),
             visible,
             quit_requested: false,
+            eq_bands: Vec::new(),
+            eq_selected: None,
+            wizard: wizard::Wizard::first_run(&Self::config_dir()),
+            wizard_fast: false,
         };
         app.refresh_presets();
         app
@@ -106,6 +121,156 @@ impl VmApp {
                     .join("vm")
             })
             .join("presets")
+    }
+
+    /// Config dir (`<cfg>/vm`) — wizard marker + replays live here.
+    fn config_dir() -> std::path::PathBuf {
+        Self::preset_dir()
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/vm"))
+    }
+
+    // -- Mirror accessors (widget-local values shadow the snapshot) -------
+
+    fn m_bool(&self, node: &str, param: &str, d: bool) -> bool {
+        *self
+            .toggles
+            .get(&(node.to_string(), param.to_string()))
+            .unwrap_or(&d)
+    }
+
+    fn m_f32(&self, node: &str, param: &str, d: f32) -> f32 {
+        *self
+            .sliders
+            .get(&(node.to_string(), param.to_string()))
+            .unwrap_or(&d)
+    }
+
+    fn m_text(&self, node: &str, param: &str, d: &str) -> String {
+        self.texts
+            .get(&(node.to_string(), param.to_string()))
+            .cloned()
+            .unwrap_or_else(|| d.to_string())
+    }
+
+    fn set_f32(&mut self, node: &str, param: &str, v: f32) {
+        self.sliders.insert((node.to_string(), param.to_string()), v);
+    }
+
+    fn set_bool(&mut self, node: &str, param: &str, v: bool) {
+        self.toggles.insert((node.to_string(), param.to_string()), v);
+    }
+
+    // -- Integration action senders (full state from mirrors + snapshot) --
+
+    fn send_monitor(&self, snap: &Snapshot) {
+        self.act(serde_json::json!({
+            "action": "setMonitor",
+            "enabled": self.m_bool("monitor", "enabled", snap.monitor.enabled),
+            "device": self.m_text("monitor", "device", &snap.monitor.device),
+            "mix": self.m_f32("monitor", "mix", snap.monitor.mix),
+            "volume_db": self.m_f32("monitor", "volume_db", snap.monitor.volume_db),
+            "muted": self.m_bool("monitor", "muted", snap.monitor.muted),
+        }));
+    }
+
+    fn send_ducking(&self, snap: &Snapshot) {
+        self.act(serde_json::json!({
+            "action": "setDucking",
+            "enabled": self.m_bool("ducking", "enabled", snap.ducking.enabled),
+            "depth_db": self.m_f32("ducking", "depth_db", snap.ducking.depth_db),
+            "threshold_db": self.m_f32("ducking", "threshold_db", snap.ducking.threshold_db),
+            "attack_ms": self.m_f32("ducking", "attack_ms", snap.ducking.attack_ms),
+            "release_ms": self.m_f32("ducking", "release_ms", snap.ducking.release_ms),
+        }));
+    }
+
+    fn send_replay(&self, snap: &Snapshot) {
+        let seconds = *self
+            .ints
+            .get(&("replay".to_string(), "seconds".to_string()))
+            .unwrap_or(&(snap.replay.seconds as i32));
+        self.act(serde_json::json!({
+            "action": "setInstantReplay",
+            "enabled": self.m_bool("replay", "enabled", snap.replay.enabled),
+            "seconds": seconds.max(5) as u32,
+        }));
+    }
+
+    fn send_passthrough(&self, snap: &Snapshot) {
+        self.act(serde_json::json!({
+            "action": "setPassthrough",
+            "enabled": self.m_bool("passthrough", "enabled", snap.passthrough.enabled),
+            "device": self.m_text("passthrough", "device", &snap.passthrough.device),
+            "app": self.m_text("passthrough", "app", &snap.passthrough.app),
+        }));
+    }
+
+    fn send_obs(&self, snap: &Snapshot, password: Option<String>) {
+        let mut v = serde_json::json!({
+            "action": "setObs",
+            "enabled": self.m_bool("obs", "enabled", false),
+            "url": self.m_text("obs", "url", &snap.obs.url),
+        });
+        if let (Some(p), Some(o)) = (password, v.as_object_mut()) {
+            o.insert("password".into(), serde_json::Value::String(p));
+        }
+        self.act(v);
+    }
+
+    fn send_midi(&self, snap: &Snapshot) {
+        self.act(serde_json::json!({
+            "action": "setMidi",
+            "enabled": self.m_bool("midi", "enabled", !snap.midi.port.is_empty()),
+            "port": self.m_text("midi", "port", &snap.midi.port),
+        }));
+    }
+
+    // -- Current-preset lookups (wizard + EQ target the live preset) ------
+
+    /// First node carrying `param` and none of `exclude`.
+    fn node_with_param(&self, param: &str, exclude: &[&str]) -> Option<String> {
+        let p = self.preset.as_ref()?;
+        p.nodes
+            .iter()
+            .find(|n| {
+                n.params.contains_key(param)
+                    && !exclude.iter().any(|e| n.params.contains_key(*e))
+            })
+            .map(|n| n.id.clone())
+    }
+
+    fn param_range(&self, node: &str, param: &str) -> Option<(f32, f32)> {
+        let p = self.preset.as_ref()?;
+        let n = p.nodes.iter().find(|n| n.id == node)?;
+        n.params.get(param)?.range.map(|r| (r[0] as f32, r[1] as f32))
+    }
+
+    fn gate_node(&self) -> Option<String> {
+        self.node_with_param("hysteresis_db", &[])
+    }
+
+    fn comp_node(&self) -> Option<String> {
+        self.node_with_param("makeup_db", &[])
+    }
+
+    fn limit_node(&self) -> Option<String> {
+        self.node_with_param("release_ms", &["hysteresis_db", "ratio", "freq_hz"])
+    }
+
+    fn denoise_node(&self) -> Option<String> {
+        self.node_with_param("reduction_db", &[])
+    }
+
+    /// Apply one live voice parameter (mirror + Control API).
+    fn apply_param(&mut self, node: &str, param: &str, value: f32) {
+        self.set_f32(node, param, value);
+        self.act(serde_json::json!({
+            "action": "setVoiceParameter",
+            "param": format!("{node}.{param}"),
+            "value": value,
+        }));
     }
 
     fn refresh_presets(&mut self) {
@@ -153,6 +318,12 @@ impl VmApp {
                     }
                 }
                 self.preset = Some(p);
+                self.eq_bands = self
+                    .preset
+                    .as_ref()
+                    .map(eq::bands_from_preset)
+                    .unwrap_or_default();
+                self.eq_selected = None;
                 self.status_msg.clear();
             }
             None => self.status_msg = format!("cannot load preset '{name}'"),
@@ -237,8 +408,12 @@ impl eframe::App for VmApp {
                 }
                 ui.label(format!(":{}", snap.port));
                 ui.separator();
-                for (tab, name) in [(Tab::Voices, "Voices"), (Tab::Soundboard, "Soundboard"), (Tab::Devices, "Devices"), (Tab::Health, "Health")] {
+                for (tab, name) in [(Tab::Voices, "Voices"), (Tab::Soundboard, "Soundboard"), (Tab::Devices, "Devices"), (Tab::Integrations, "Integrations"), (Tab::Health, "Health")] {
                     ui.selectable_value(&mut self.tab, tab, name);
+                }
+                ui.separator();
+                if ui.button("Setup wizard").clicked() {
+                    self.wizard.open = true;
                 }
                 ui.separator();
                 if self.daemon_child.is_some() {
@@ -289,8 +464,22 @@ impl eframe::App for VmApp {
             Tab::Voices => self.voices_tab(ui, &snap),
             Tab::Soundboard => self.soundboard_tab(ui, &snap),
             Tab::Devices => self.devices_tab(ui, &snap),
+            Tab::Integrations => self.integrations_tab(ui, &snap),
             Tab::Health => self.health_tab(ui, &snap),
         });
+
+        // First-run wizard: modal-ish floating window; fast level polling
+        // only while it is open (the meters need ~100 ms updates).
+        if self.wizard.open != self.wizard_fast {
+            self.link.set_fast_levels(self.wizard.open);
+            self.wizard_fast = self.wizard.open;
+        }
+        if self.wizard.open {
+            let dt = ui.ctx().input(|i| i.stable_dt).min(0.5);
+            self.wizard.feed(snap.levels.mic_db, dt);
+            let ctx = ui.ctx().clone();
+            self.wizard_ui(&ctx, &snap);
+        }
     }
 }
 
@@ -320,6 +509,7 @@ impl VmApp {
         });
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
+                self.eq_section(ui);
                 let mut pending: Vec<(String, String, serde_json::Value)> = Vec::new();
                 if let Some(preset) = &self.preset {
                     if let Some(desc) = preset.description.as_deref() {
@@ -458,6 +648,116 @@ impl VmApp {
             }
         });
         ui.separator();
+        // Instant replay (F-0.4.B 20): rolling window of the final output.
+        ui.horizontal(|ui| {
+            let mut en = self.m_bool("replay", "enabled", snap.replay.enabled);
+            if ui.checkbox(&mut en, "Instant replay").changed() {
+                self.set_bool("replay", "enabled", en);
+                self.send_replay(snap);
+            }
+            let key = ("replay".to_string(), "seconds".to_string());
+            let mut secs = *self
+                .ints
+                .get(&key)
+                .unwrap_or(&(snap.replay.seconds as i32));
+            if ui
+                .add(
+                    egui::DragValue::new(&mut secs)
+                        .range(5..=120)
+                        .suffix(" s")
+                        .speed(1.0),
+                )
+                .changed()
+            {
+                self.ints.insert(key, secs);
+                self.send_replay(snap);
+            }
+            ui.label(format!("buffered {:.1}s", snap.replay.buffered_seconds));
+            if ui.button("Save now").clicked() {
+                self.act(serde_json::json!({"action": "saveInstantReplay"}));
+            }
+            if !snap.replay_saved_path.is_empty() {
+                ui.label(format!("saved → {}", snap.replay_saved_path));
+            }
+        });
+        // Per-application passthrough (F-0.4.B 18).
+        ui.horizontal(|ui| {
+            let mut en = self.m_bool("passthrough", "enabled", snap.passthrough.enabled);
+            if ui.checkbox(&mut en, "Route app audio").changed() {
+                self.set_bool("passthrough", "enabled", en);
+                if en {
+                    self.act(serde_json::json!({"action": "listPassthroughApps"}));
+                }
+                self.send_passthrough(snap);
+            }
+            if ui.button("↻ apps").clicked() {
+                self.act(serde_json::json!({"action": "listPassthroughApps"}));
+            }
+            let mut apps: Vec<link::AppEntry> = snap.passthrough_apps.clone();
+            apps.sort_by(|a, b| a.app.cmp(&b.app));
+            apps.dedup_by(|a, b| a.app == b.app);
+            let cur = self.m_text("passthrough", "app", &snap.passthrough.app);
+            let mut chosen: Option<String> = None;
+            egui::ComboBox::from_label("App")
+                .selected_text(if cur.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    cur.clone()
+                })
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(cur.is_empty(), "(none — manual device)")
+                        .clicked()
+                    {
+                        chosen = Some(String::new());
+                    }
+                    for a in &apps {
+                        let label = if a.name.is_empty() {
+                            format!("{} ({})", a.app, a.sink)
+                        } else {
+                            format!("{} ({})", a.app, a.name)
+                        };
+                        if ui.selectable_label(cur == a.app, &label).clicked() {
+                            chosen = Some(a.app.clone());
+                        }
+                    }
+                });
+            if let Some(c) = chosen {
+                self.texts
+                    .insert(("passthrough".to_string(), "app".to_string()), c);
+                self.send_passthrough(snap);
+            }
+            let cur_dev = self.m_text("passthrough", "device", &snap.passthrough.device);
+            let sinks: Vec<&link::DeviceInfo> =
+                snap.devices.iter().filter(|d| d.role == "Sink").collect();
+            let shown_dev = sinks
+                .iter()
+                .find(|d| d.uid == cur_dev)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| "(system default)".to_string());
+            let mut chosen_dev: Option<String> = None;
+            egui::ComboBox::from_label("→")
+                .selected_text(shown_dev)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(cur_dev.is_empty(), "(system default)")
+                        .clicked()
+                    {
+                        chosen_dev = Some(String::new());
+                    }
+                    for d in &sinks {
+                        if ui.selectable_label(cur_dev == d.uid, &d.name).clicked() {
+                            chosen_dev = Some(d.uid.clone());
+                        }
+                    }
+                });
+            if let Some(c) = chosen_dev {
+                self.texts
+                    .insert(("passthrough".to_string(), "device".to_string()), c);
+                self.send_passthrough(snap);
+            }
+        });
+        ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| {
             egui::Grid::new("sounds").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
                 for (i, name) in snap.sounds.iter().enumerate() {
@@ -510,8 +810,18 @@ impl VmApp {
             }
         });
         ui.separator();
+        ui.heading("Output (sinks)");
+        ui.label("Selectable targets for monitor + passthrough.");
+        for d in snap.devices.iter().filter(|d| d.role == "Sink") {
+            ui.label(format!("{} — {} ({}Hz {}ch)", d.name, d.uid, d.rate, d.channels));
+        }
+        ui.separator();
         ui.heading("Virtual + monitor");
-        for d in snap.devices.iter().filter(|d| d.role != "Input") {
+        for d in snap
+            .devices
+            .iter()
+            .filter(|d| matches!(d.role.as_str(), "Virtual" | "Monitor"))
+        {
             ui.label(format!("{} — {} ({}Hz {}ch)", d.name, d.role, d.rate, d.channels));
         }
         ui.separator();
@@ -527,6 +837,408 @@ impl VmApp {
                 self.link.refresh();
             }
         });
+    }
+
+    /// Interactive EQ (F-0.4.B item 26): drag bands on the canvas; the
+    /// drawn curve is `vm-dsp`'s own biquad math.
+    fn eq_section(&mut self, ui: &mut egui::Ui) {
+        if self.eq_bands.is_empty() {
+            return;
+        }
+        // Refresh band values from the slider mirrors (sliders may be the
+        // writer, e.g. the generic param list below the canvas).
+        for i in 0..self.eq_bands.len() {
+            let (node, freq, q, gain, has_gain) = {
+                let b = &self.eq_bands[i];
+                (b.node.clone(), b.freq, b.q, b.gain_db, b.has_gain)
+            };
+            let nf = self.m_f32(&node, "freq_hz", freq);
+            let nq = self.m_f32(&node, "q", q);
+            let ng = if has_gain {
+                self.m_f32(&node, "gain_db", gain)
+            } else {
+                gain
+            };
+            let b = &mut self.eq_bands[i];
+            b.freq = nf;
+            b.q = nq;
+            b.gain_db = ng;
+        }
+        ui.label("EQ — drag a handle: horizontal = frequency, vertical = gain, double-click resets gain");
+        let pending = eq::canvas(ui, &mut self.eq_bands, 48_000.0, &mut self.eq_selected);
+        for (node, param, value) in pending {
+            self.apply_param(&node, param, value);
+        }
+        if let Some(i) = self.eq_selected {
+            let info = self
+                .eq_bands
+                .get(i)
+                .map(|b| (b.node.clone(), b.freq, b.q, b.gain_db, b.has_gain));
+            if let Some((node, freq, q, gain, has_gain)) = info {
+                let (flo, fhi) = self
+                    .param_range(&node, "freq_hz")
+                    .unwrap_or((20.0, 20_000.0));
+                let mut f = freq;
+                if ui
+                    .add(egui::Slider::new(&mut f, flo..=fhi).logarithmic(true).text("freq (Hz)"))
+                    .drag_stopped()
+                {
+                    self.apply_param(&node, "freq_hz", f);
+                }
+                {
+                    let (qlo, qhi) = self.param_range(&node, "q").unwrap_or((0.1, 18.0));
+                    let mut qv = q;
+                    if ui
+                        .add(egui::Slider::new(&mut qv, qlo..=qhi).text("Q"))
+                        .drag_stopped()
+                    {
+                        self.apply_param(&node, "q", qv);
+                    }
+                }
+                if has_gain {
+                    let (glo, ghi) = self.param_range(&node, "gain_db").unwrap_or((-24.0, 24.0));
+                    let mut g = gain;
+                    if ui
+                        .add(egui::Slider::new(&mut g, glo..=ghi).text("gain (dB)"))
+                        .drag_stopped()
+                    {
+                        self.apply_param(&node, "gain_db", g);
+                    }
+                }
+            }
+        }
+        ui.separator();
+    }
+
+    fn integrations_tab(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
+        let sinks: Vec<&link::DeviceInfo> =
+            snap.devices.iter().filter(|d| d.role == "Sink").collect();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.heading("Monitor — hear yourself");
+            ui.label("Plays your processed voice into an output with near-zero latency.");
+            ui.horizontal(|ui| {
+                let mut en = self.m_bool("monitor", "enabled", snap.monitor.enabled);
+                if ui.checkbox(&mut en, "enabled").changed() {
+                    self.set_bool("monitor", "enabled", en);
+                    self.send_monitor(snap);
+                }
+                let mut muted = self.m_bool("monitor", "muted", snap.monitor.muted);
+                if ui.checkbox(&mut muted, "mute").changed() {
+                    self.set_bool("monitor", "muted", muted);
+                    self.send_monitor(snap);
+                }
+            });
+            let cur = self.m_text("monitor", "device", &snap.monitor.device);
+            let shown = sinks
+                .iter()
+                .find(|d| d.uid == cur)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| "(system default)".to_string());
+            let mut chosen: Option<String> = None;
+            egui::ComboBox::from_label("Output").selected_text(shown).show_ui(ui, |ui| {
+                if ui.selectable_label(cur.is_empty(), "(system default)").clicked() {
+                    chosen = Some(String::new());
+                }
+                for d in &sinks {
+                    if ui.selectable_label(cur == d.uid, &d.name).clicked() {
+                        chosen = Some(d.uid.clone());
+                    }
+                }
+            });
+            if let Some(c) = chosen {
+                self.texts
+                    .insert(("monitor".to_string(), "device".to_string()), c);
+                self.send_monitor(snap);
+            }
+            let mut mix = self.m_f32("monitor", "mix", snap.monitor.mix);
+            let r = ui.add(egui::Slider::new(&mut mix, 0.0..=1.0).text("dry → wet blend"));
+            self.set_f32("monitor", "mix", mix);
+            if r.drag_stopped() {
+                self.send_monitor(snap);
+            }
+            let mut vol = self.m_f32("monitor", "volume_db", snap.monitor.volume_db);
+            let r = ui.add(egui::Slider::new(&mut vol, -40.0..=12.0).text("volume (dB)"));
+            self.set_f32("monitor", "volume_db", vol);
+            if r.drag_stopped() {
+                self.send_monitor(snap);
+            }
+
+            ui.separator();
+            ui.heading("Ducking — lower sounds while you speak");
+            ui.label("Detects your voice on the raw mic and dips the soundboard for the effect.");
+            let mut en = self.m_bool("ducking", "enabled", snap.ducking.enabled);
+            if ui.checkbox(&mut en, "enabled").changed() {
+                self.set_bool("ducking", "enabled", en);
+                self.send_ducking(snap);
+            }
+            for (param, label, lo, hi, def) in [
+                ("depth_db", "depth (dB)", 0.0f32, 30.0, snap.ducking.depth_db),
+                ("threshold_db", "threshold (dBFS)", -60.0, 0.0, snap.ducking.threshold_db),
+                ("attack_ms", "attack (ms)", 1.0, 500.0, snap.ducking.attack_ms),
+                ("release_ms", "release (ms)", 10.0, 2000.0, snap.ducking.release_ms),
+            ] {
+                let mut v = self.m_f32("ducking", param, def);
+                let r = ui.add(egui::Slider::new(&mut v, lo..=hi).text(label));
+                self.set_f32("ducking", param, v);
+                if r.drag_stopped() {
+                    self.send_ducking(snap);
+                }
+            }
+
+            ui.separator();
+            ui.heading("OBS bridge (obs-websocket)");
+            ui.label("Switches voice on OBS scene changes and exposes a VU text source.");
+            let mut en = self.m_bool("obs", "enabled", snap.obs.enabled);
+            if ui.checkbox(&mut en, "enabled").changed() {
+                self.set_bool("obs", "enabled", en);
+                self.send_obs(snap, None);
+            }
+            ui.horizontal(|ui| {
+                let mut url = self.m_text("obs", "url", &snap.obs.url);
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut url)
+                        .hint_text("ws://127.0.0.1:4455")
+                        .desired_width(220.0),
+                );
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    self.texts
+                        .insert(("obs".to_string(), "url".to_string()), url.clone());
+                    self.send_obs(snap, None);
+                } else {
+                    self.texts
+                        .insert(("obs".to_string(), "url".to_string()), url);
+                }
+                let mut pass = self.m_text("obs", "password", "");
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut pass)
+                        .password(true)
+                        .hint_text("password")
+                        .desired_width(140.0),
+                );
+                if r.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    && !pass.is_empty()
+                {
+                    self.send_obs(snap, Some(pass));
+                }
+            });
+            if snap.obs.connected {
+                ui.colored_label(
+                    egui::Color32::GREEN,
+                    format!("connected — scene '{}'", snap.obs.scene),
+                );
+            } else {
+                ui.colored_label(egui::Color32::GRAY, "not connected");
+            }
+
+            ui.separator();
+            ui.heading("MIDI learn");
+            ui.label("Binds MIDI knobs/pads to hotkey targets; captured via the Control API.");
+            let mut en = self.m_bool("midi", "enabled", snap.midi.enabled);
+            if ui.checkbox(&mut en, "enabled").changed() {
+                self.set_bool("midi", "enabled", en);
+                self.send_midi(snap);
+            }
+            ui.horizontal(|ui| {
+                let mut port = self.m_text("midi", "port", &snap.midi.port);
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut port)
+                        .hint_text("ALSA port (empty = first available)")
+                        .desired_width(240.0),
+                );
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    self.texts
+                        .insert(("midi".to_string(), "port".to_string()), port.clone());
+                    self.send_midi(snap);
+                } else {
+                    self.texts
+                        .insert(("midi".to_string(), "port".to_string()), port);
+                }
+                if ui.button("↻ status").clicked() {
+                    self.act(serde_json::json!({"action": "getMidiStatus"}));
+                }
+            });
+            ui.label(format!(
+                "{} bindings · {}{}",
+                snap.midi.bindings,
+                if snap.midi.connected { "connected" } else { "not connected" },
+                if snap.midi.learning { " · capturing…" } else { "" }
+            ));
+        });
+    }
+
+    /// Setup wizard modal (F-0.4.B item 29).
+    fn wizard_ui(&mut self, ctx: &egui::Context, snap: &Snapshot) {
+        // Auto-advance the measurement steps when their clock elapses.
+        match self.wizard.step {
+            wizard::Step::NoiseFloor if self.wizard.measurement_done() => {
+                let range = self
+                    .gate_node()
+                    .and_then(|g| self.param_range(&g, "threshold_db"));
+                self.wizard.finish_noise(range);
+                if let Some(dn) = self.denoise_node() {
+                    self.act(serde_json::json!({"action": "captureNoiseProfile", "node": dn}));
+                    self.wizard.note = "noise profile captured".to_string();
+                }
+                self.wizard.begin_step(wizard::Step::Gate);
+            }
+            wizard::Step::SpeechLevel if self.wizard.measurement_done() => {
+                self.wizard.finish_speech();
+                self.wizard.begin_step(wizard::Step::Limiter);
+            }
+            _ => {}
+        }
+        let step = self.wizard.step;
+        let mut open = self.wizard.open;
+        egui::Window::new("Setup wizard — perfect audio in a minute")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(440.0)
+            .show(ctx, |ui| match step {
+                wizard::Step::Welcome => {
+                    ui.label("This 1-minute check finds your microphone level, measures your room, and suggests a gate and a safety limiter.");
+                    ui.add_space(6.0);
+                    ui.label("Steps: speak once → stay silent 3 s → check the result.");
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Start").clicked() {
+                            self.wizard.begin_step(wizard::Step::MicCheck);
+                        }
+                        if ui.button("Skip").clicked() {
+                            self.wizard.open = false;
+                        }
+                    });
+                }
+                wizard::Step::MicCheck => {
+                    ui.strong("1/4 · Test your microphone");
+                    ui.label("Speak normally — the bars must move.");
+                    ui.add_space(4.0);
+                    level_db_bar(ui, "mic", snap.levels.mic_db);
+                    level_db_bar(ui, "out", snap.levels.out_db);
+                    ui.add_space(6.0);
+                    if snap.levels.speech {
+                        ui.colored_label(egui::Color32::GREEN, "speech detected ✓");
+                    } else if snap.levels.mic_db < -55.0 {
+                        ui.colored_label(
+                            egui::Color32::YELLOW,
+                            "No signal yet — check the microphone on the Devices tab.",
+                        );
+                    }
+                    if ui.button("I see the level moving →").clicked() {
+                        self.wizard.begin_step(wizard::Step::NoiseFloor);
+                    }
+                }
+                wizard::Step::NoiseFloor => {
+                    ui.strong("2/4 · Measuring the noise floor");
+                    ui.label("Stay silent for 3 seconds…");
+                    ui.add(egui::ProgressBar::new(self.wizard.progress()).desired_height(10.0));
+                    ui.add_space(4.0);
+                    level_db_bar(ui, "mic", snap.levels.mic_db);
+                    if snap.levels.speech {
+                        ui.colored_label(
+                            egui::Color32::YELLOW,
+                            "voice detected — the measurement restarts best if you stay quiet",
+                        );
+                    }
+                }
+                wizard::Step::Gate => {
+                    ui.strong("3/4 · Noise gate");
+                    ui.label(format!(
+                        "Room floor ≈ {:.0} dBFS — a gate {:.0} dBFS keeps it out.",
+                        self.wizard.floor_db,
+                        self.wizard.gate_db
+                    ));
+                    let (lo, hi) = self
+                        .gate_node()
+                        .and_then(|g| self.param_range(&g, "threshold_db"))
+                        .unwrap_or((-70.0, -20.0));
+                    let mut v = self.m_f32("wizard", "gate_db", self.wizard.gate_db);
+                    if ui
+                        .add(egui::Slider::new(&mut v, lo..=hi).text("gate threshold (dBFS)"))
+                        .changed()
+                    {
+                        self.set_f32("wizard", "gate_db", v);
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply to voice").clicked() {
+                            let v = self.m_f32("wizard", "gate_db", self.wizard.gate_db);
+                            if let Some(g) = self.gate_node() {
+                                self.apply_param(&g, "threshold_db", v);
+                                self.wizard.note = format!("gate set to {v:.0} dBFS");
+                            } else {
+                                self.wizard.note =
+                                    "current preset has no gate node".to_string();
+                            }
+                        }
+                        if ui.button("Next →").clicked() {
+                            self.wizard.note.clear();
+                            self.wizard.begin_step(wizard::Step::SpeechLevel);
+                        }
+                    });
+                    if !self.wizard.note.is_empty() {
+                        ui.label(&self.wizard.note);
+                    }
+                }
+                wizard::Step::SpeechLevel => {
+                    ui.strong("4/4 · Speech level");
+                    ui.label("Read anything out loud: “The quick brown fox jumps over the lazy dog.”");
+                    ui.add(egui::ProgressBar::new(self.wizard.progress()).desired_height(10.0));
+                    ui.add_space(4.0);
+                    level_db_bar(ui, "mic", snap.levels.mic_db);
+                }
+                wizard::Step::Limiter => {
+                    ui.strong("Finishing touches");
+                    ui.label(format!(
+                        "Speech ≈ {:.0} dBFS (target {:.0} dBFS).",
+                        self.wizard.speech_db,
+                        wizard::TARGET_SPEECH_DB
+                    ));
+                    let mut applied_any = false;
+                    if let Some(comp) = self.comp_node() {
+                        let range = self.param_range(&comp, "makeup_db");
+                        let suggestion = wizard::suggest_makeup(self.wizard.speech_db, range);
+                        let mut v = self.m_f32("wizard", "makeup_db", suggestion);
+                        ui.add(egui::Slider::new(&mut v, -12.0..=24.0).text("makeup gain (dB)"));
+                        self.set_f32("wizard", "makeup_db", v);
+                        if ui.button("Apply makeup").clicked() {
+                            self.apply_param(&comp, "makeup_db", v);
+                            self.wizard.note = format!("makeup {v:+.1} dB applied");
+                            applied_any = true;
+                        }
+                    }
+                    if let Some(lim) = self.limit_node() {
+                        let (lo, hi) = self
+                            .param_range(&lim, "threshold_db")
+                            .unwrap_or((-12.0, 0.0));
+                        let suggestion = (-1.0f32).clamp(lo, hi);
+                        let mut v = self.m_f32("wizard", "limiter_db", suggestion);
+                        ui.add(egui::Slider::new(&mut v, lo..=hi).text("limiter threshold (dBFS)"));
+                        self.set_f32("wizard", "limiter_db", v);
+                        if ui.button("Apply limiter").clicked() {
+                            self.apply_param(&lim, "threshold_db", v);
+                            self.wizard.note = format!("limiter at {v:.1} dBFS applied");
+                            applied_any = true;
+                        }
+                    }
+                    let _ = applied_any;
+                    if !self.wizard.note.is_empty() {
+                        ui.label(&self.wizard.note);
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Finish").clicked() {
+                            self.wizard.mark_done(&Self::config_dir());
+                            self.wizard.open = false;
+                        }
+                        if ui.button("Replay setup later").clicked() {
+                            self.wizard.open = false;
+                        }
+                    });
+                }
+            });
+        self.wizard.open = open;
     }
 
     fn health_tab(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
@@ -618,6 +1330,19 @@ impl VmApp {
             }
         });
     }
+}
+
+/// Setup wizard VU: dBFS (−60…0) into a progress bar.
+fn level_db_bar(ui: &mut egui::Ui, label: &str, db: f32) {
+    let t = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.add(
+            egui::ProgressBar::new(t)
+                .desired_width(260.0)
+                .text(format!("{db:.0} dBFS")),
+        );
+    });
 }
 
 fn main() -> eframe::Result<()> {

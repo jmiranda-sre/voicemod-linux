@@ -62,6 +62,77 @@ pub struct HealthInfo {
     pub latency_ms: f64,
 }
 
+/// Hear-myself monitor (F-0.4.C 15).
+#[derive(Debug, Clone, Default)]
+pub struct MonitorState {
+    pub enabled: bool,
+    pub device: String,
+    pub mix: f32,
+    pub volume_db: f32,
+    pub muted: bool,
+}
+
+/// Sidechain ducking (F-0.4.C 14).
+#[derive(Debug, Clone, Default)]
+pub struct DuckingState {
+    pub enabled: bool,
+    pub depth_db: f32,
+    pub threshold_db: f32,
+    pub attack_ms: f32,
+    pub release_ms: f32,
+}
+
+/// Instant replay (F-0.4.B 20).
+#[derive(Debug, Clone, Default)]
+pub struct ReplayState {
+    pub enabled: bool,
+    pub seconds: u32,
+    pub buffered_seconds: f32,
+}
+
+/// Per-application passthrough (F-0.4.B 18).
+#[derive(Debug, Clone, Default)]
+pub struct PassthroughState {
+    pub enabled: bool,
+    pub device: String,
+    pub app: String,
+}
+
+/// One application output stream (passthrough picker).
+#[derive(Debug, Clone, Default)]
+pub struct AppEntry {
+    pub app: String,
+    pub name: String,
+    pub sink: String,
+}
+
+/// obs-websocket bridge status (F-0.4.C 35).
+#[derive(Debug, Clone, Default)]
+pub struct ObsState {
+    pub connected: bool,
+    pub scene: String,
+    pub url: String,
+    pub enabled: bool,
+}
+
+/// MIDI learn status (F-0.4.C 37).
+#[derive(Debug, Clone, Default)]
+pub struct MidiState {
+    pub connected: bool,
+    pub learning: bool,
+    pub port: String,
+    pub bindings: u32,
+    pub enabled: bool,
+}
+
+/// Live level snapshot (wizard meters + VU).
+#[derive(Debug, Clone, Default)]
+pub struct LevelsState {
+    pub mic_db: f32,
+    pub out_db: f32,
+    pub speech: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     pub connected: bool,
@@ -76,6 +147,16 @@ pub struct Snapshot {
     pub muted: bool,
     pub selected_voice: String,
     pub last_error: String,
+    pub monitor: MonitorState,
+    pub ducking: DuckingState,
+    pub replay: ReplayState,
+    pub passthrough: PassthroughState,
+    pub passthrough_apps: Vec<AppEntry>,
+    pub obs: ObsState,
+    pub midi: MidiState,
+    pub levels: LevelsState,
+    /// Last saved replay path (`replaySaved` event).
+    pub replay_saved_path: String,
 }
 
 impl Snapshot {
@@ -89,12 +170,17 @@ pub enum ToLink {
     Action(serde_json::Value),
     /// Force a status refresh now.
     Refresh,
+    /// Poll interval flag changed (wake the loop to apply it).
+    FastLevels,
 }
 
 pub struct UiLink {
     tx: mpsc::Sender<ToLink>,
     pub snapshot: Arc<Mutex<Snapshot>>,
     next_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Fast `getLevels` polling (wizard meters); 100 ms instead of the
+    /// regular 2 s status cadence.
+    fast: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl UiLink {
@@ -103,6 +189,8 @@ impl UiLink {
         let snapshot = Arc::new(Mutex::new(Snapshot::default()));
         let snap = snapshot.clone();
         let next_id = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let fast = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fast_thread = fast.clone();
         std::thread::Builder::new()
             .name("vm-ws".into())
             .spawn(move || {
@@ -110,10 +198,10 @@ impl UiLink {
                     .enable_all()
                     .build()
                     .expect("link runtime");
-                rt.block_on(link_main(rx, snap, Arc::new(repaint)));
+                rt.block_on(link_main(rx, snap, Arc::new(repaint), fast_thread));
             })
             .ok();
-        Self { tx, snapshot, next_id }
+        Self { tx, snapshot, next_id, fast }
     }
 
     pub fn send_action(&self, mut action: serde_json::Value) {
@@ -129,6 +217,12 @@ impl UiLink {
     pub fn refresh(&self) {
         let _ = self.tx.send(ToLink::Refresh);
     }
+
+    /// Fast level polling for the wizard meters (and to wake the loop now).
+    pub fn set_fast_levels(&self, on: bool) {
+        self.fast.store(on, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.tx.send(ToLink::FastLevels);
+    }
 }
 
 fn update_snap<F: FnOnce(&mut Snapshot)>(snap: &Arc<Mutex<Snapshot>>, repaint: &Arc<dyn Fn()>, f: F) {
@@ -142,6 +236,7 @@ async fn link_main(
     rx: mpsc::Receiver<ToLink>,
     snap: Arc<Mutex<Snapshot>>,
     repaint: Arc<dyn Fn()>,
+    fast: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let token = std::env::var("VM_CONTROL_TOKEN").unwrap_or_default();
     loop {
@@ -159,6 +254,12 @@ async fn link_main(
                     serde_json::json!({"action": "getAudioStreamStatus"}),
                     serde_json::json!({"action": "getHealth"}),
                     serde_json::json!({"action": "getUserLicense"}),
+                    serde_json::json!({"action": "getMonitor"}),
+                    serde_json::json!({"action": "getDucking"}),
+                    serde_json::json!({"action": "getInstantReplay"}),
+                    serde_json::json!({"action": "getPassthrough"}),
+                    serde_json::json!({"action": "getObsStatus"}),
+                    serde_json::json!({"action": "getMidiStatus"}),
                 ] {
                     if !request(&mut ws, &snap, &repaint, &token, boot).await {
                         break;
@@ -166,20 +267,38 @@ async fn link_main(
                 }
                 // Serve the queue + periodic refresh until the socket dies.
                 loop {
-                    let alive = match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                    let fast_now = fast.load(std::sync::atomic::Ordering::Relaxed);
+                    let poll = if fast_now {
+                        std::time::Duration::from_millis(100)
+                    } else {
+                        std::time::Duration::from_secs(2)
+                    };
+                    let alive = match rx.recv_timeout(poll) {
                         Ok(ToLink::Action(a)) => {
                             request(&mut ws, &snap, &repaint, &token, a).await
                         }
+                        Ok(ToLink::FastLevels) => true,
                         Ok(ToLink::Refresh) | Err(mpsc::RecvTimeoutError::Timeout) => {
-                            let ok = request(
+                            // Wizard open (fast): cheap level polls only;
+                            // otherwise the regular status + health cadence.
+                            if fast.load(std::sync::atomic::Ordering::Relaxed) {
+                                request(
+                                    &mut ws,
+                                    &snap,
+                                    &repaint,
+                                    &token,
+                                    serde_json::json!({"action": "getLevels"}),
+                                )
+                                .await
+                            } else if request(
                                 &mut ws,
                                 &snap,
                                 &repaint,
                                 &token,
                                 serde_json::json!({"action": "getAudioStreamStatus"}),
                             )
-                            .await;
-                            if ok {
+                            .await
+                            {
                                 request(
                                     &mut ws,
                                     &snap,
@@ -289,6 +408,47 @@ fn apply_event(snap: &Arc<Mutex<Snapshot>>, repaint: &Arc<dyn Fn()>, v: &serde_j
             Some("mutedChanged") => {
                 s.muted = v.get("muted").and_then(|x| x.as_bool()).unwrap_or(false);
             }
+            Some("monitorChanged") => {
+                s.monitor = MonitorState {
+                    enabled: v.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false),
+                    device: v.get("device").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                    mix: v.get("mix").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
+                    volume_db: v.get("volume_db").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
+                    muted: v.get("muted").and_then(|x| x.as_bool()).unwrap_or(false),
+                };
+            }
+            Some("duckingChanged") => {
+                s.ducking = DuckingState {
+                    enabled: v.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false),
+                    depth_db: v.get("depth_db").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
+                    threshold_db: v.get("threshold_db").and_then(|x| x.as_f64()).unwrap_or(0.0)
+                        as f32,
+                    attack_ms: v.get("attack_ms").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
+                    release_ms: v.get("release_ms").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
+                };
+            }
+            Some("replaySaved") => {
+                s.replay_saved_path = v.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            }
+            Some("passthroughChanged") => {
+                s.passthrough = PassthroughState {
+                    enabled: v.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false),
+                    device: v.get("device").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                    app: v.get("app").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                };
+            }
+            Some("obsStatusChanged") => {
+                s.obs.connected = v.get("connected").and_then(|x| x.as_bool()).unwrap_or(false);
+                s.obs.scene = v.get("scene").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                if let Some(u) = v.get("url").and_then(|x| x.as_str()) {
+                    if !u.is_empty() {
+                        s.obs.url = u.to_string();
+                    }
+                }
+            }
+            Some("midiBindingsChanged") => {
+                // Count is stale until the next getMidiStatus; leave it.
+            }
             _ => {}
         }
     });
@@ -357,6 +517,80 @@ fn apply_reply(
                 s.muted = data.and_then(|d| d.get("muted")).and_then(|x| x.as_bool()).unwrap_or(false);
                 s.voice_enabled =
                     data.and_then(|d| d.get("enabled")).and_then(|x| x.as_bool()).unwrap_or(true);
+            }
+            "getMonitor" => {
+                s.monitor = MonitorState {
+                    enabled: data.and_then(|d| d.get("enabled")).and_then(|x| x.as_bool()).unwrap_or(false),
+                    device: str_of(data, "device"),
+                    mix: fnum(data.and_then(|d| d.get("mix"))) as f32,
+                    volume_db: fnum(data.and_then(|d| d.get("volume_db"))) as f32,
+                    muted: data.and_then(|d| d.get("muted")).and_then(|x| x.as_bool()).unwrap_or(false),
+                };
+            }
+            "getDucking" => {
+                s.ducking = DuckingState {
+                    enabled: data.and_then(|d| d.get("enabled")).and_then(|x| x.as_bool()).unwrap_or(false),
+                    depth_db: fnum(data.and_then(|d| d.get("depth_db"))) as f32,
+                    threshold_db: fnum(data.and_then(|d| d.get("threshold_db"))) as f32,
+                    attack_ms: fnum(data.and_then(|d| d.get("attack_ms"))) as f32,
+                    release_ms: fnum(data.and_then(|d| d.get("release_ms"))) as f32,
+                };
+            }
+            "getInstantReplay" | "setInstantReplay" => {
+                s.replay = ReplayState {
+                    enabled: data.and_then(|d| d.get("enabled")).and_then(|x| x.as_bool()).unwrap_or(false),
+                    seconds: data.and_then(|d| d.get("seconds")).and_then(|x| x.as_u64()).unwrap_or(30) as u32,
+                    buffered_seconds: fnum(data.and_then(|d| d.get("buffered_seconds"))) as f32,
+                };
+            }
+            "saveInstantReplay" => {
+                s.replay_saved_path = str_of(data, "path");
+            }
+            "getPassthrough" => {
+                s.passthrough = PassthroughState {
+                    enabled: data.and_then(|d| d.get("enabled")).and_then(|x| x.as_bool()).unwrap_or(false),
+                    device: str_of(data, "device"),
+                    app: str_of(data, "app"),
+                };
+            }
+            "listPassthroughApps" => {
+                s.passthrough_apps = data
+                    .and_then(|d| d.get("apps"))
+                    .and_then(|d| d.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .map(|a| AppEntry {
+                                app: str_of(Some(a), "app"),
+                                name: str_of(Some(a), "name"),
+                                sink: str_of(Some(a), "sink"),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            }
+            "getObsStatus" => {
+                s.obs = ObsState {
+                    connected: data.and_then(|d| d.get("connected")).and_then(|x| x.as_bool()).unwrap_or(false),
+                    scene: str_of(data, "scene"),
+                    url: str_of(data, "url"),
+                    enabled: data.and_then(|d| d.get("enabled")).and_then(|x| x.as_bool()).unwrap_or(false),
+                };
+            }
+            "getMidiStatus" => {
+                s.midi = MidiState {
+                    connected: data.and_then(|d| d.get("connected")).and_then(|x| x.as_bool()).unwrap_or(false),
+                    learning: data.and_then(|d| d.get("learning")).and_then(|x| x.as_bool()).unwrap_or(false),
+                    port: str_of(data, "port"),
+                    bindings: data.and_then(|d| d.get("bindings")).and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+                    enabled: data.and_then(|d| d.get("enabled")).and_then(|x| x.as_bool()).unwrap_or(false),
+                };
+            }
+            "getLevels" => {
+                s.levels = LevelsState {
+                    mic_db: fnum(data.and_then(|d| d.get("mic_db"))) as f32,
+                    out_db: fnum(data.and_then(|d| d.get("out_db"))) as f32,
+                    speech: data.and_then(|d| d.get("speech")).and_then(|x| x.as_bool()).unwrap_or(false),
+                };
             }
             _ => {}
         }
@@ -488,5 +722,81 @@ mod link_tests {
         let s = snap.lock().unwrap();
         assert_eq!(s.last_error, "boom");
         assert!(s.health.nodes.is_empty());
+    }
+
+    #[test]
+    fn integration_replies_map_into_snapshot() {
+        let snap = snap_link();
+        let rp = snap_repaint();
+        for (action, reply) in [
+            (
+                serde_json::json!({"action": "getMonitor"}),
+                serde_json::json!({"ok": true, "data": {"enabled": true, "device": "a#1", "mix": 0.5, "volume_db": -6.0, "muted": false}}),
+            ),
+            (
+                serde_json::json!({"action": "getDucking"}),
+                serde_json::json!({"ok": true, "data": {"enabled": true, "depth_db": 12.0, "threshold_db": -40.0, "attack_ms": 50.0, "release_ms": 400.0}}),
+            ),
+            (
+                serde_json::json!({"action": "getInstantReplay"}),
+                serde_json::json!({"ok": true, "data": {"enabled": true, "seconds": 30, "buffered_seconds": 12.5}}),
+            ),
+            (
+                serde_json::json!({"action": "getPassthrough"}),
+                serde_json::json!({"ok": true, "data": {"enabled": true, "device": "", "app": "Discord"}}),
+            ),
+            (
+                serde_json::json!({"action": "listPassthroughApps"}),
+                serde_json::json!({"ok": true, "data": {"apps": [{"id": 7, "app": "Discord", "name": "playback", "sink": "vm-passthrough"}]}}),
+            ),
+            (
+                serde_json::json!({"action": "getMidiStatus"}),
+                serde_json::json!({"ok": true, "data": {"connected": true, "learning": false, "port": "mpk", "bindings": 2}}),
+            ),
+            (
+                serde_json::json!({"action": "getLevels"}),
+                serde_json::json!({"ok": true, "data": {"mic_db": -22.5, "out_db": -20.0, "speech": true}}),
+            ),
+        ] {
+            apply_reply(&snap, &rp, &action, &reply);
+        }
+        let s = snap.lock().unwrap();
+        assert!(s.monitor.enabled);
+        assert_eq!(s.monitor.device, "a#1");
+        assert!((s.monitor.mix - 0.5).abs() < 1e-6);
+        assert!(s.ducking.enabled);
+        assert!((s.ducking.depth_db - 12.0).abs() < 1e-6);
+        assert!(s.replay.enabled);
+        assert_eq!(s.replay.seconds, 30);
+        assert!((s.replay.buffered_seconds - 12.5).abs() < 1e-6);
+        assert!(s.passthrough.enabled);
+        assert_eq!(s.passthrough.app, "Discord");
+        assert_eq!(s.passthrough_apps.len(), 1);
+        assert_eq!(s.passthrough_apps[0].sink, "vm-passthrough");
+        assert_eq!(s.midi.bindings, 2);
+        assert!((s.levels.mic_db + 22.5).abs() < 1e-6);
+        assert!(s.levels.speech);
+    }
+
+    #[test]
+    fn events_update_integration_state() {
+        let snap = snap_link();
+        let rp = snap_repaint();
+        apply_event(&snap, &rp, &serde_json::json!({"event": "replaySaved", "path": "/tmp/r.wav"}));
+        apply_event(
+            &snap,
+            &rp,
+            &serde_json::json!({"event": "passthroughChanged", "enabled": true, "device": "d", "app": "Firefox"}),
+        );
+        apply_event(
+            &snap,
+            &rp,
+            &serde_json::json!({"event": "monitorChanged", "enabled": true, "device": "", "mix": 1.0, "volume_db": 0.0, "muted": true}),
+        );
+        let s = snap.lock().unwrap();
+        assert_eq!(s.replay_saved_path, "/tmp/r.wav");
+        assert!(s.passthrough.enabled);
+        assert_eq!(s.passthrough.app, "Firefox");
+        assert!(s.monitor.muted);
     }
 }

@@ -829,7 +829,7 @@ da fábrica (nunca sobrescreve): deletar o arquivo recebe a update.
 **D → A → C → B** (infra de automação primeiro p/ testar o resto;
 DSP pesado em seguida; roteamento; UX coroa o ciclo; itens do B são
 paralelizáveis a qualquer momento).
-Progresso 2026-10-17: **D, A e C FECHADAS — resta B.**
+Progresso 2026-10-17: **D, A, C e B FECHADAS — ciclo v0.4.0 completo (release pendente).**
 
 ### F-0.4.D — Automação + dispositivos (Pilar 4)
 - Item 42: CLI 100% da Control API (base p/ scripts/testes de tudo).
@@ -921,4 +921,53 @@ Progresso 2026-10-17: **D, A e C FECHADAS — resta B.**
   `--features midi`; `vm actions` agora lê `vm_control::ALL_ACTIONS`
   (43) com guarda que serializa cada variant e compara nomes na ordem.
 - UI: ainda sem superfície p/ monitor/ducking/OBS/MIDI (tudo via API;
-  candidato natural ao lado do wizard do B).
+  candidato natural ao lado do wizard do B → resolvido no B, aba
+  *Integrations*).
+
+### F-0.4.B — FECHADA (soundboard pro + UX) — 2026-10-17
+- Item 29 wizard: modal de primeira execução (Welcome → teste de mic
+  → piso de ruído 3 s → gate → nível de fala 3 s → acabamento
+  makeup/limiter); `wizard.json` no dir de config auto-abre na 1ª
+  execução e o botão "Setup wizard" reabre. Só amostras DISTINTAS de
+  `getLevels`, mediana; completar o piso captura o noise profile no
+  denoise (`captureNoiseProfile`) e sugere gate = piso + 6 dB clampado
+  ao range do preset; fala mira −18 dBFS (makeup sugerido), limiter
+  −1 dBFS clampado. Níveis polam a 100 ms SÓ com o wizard aberto
+  (`set_fast_levels`).
+- Item 26 EQ gráfica: canvas na aba Voices — arrasto do handle
+  (X=freq, Y=ganho), double-click zera o ganho, sliders de freq/Q/
+  ganho da banda selecionada; updates pendentes viram
+  `setVoiceParameter`. `vm_dsp::biquad_magnitude_db` é a fonte ÚNICA
+  da curva; teste cross-check analítico × resposta medida do biquad.
+- Item 18 passthrough: sink `vm-passthrough` + module-loopback 20 ms
+  para o output alvo (device "" = default do sistema); semântica
+  declarativa — exatamente `{settings.app}` no sink, resto restaurado,
+  re-execução converge, app desconhecido falha alto com rollback de
+  config E backend. Soundboard injeta no MESMO sink via stream
+  `vm-inject` (pós-ducking, imune ao master mute). Boot reaplica o
+  estado (adota leftover de crash; purga módulos velhos). Compat:
+  EasyEffects "process all outputs" re-roteia qualquer move de
+  terceiros (mesma dor de pavucontrol/Soundux) — documentado no README.
+- Item 20 Instant Replay: `ReplayRing` (default 30 s, clamp 5..=120)
+  no tap FINAL pós-mute; push por quantum com `try_lock` (contenção =
+  pula; RT nunca bloqueia); save = snapshot sob lock + WAV fora do
+  lock (PCM16 estéreo 48k, writer RIFF à mão, zero dep nova) em
+  `<config>/replays/replay-<unix>.wav`; hotkey `SaveReplay`;
+  `getInstantReplay` devolve `buffered_seconds`; disable limpa o
+  buffer.
+- Schema config v4 (`replay`/`passthrough`; v1–v3 migram); updates por
+  seção com rollback duplo (persist-then-apply).
+- UI: aba *Integrations* (monitor/ducking/OBS/MIDI) fecha a lacuna do
+  C; linhas de replay + passthrough na aba Soundboard; Devices
+  dividido em Input/Output(sinks)/Virtual+monitor; wizard modal.
+- BUG REAL (achado no smoke LIVE, invisível nos testes): ao ADOTAR um
+  sink `vm-passthrough` de sessão anterior, `ensure_loopback` purgava
+  por agulha `sink_name=vm-passthrough` sem keep registrado → derrubava
+  o próprio sink adotado → boot-apply movia o app para um nome morto
+  ("No such entity"). Purges agora separados: sink × loopback.
+- Qualidade: 182 testes workspace (daemon 53 c/ f04b; dsp 53; UI 15;
+  control 23); clippy zero default e `--features midi`; smokes f04b
+  stub (clamp, rollback de app inexistente, config v4, hotkey) e live
+  (REPLAY wav de 5 s real, MOVE p/ vm-passthrough, INJECT no sink,
+  BOOT_APPLY pós-restart, RESTORE no disable; EE pausado no teste por
+  conflito conhecido).

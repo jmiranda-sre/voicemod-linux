@@ -19,9 +19,10 @@
 //! - Hotplug comes from registry `global`/`global_remove`.
 
 use super::super::{
-    AudioBackend, AudioDevice, AudioError, CallbackStats, DeviceRole, DeviceUid, HotplugEvent,
-    MonitorSettings, StreamKind, StreamLinkState, StreamProcessor, StreamStopReason, StreamTopology,
-    MAX_CHANNELS, MONITOR_SINK_NAME, QUANTUM_FRAMES, SAMPLE_RATE, VIRTUAL_SOURCE_NAME,
+    AppStream, AudioBackend, AudioDevice, AudioError, CallbackStats, DeviceRole, DeviceUid,
+    HotplugEvent, MonitorSettings, PassthroughSettings, StreamKind, StreamLinkState,
+    StreamProcessor, StreamStopReason, StreamTopology, MAX_CHANNELS, MONITOR_SINK_NAME,
+    PASSTHROUGH_SINK_NAME, QUANTUM_FRAMES, SAMPLE_RATE, VIRTUAL_SOURCE_NAME,
 };
 use pipewire as pw;
 use pw::{properties::properties, spa};
@@ -89,6 +90,9 @@ struct Shared {
     stats_cap: Mutex<CallbackStats>,
     stats_vad: Mutex<CallbackStats>,
     stats_mon: Mutex<CallbackStats>,
+    /// Passthrough injection stream (F-0.4.B 18; auxiliary — never
+    /// counted into the core-pipeline watchdog).
+    stats_inj: Mutex<CallbackStats>,
     fmt_cap: Mutex<FormatState>,
     fmt_out: Mutex<FormatState>,
     link: Mutex<StreamLinkState>,
@@ -105,6 +109,7 @@ impl Shared {
             stats_cap: Mutex::new(CallbackStats::default()),
             stats_vad: Mutex::new(CallbackStats::default()),
             stats_mon: Mutex::new(CallbackStats::default()),
+            stats_inj: Mutex::new(CallbackStats::default()),
             fmt_cap: Mutex::new(FormatState { rate: SAMPLE_RATE, channels: 2, format: SampleFormat::F32 }),
             fmt_out: Mutex::new(FormatState { rate: SAMPLE_RATE, channels: 2, format: SampleFormat::F32 }),
             link: Mutex::new(StreamLinkState::Down),
@@ -140,15 +145,30 @@ struct PlaybackData {
     processor: Arc<Mutex<dyn StreamProcessor>>,
     /// Tee into the monitor ring (Some on the VAD playback path).
     mon_tx: Option<rtrb::Producer<f32>>,
+    /// Tee into the passthrough inject ring (F-0.4.B 18): the soundboard
+    /// bus alone, written into the `vm-passthrough` sink by a separate
+    /// output stream. Always Some on the VAD path; the ring fills and
+    /// drops when no inject stream consumes it.
+    inj_tx: Option<rtrb::Producer<f32>>,
     scratch_in: Vec<Vec<f32>>,
     scratch_out: Vec<Vec<f32>>,
     scratch_raw: Vec<f32>,
     /// Interleaved stereo monitor-only bus (soundboard sounds routed away
     /// from vm-mic), staged here so the RT callback never allocates.
     mon_scratch: Vec<f32>,
+    /// Interleaved stereo full soundboard bus for the inject tee.
+    inj_scratch: Vec<f32>,
 }
 
 struct MonitorData {
+    shared: Arc<Shared>,
+    rx: rtrb::Consumer<f32>,
+    scratch: Vec<f32>,
+}
+
+/// Passthrough inject output stream (F-0.4.B 18): pops the soundboard
+/// bus ring and plays it into the `vm-passthrough` sink.
+struct InjectData {
     shared: Arc<Shared>,
     rx: rtrb::Consumer<f32>,
     scratch: Vec<f32>,
@@ -195,6 +215,11 @@ enum Cmd {
     DestroyVmMic(mpsc::Sender<Result<(), AudioError>>),
     /// Move the hear-myself monitor stream to another sink (F-0.4.C 15).
     MonitorRetarget(String, mpsc::Sender<Result<(), AudioError>>),
+    /// List application output streams (pulse sink-inputs) for the
+    /// passthrough picker (F-0.4.B 18).
+    ListApps(mpsc::Sender<Result<Vec<AppStream>, AudioError>>),
+    /// Converge the per-application passthrough to these settings.
+    SetPassthrough(Box<PassthroughSettings>, mpsc::Sender<Result<(), AudioError>>),
     Quit,
 }
 
@@ -298,12 +323,133 @@ fn default_sink_id(nodes: &Arc<Mutex<HashMap<u32, NodeSummary>>>) -> Option<u32>
         .map(|(id, _)| *id)
 }
 
+/// Default sink **name** via `pactl get-default-sink` (None on failure).
+fn default_sink_name() -> Option<String> {
+    let out = std::process::Command::new("pactl").arg("get-default-sink").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Run a `pactl` subcommand; stdout text or a descriptive error.
+fn pactl(args: &[&str]) -> Result<String, AudioError> {
+    let out = std::process::Command::new("pactl")
+        .args(args)
+        .output()
+        .map_err(|e| AudioError::Backend(format!("pactl missing/failed: {e}")))?;
+    if !out.status.success() {
+        return Err(AudioError::Backend(format!(
+            "pactl {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+// ---------------------------------------------------------------------------
+// pactl output parsers (pure; F-0.4.B item 18).
+// ---------------------------------------------------------------------------
+
+/// Parse `pactl list short sinks` (`id<TAB>name<TAB>driver<TAB>spec<TAB>state`).
+fn parse_short_sinks(text: &str) -> HashMap<u32, String> {
+    let mut map = HashMap::new();
+    for line in text.lines() {
+        let mut cols = line.split('\t');
+        if let (Some(id), Some(name)) = (cols.next(), cols.next()) {
+            if let Ok(id) = id.trim().parse::<u32>() {
+                let name = name.trim();
+                if !name.is_empty() {
+                    map.insert(id, name.to_string());
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Parse `pactl list short modules` (`id<TAB>name<TAB>argument`); returns
+/// module ids whose argument contains `needle`.
+fn parse_modules_with_argument(text: &str, needle: &str) -> Vec<u32> {
+    let mut ids = Vec::new();
+    for line in text.lines() {
+        let mut cols = line.split('\t');
+        let (Some(id), Some(_name), Some(arg)) = (cols.next(), cols.next(), cols.next()) else {
+            continue;
+        };
+        if arg.contains(needle) {
+            if let Ok(id) = id.trim().parse::<u32>() {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+/// Strip the surrounding quotes of a pactl property value, if any.
+fn unquote(v: &str) -> String {
+    let v = v.trim();
+    v.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(v).to_string()
+}
+
+/// Flush the in-progress `Sink Input` block, if any.
+fn flush_sink_input(
+    out: &mut Vec<AppStream>,
+    cur: &mut Option<(u32, Option<u32>, String, String)>,
+    sinks: &HashMap<u32, String>,
+) {
+    if let Some((id, sink_id, app, name)) = cur.take() {
+        let sink = sink_id
+            .and_then(|s| sinks.get(&s).cloned())
+            .unwrap_or_else(|| sink_id.map(|s| format!("#{s}")).unwrap_or_default());
+        out.push(AppStream { id, app, name, sink });
+    }
+}
+
+/// Parse `pactl list sink-inputs` into application streams. `sinks` maps
+/// sink ids to names (`parse_short_sinks`); unknown ids render `#<id>`.
+fn parse_sink_inputs(text: &str, sinks: &HashMap<u32, String>) -> Vec<AppStream> {
+    let mut out = Vec::new();
+    // id, "Sink:" id, application.name, media.name
+    let mut cur: Option<(u32, Option<u32>, String, String)> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Sink Input #") {
+            flush_sink_input(&mut out, &mut cur, sinks);
+            if let Ok(id) = rest.trim().parse::<u32>() {
+                cur = Some((id, None, String::new(), String::new()));
+            }
+        } else if let Some((_, sink_id, app, name)) = cur.as_mut() {
+            if let Some(v) = trimmed.strip_prefix("Sink:") {
+                *sink_id = v.trim().parse::<u32>().ok();
+            } else if let Some(v) = trimmed.strip_prefix("application.name = ") {
+                *app = unquote(v);
+            } else if let Some(v) = trimmed.strip_prefix("media.name = ") {
+                *name = unquote(v);
+            }
+        }
+    }
+    flush_sink_input(&mut out, &mut cur, sinks);
+    out
+}
+
 fn device_role(class: &str, name: &str) -> Option<DeviceRole> {
     if name == VIRTUAL_SOURCE_NAME || name.starts_with(&format!("{VIRTUAL_SOURCE_NAME}.")) {
         return Some(DeviceRole::Virtual);
     }
     if class.contains("Audio/Source") {
         Some(DeviceRole::Input)
+    } else if class.contains("Audio/Sink") {
+        // Physical playback devices are selectable targets (monitor,
+        // passthrough); virtual sinks we manage show up too and are
+        // filtered by consumers when needed.
+        Some(DeviceRole::Sink)
     } else {
         None
     }
@@ -368,6 +514,7 @@ impl AudioBackend for PipeWireBackend {
             StreamKind::FullDuplexCapture => self.shared.stats_cap.lock(),
             StreamKind::HalfDuplexPlayback => self.shared.stats_vad.lock(),
             StreamKind::Monitor => self.shared.stats_mon.lock(),
+            StreamKind::Inject => self.shared.stats_inj.lock(),
         };
         guard
             .map(|g| CallbackStats {
@@ -422,6 +569,17 @@ impl AudioBackend for PipeWireBackend {
         }
         Ok(())
     }
+
+    fn output_streams(&mut self) -> Result<Vec<AppStream>, AudioError> {
+        flatten(self.roundtrip(Cmd::ListApps, "list apps"))
+    }
+
+    fn set_passthrough(&mut self, settings: &PassthroughSettings) -> Result<(), AudioError> {
+        flatten(self.roundtrip(
+            |tx| Cmd::SetPassthrough(Box::new(settings.clone()), tx),
+            "set passthrough",
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -450,6 +608,12 @@ fn reply_err(cmd: Cmd, msg: &str) {
             let _ = tx.send(Err(err));
         }
         Cmd::MonitorRetarget(_, tx) => {
+            let _ = tx.send(Err(err));
+        }
+        Cmd::ListApps(tx) => {
+            let _ = tx.send(Err(err));
+        }
+        Cmd::SetPassthrough(_, tx) => {
             let _ = tx.send(Err(err));
         }
         Cmd::Quit => {}
@@ -589,6 +753,10 @@ fn worker_main(
         links: Vec::new(),
         mon_links: Vec::new(),
         mon_node_id: None,
+        inject_rx: None,
+        inject: None,
+        inject_links: Vec::new(),
+        passthrough: PassState::default(),
     };
     worker.run(&mainloop, &core);
 }
@@ -630,6 +798,37 @@ struct Worker {
     mon_links: Vec<pw::link::Link>,
     /// Node id of the monitor stream (set on `open`).
     mon_node_id: Option<u32>,
+    /// Consumer for the next inject stream (recreated on every `open`).
+    inject_rx: Option<rtrb::Consumer<f32>>,
+    /// Live passthrough inject stream, when active.
+    inject: Option<InjectStream>,
+    /// Inject stream → passthrough sink links.
+    inject_links: Vec<pw::link::Link>,
+    /// Per-application passthrough state (F-0.4.B 18).
+    passthrough: PassState,
+}
+
+/// Live passthrough inject stream bundle (F-0.4.B 18).
+struct InjectStream {
+    _stream: pw::stream::StreamRc,
+    _listener: pw::stream::StreamListener<InjectData>,
+    _pods: Vec<&'static Pod>,
+    _node_id: u32,
+}
+
+/// Worker-side passthrough bookkeeping.
+#[derive(Default)]
+struct PassState {
+    settings: PassthroughSettings,
+    /// pactl module index of the `vm-passthrough` null-sink (when we
+    /// created it this session).
+    sink_module: Option<u32>,
+    /// pactl module index of the forwarding loopback.
+    loopback_module: Option<u32>,
+    /// Sink name the loopback currently forwards to.
+    loopback_target: String,
+    /// sink-input id → original sink name (moves we performed).
+    moved: HashMap<u32, String>,
 }
 
 impl Worker {
@@ -668,6 +867,17 @@ impl Worker {
     }
 
     fn teardown(&mut self) {
+        // Process exit: leave the system as we found it (apps back to
+        // their sinks, passthrough modules unloaded; boot re-applies).
+        self.destroy_inject_stream();
+        if self.passthrough.settings.enabled
+            || self.passthrough.sink_module.is_some()
+            || self.passthrough.loopback_module.is_some()
+        {
+            if let Err(e) = self.disable_passthrough() {
+                eprintln!("vm-audio: passthrough teardown: {e}");
+            }
+        }
         self.streams = None;
         self.mon_links.clear();
         self.mon_node_id = None;
@@ -702,6 +912,12 @@ impl Worker {
             }
             Cmd::MonitorRetarget(uid, tx) => {
                 let _ = tx.send(self.retarget_monitor(&uid, core, loop_));
+            }
+            Cmd::ListApps(tx) => {
+                let _ = tx.send(self.list_app_streams());
+            }
+            Cmd::SetPassthrough(settings, tx) => {
+                let _ = tx.send(self.apply_passthrough(core, loop_, &settings));
             }
             Cmd::Quit => {}
         }
@@ -852,6 +1068,7 @@ impl Worker {
         }
         let (raw_tx, raw_rx) = rtrb::RingBuffer::new(RING_SAMPLES);
         let (mon_tx, mon_rx) = rtrb::RingBuffer::new(RING_SAMPLES);
+        let (inj_tx, inj_rx) = rtrb::RingBuffer::new(RING_SAMPLES);
 
         let cap_data = CaptureData { shared: self.shared.clone(), tx: raw_tx, scratch: Vec::new() };
         let vad_data = PlaybackData {
@@ -859,12 +1076,17 @@ impl Worker {
             rx: raw_rx,
             processor: req.processor,
             mon_tx: Some(mon_tx),
+            inj_tx: Some(inj_tx),
             scratch_in: Vec::new(),
             scratch_out: Vec::new(),
             scratch_raw: Vec::new(),
             mon_scratch: Vec::new(),
+            inj_scratch: Vec::new(),
         };
         let mon_data = MonitorData { shared: self.shared.clone(), rx: mon_rx, scratch: Vec::new() };
+        // The inject consumer is stashed for a later `ensure_inject_stream`
+        // (passthrough may be enabled after this open).
+        self.inject_rx = Some(inj_rx);
 
         // Resolve the mic's output ports first so the capture format
         // matches the device width (mono mics expose a single port).
@@ -1057,19 +1279,6 @@ impl Worker {
                 let t0 = Instant::now();
                 let mut xrun = false;
                 if let Some(mut buffer) = stream.dequeue_buffer() {
-                    {
-                        static BLEN2: std::sync::atomic::AtomicUsize =
-                            std::sync::atomic::AtomicUsize::new(0);
-                        if BLEN2.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(200) {
-                            let nd = buffer.datas_mut().len();
-                            let lens: Vec<usize> = buffer
-                                .datas_mut()
-                                .iter_mut()
-                                .map(|d| d.data().map(|b| b.len()).unwrap_or(usize::MAX))
-                                .collect();
-                            eprintln!("VADBUF2 datas={nd} lens={lens:?}");
-                        }
-                    }
                     let (ch, rate) = data
                         .shared
                         .fmt_out
@@ -1122,6 +1331,7 @@ impl Worker {
                                 stage.resize(frames, 0.0);
                             }
                             data.mon_scratch.resize(frames * 2, 0.0);
+                            data.inj_scratch.resize(frames * 2, 0.0);
                             match data.processor.try_lock() {
                                 Ok(mut proc) => {
                                     let ins: Vec<&[f32]> =
@@ -1137,6 +1347,12 @@ impl Worker {
                                     let bus = proc.monitor_bus();
                                     let n = bus.len().min(data.mon_scratch.len());
                                     data.mon_scratch[..n].copy_from_slice(&bus[..n]);
+                                    // Full soundboard bus for passthrough injection
+                                    // (F-0.4.B 18) — staged for the tee below.
+                                    let ibus = proc.inject_bus();
+                                    let n = ibus.len().min(data.inj_scratch.len());
+                                    data.inj_scratch[..n].copy_from_slice(&ibus[..n]);
+                                    data.inj_scratch[n..].fill(0.0);
                                 }
                                 Err(_) => {
                                     // Contended: pass through (never block RT).
@@ -1152,36 +1368,11 @@ impl Worker {
                                     xrun = true;
                                 }
                             }
-                            {
-                                static OPEAK: std::sync::atomic::AtomicUsize =
-                                    std::sync::atomic::AtomicUsize::new(0);
-                                if OPEAK.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(300) {
-                                    let mx = data
-                                        .scratch_out
-                                        .iter()
-                                        .flat_map(|l| l.iter())
-                                        .fold(0.0f32, |m, s| m.max(s.abs()));
-                                    eprintln!("OPEAK graph-out peak={mx:.4} rate={rate} frames={frames}");
-                                }
-                            }
                             for f in 0..frames {
                                 for c in 0..ch {
                                     let v = data.scratch_out[c % MAX_CHANNELS][f];
                                     let off = (f * ch + c) * 4;
                                     bytes[off..off + 4].copy_from_slice(&v.to_le_bytes());
-                                }
-                            }
-                            {
-                                static IPEAK: std::sync::atomic::AtomicUsize =
-                                    std::sync::atomic::AtomicUsize::new(0);
-                                if IPEAK.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(300) {
-                                    let mx = bytes
-                                        .as_chunks::<4>()
-                                        .0
-                                        .iter()
-                                        .map(|w| f32::from_le_bytes(*w).abs())
-                                        .fold(0.0f32, f32::max);
-                                    eprintln!("IPEAK interleaved peak={mx:.4} frames={frames}");
                                 }
                             }
                             // Publish exactly what we wrote; the rest of the
@@ -1224,6 +1415,19 @@ impl Worker {
                                         if mon.push(v).is_err() {
                                             break;
                                         }
+                                    }
+                                }
+                            }
+                            if let Some(inj) = data.inj_tx.as_mut() {
+                                // Passthrough injection tee (F-0.4.B 18): the
+                                // full soundboard bus (post ducking) feeding
+                                // the `vm-passthrough` sink via vm-inject.
+                                // The ring fills and drops while the inject
+                                // stream is absent; `ensure_inject_stream`
+                                // drains it before playing.
+                                for s in data.inj_scratch.iter().take(frames * 2) {
+                                    if inj.push(*s).is_err() {
+                                        break;
                                     }
                                 }
                             }
@@ -1380,6 +1584,15 @@ impl Worker {
             let _ = s._vad.set_active(true);
             let _ = s._monitor.set_active(true);
         }
+        // Passthrough survives watchdog restarts and input switches: the
+        // worker state persists, only the injection stream is rebuilt
+        // against the fresh ring.
+        if self.passthrough.settings.enabled {
+            let settings = self.passthrough.settings.clone();
+            if let Err(e) = self.apply_passthrough(core, loop_, &settings) {
+                eprintln!("vm-audio: passthrough re-apply failed: {e}");
+            }
+        }
         *self.shared.link.lock().unwrap() = StreamLinkState::Streaming;
         Ok(())
     }
@@ -1501,6 +1714,308 @@ impl Worker {
         Ok(())
     }
 
+    // -- Per-application passthrough (F-0.4.B item 18) --------------------
+
+    /// Find a node by its `node.name`.
+    fn find_node_by_name(&self, name: &str) -> Option<u32> {
+        self.nodes
+            .lock()
+            .ok()?
+            .iter()
+            .find(|(_, n)| n.name == name)
+            .map(|(id, _)| *id)
+    }
+
+    /// Module ids whose pactl argument contains `needle`.
+    fn modules_with_argument(&self, needle: &str) -> Vec<u32> {
+        match std::process::Command::new("pactl")
+            .args(["list", "short", "modules"])
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                parse_modules_with_argument(&String::from_utf8_lossy(&out.stdout), needle)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn unload_module(&self, id: u32) {
+        let _ = std::process::Command::new("pactl")
+            .args(["unload-module", &id.to_string()])
+            .output();
+    }
+
+    /// Unload `module-null-sink` leftovers from a crashed session, except
+    /// `keep`. Never touches loopbacks.
+    fn purge_stale_sink_modules(&self, keep: &[Option<u32>]) {
+        let keep: Vec<u32> = keep.iter().flatten().copied().collect();
+        for id in self.modules_with_argument("sink_name=vm-passthrough") {
+            if !keep.contains(&id) {
+                self.unload_module(id);
+            }
+        }
+    }
+
+    /// Unload `module-loopback` leftovers from a crashed session, except
+    /// `keep`. Never touches the sink module: an adopted `vm-passthrough`
+    /// node (crash leftover) has no recorded module id here, and purging
+    /// it would tear down the very sink the session just adopted.
+    fn purge_stale_loopback_modules(&self, keep: &[Option<u32>]) {
+        let keep: Vec<u32> = keep.iter().flatten().copied().collect();
+        for id in self.modules_with_argument("source=vm-passthrough.monitor") {
+            if !keep.contains(&id) {
+                self.unload_module(id);
+            }
+        }
+    }
+
+    /// Application output streams (pulse sink-inputs) for the picker.
+    fn list_app_streams(&self) -> Result<Vec<AppStream>, AudioError> {
+        let sinks = parse_short_sinks(&pactl(&["list", "short", "sinks"])?);
+        let inputs = pactl(&["list", "sink-inputs"])?;
+        Ok(parse_sink_inputs(&inputs, &sinks))
+    }
+
+    /// Create (or adopt) the `vm-passthrough` sink and return its node id.
+    fn ensure_passthrough_sink(&mut self, loop_: &pw::loop_::Loop) -> Result<u32, AudioError> {
+        if let Some(id) = self.find_node_by_name(PASSTHROUGH_SINK_NAME) {
+            return Ok(id);
+        }
+        self.purge_stale_sink_modules(&[self.passthrough.sink_module]);
+        self.purge_stale_loopback_modules(&[self.passthrough.loopback_module]);
+        let module = pactl(&[
+            "load-module",
+            "module-null-sink",
+            "sink_name=vm-passthrough",
+            "sink_properties=device.description='vm-passthrough (soundboard injection)'",
+        ])?
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| AudioError::Backend("pactl load-module returned no module id".into()))?;
+        self.passthrough.sink_module = Some(module);
+        let mut found = None;
+        self.pump_until(loop_, Duration::from_secs(5), || {
+            found = self.find_node_by_name(PASSTHROUGH_SINK_NAME);
+            found.is_some()
+        });
+        found.ok_or_else(|| AudioError::Backend("vm-passthrough sink did not appear".into()))
+    }
+
+    /// Point the forwarding loopback at `target` (sink name), reloading it
+    /// only when the target actually changed.
+    fn ensure_loopback(&mut self, target: &str) -> Result<(), AudioError> {
+        if self.passthrough.loopback_module.is_some() && self.passthrough.loopback_target == target {
+            return Ok(());
+        }
+        if let Some(m) = self.passthrough.loopback_module.take() {
+            self.unload_module(m);
+        }
+        self.purge_stale_loopback_modules(&[]);
+        let module = pactl(&[
+            "load-module",
+            "module-loopback",
+            "source=vm-passthrough.monitor",
+            &format!("sink={target}"),
+            "latency_msec=20",
+        ])?
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| AudioError::Backend("pactl loopback returned no module id".into()))?;
+        self.passthrough.loopback_module = Some(module);
+        self.passthrough.loopback_target = target.to_string();
+        Ok(())
+    }
+
+    /// Declarative app moves: when enabled, exactly `app` (if any) sits on
+    /// `vm-passthrough`; strays get restored to their original (or default)
+    /// sink. Missing `app` fails the action (the daemon rolls back).
+    fn sync_moved_apps(&mut self, app: &str) -> Result<(), AudioError> {
+        let sinks = parse_short_sinks(&pactl(&["list", "short", "sinks"])?);
+        let inputs = parse_sink_inputs(&pactl(&["list", "sink-inputs"])?, &sinks);
+        let default = default_sink_name();
+        for stream in &inputs {
+            let keep = !app.is_empty() && stream.app.eq_ignore_ascii_case(app);
+            if stream.sink == PASSTHROUGH_SINK_NAME && !keep {
+                let target = self
+                    .passthrough
+                    .moved
+                    .remove(&stream.id)
+                    .or_else(|| default.clone());
+                if let Some(t) = target {
+                    let _ = pactl(&["move-sink-input", &stream.id.to_string(), &t]);
+                }
+            }
+        }
+        if !app.is_empty() {
+            let pick = inputs
+                .iter()
+                .find(|s| s.app == app)
+                .or_else(|| inputs.iter().find(|s| s.app.eq_ignore_ascii_case(app)));
+            match pick {
+                Some(stream) if stream.sink != PASSTHROUGH_SINK_NAME => {
+                    self.passthrough.moved.entry(stream.id).or_insert_with(|| stream.sink.clone());
+                    pactl(&["move-sink-input", &stream.id.to_string(), PASSTHROUGH_SINK_NAME])?;
+                }
+                Some(_) => {} // already routed
+                None => {
+                    return Err(AudioError::Backend(format!("application '{app}' not found")));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Spawn the soundboard injection stream feeding the passthrough sink.
+    fn ensure_inject_stream(
+        &mut self,
+        core: &pw::core::CoreRc,
+        loop_: &pw::loop_::Loop,
+        sink_id: u32,
+    ) -> Result<(), AudioError> {
+        if self.inject.is_some() {
+            return Ok(());
+        }
+        // No open session yet: `open_streams` creates the ring and calls
+        // back here. Nothing to feed otherwise.
+        let Some(mut rx) = self.inject_rx.take() else {
+            return Ok(());
+        };
+        // Drop stale bus content so enabling never replays old sounds.
+        while rx.pop().is_ok() {}
+        let props = properties! {
+            *pw::keys::NODE_NAME => "vm-inject",
+            *pw::keys::NODE_DESCRIPTION => "vm soundboard injection",
+            *pw::keys::MEDIA_TYPE => "Audio",
+            *pw::keys::MEDIA_CATEGORY => "Playback",
+            *pw::keys::MEDIA_ROLE => "Music",
+            *pw::keys::NODE_LATENCY => LATENCY_PROP,
+        };
+        let stream = pw::stream::StreamRc::new(pw::core::CoreRc::clone(core), "vm-inject", props)
+            .map_err(|e| AudioError::Backend(format!("inject stream: {e:?}")))?;
+        let data = InjectData { shared: self.shared.clone(), rx, scratch: Vec::new() };
+        let listener = stream
+            .add_local_listener_with_user_data(data)
+            .process(|stream, data| {
+                let t0 = Instant::now();
+                let mut xrun = false;
+                if let Some(mut buffer) = stream.dequeue_buffer() {
+                    let ch = data.shared.fmt_out.lock().map(|f| f.channels.max(1)).unwrap_or(2);
+                    for data_chunk in buffer.datas_mut() {
+                        if let Some(bytes) = data_chunk.data() {
+                            let capacity = bytes.len() / (4 * ch);
+                            let frames = (QUANTUM_FRAMES as usize).min(capacity).max(1);
+                            data.scratch.resize(frames * ch, 0.0);
+                            for s in data.scratch.iter_mut() {
+                                *s = data.rx.pop().unwrap_or_else(|_| {
+                                    xrun = true;
+                                    0.0
+                                });
+                            }
+                            for (i, word) in bytes
+                                .as_chunks_mut::<4>()
+                                .0
+                                .iter_mut()
+                                .enumerate()
+                                .take(frames * ch)
+                            {
+                                word.copy_from_slice(&data.scratch[i].to_le_bytes());
+                            }
+                            let chunk = data_chunk.chunk_mut();
+                            *chunk.offset_mut() = 0;
+                            *chunk.stride_mut() = (ch * 4) as _;
+                            *chunk.size_mut() = (frames * ch * 4) as _;
+                        }
+                    }
+                } else {
+                    xrun = true;
+                }
+                record(&data.shared.stats_inj, t0, xrun);
+            })
+            .register()
+            .map_err(|e| AudioError::Backend(format!("inject listener: {e:?}")))?;
+        let pod = format_pod(MAX_CHANNELS as u32)?;
+        let mut params = [pod; 1];
+        stream
+            .connect(
+                spa::utils::Direction::Output,
+                None,
+                pw::stream::StreamFlags::MAP_BUFFERS | pw::stream::StreamFlags::RT_PROCESS,
+                &mut params,
+            )
+            .map_err(|e| AudioError::Backend(format!("inject connect: {e:?}")))?;
+        let mut node_id = stream.node_id();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while node_id == u32::MAX && Instant::now() < deadline {
+            let _ = loop_.iterate(pw::loop_::Timeout::Finite(Duration::from_millis(50)));
+            node_id = stream.node_id();
+        }
+        if node_id == u32::MAX {
+            return Err(AudioError::Backend("inject stream node id never assigned".into()));
+        }
+        let links = self.link_ports(core, loop_, node_id, sink_id)?;
+        let _ = stream.set_active(true);
+        self.inject_links = links;
+        self.inject = Some(InjectStream {
+            _stream: stream,
+            _listener: listener,
+            _pods: vec![pod],
+            _node_id: node_id,
+        });
+        Ok(())
+    }
+
+    /// Drop the injection stream (links included); the ring drains and the
+    /// VAD tee keeps filling it for the next enable.
+    fn destroy_inject_stream(&mut self) {
+        self.inject_links.clear();
+        self.inject = None;
+    }
+
+    /// Converge the passthrough topology to `settings` (idempotent).
+    fn apply_passthrough(
+        &mut self,
+        core: &pw::core::CoreRc,
+        loop_: &pw::loop_::Loop,
+        settings: &PassthroughSettings,
+    ) -> Result<(), AudioError> {
+        self.passthrough.settings = settings.clone();
+        if !settings.enabled {
+            return self.disable_passthrough();
+        }
+        let sink_id = self.ensure_passthrough_sink(loop_)?;
+        let target = if settings.device.is_empty() {
+            default_sink_name()
+                .ok_or_else(|| AudioError::Backend("no default sink to forward to".into()))?
+        } else {
+            settings.device.clone()
+        };
+        self.ensure_loopback(&target)?;
+        // On error the caller rolls the config back and a later call
+        // converges; sink + loopback stay up meanwhile.
+        self.sync_moved_apps(&settings.app)?;
+        self.ensure_inject_stream(core, loop_, sink_id)?;
+        Ok(())
+    }
+
+    /// Tear the passthrough down: restore every app, drop the loopback and
+    /// the sink (including leftovers from a crashed session). Module
+    /// cleanup is best-effort; only a failed restore surfaces.
+    fn disable_passthrough(&mut self) -> Result<(), AudioError> {
+        self.destroy_inject_stream();
+        let restore = self.sync_moved_apps("");
+        if let Some(m) = self.passthrough.loopback_module.take() {
+            self.unload_module(m);
+        }
+        if let Some(m) = self.passthrough.sink_module.take() {
+            self.unload_module(m);
+        }
+        self.purge_stale_sink_modules(&[]);
+        self.purge_stale_loopback_modules(&[]);
+        self.passthrough.moved.clear();
+        self.passthrough.loopback_target.clear();
+        restore
+    }
+
     fn start_streams(&mut self) -> Result<(), AudioError> {
         // PipeWire streams flow once connected; `open` already connected.
         if self.streams.is_none() {
@@ -1513,6 +2028,8 @@ impl Worker {
         // Dropping streams AND link proxies disconnects everything; the
         // worker keeps the loop alive for re-open (mirrors the reference
         // restart path).
+        self.destroy_inject_stream();
+        self.inject_rx = None;
         self.links.clear();
         self.mon_links.clear();
         self.mon_node_id = None;
@@ -1540,5 +2057,84 @@ mod pod_tests {
                 "format"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod pactl_parse_tests {
+    use super::{parse_modules_with_argument, parse_short_sinks, parse_sink_inputs};
+
+    /// Real `pactl list short sinks` shape (tabs).
+    const SHORT_SINKS: &str = "\
+51\talsa_output.usb-MV-SILICON_fifine_Microphone_20190808-00.analog-stereo\tPipeWire\ts24le 2ch 48000Hz\tSUSPENDED\n\
+55\talsa_output.pci-0000_00_1f.3.analog-stereo\tPipeWire\ts32le 2ch 48000Hz\tRUNNING\n\
+18369\teasyeffects_sink\tPipeWire\tfloat32le 2ch 48000Hz\tSUSPENDED\n";
+
+    /// Real `pactl list sink-inputs` shape (adapted from a live capture).
+    const SINK_INPUTS: &str = "\
+Sink Input #19650\n\
+\tDriver: PipeWire\n\
+\tClient: 19438\n\
+\tSink: 18369\n\
+\tSample Specification: float32le 2ch 48000Hz\n\
+\tProperties:\n\
+\t\tclient.api = \"pipewire-pulse\"\n\
+\t\tapplication.name = \"Firefox\"\n\
+\t\tapplication.process.id = \"463382\"\n\
+\t\tmedia.name = \"AudioStream\"\n\
+\n\
+Sink Input #19700\n\
+\tDriver: PipeWire\n\
+\tSink: 55\n\
+\tProperties:\n\
+\t\tapplication.name = \"Discord\"\n\
+\t\tmedia.name = \"playback\"\n\
+\n\
+Sink Input #19742\n\
+\tSink: 999999\n\
+\tProperties:\n\
+\t\tmedia.name = \"mystery\"\n";
+
+    #[test]
+    fn short_sinks_parse_id_and_name() {
+        let sinks = parse_short_sinks(SHORT_SINKS);
+        assert_eq!(sinks.len(), 3);
+        assert_eq!(sinks[&55], "alsa_output.pci-0000_00_1f.3.analog-stereo");
+        assert_eq!(sinks[&18369], "easyeffects_sink");
+        // Junk lines are skipped, never panic.
+        assert!(parse_short_sinks("garbage\n\t\t").is_empty());
+    }
+
+    #[test]
+    fn sink_inputs_parse_apps_and_resolve_sinks() {
+        let sinks = parse_short_sinks(SHORT_SINKS);
+        let apps = parse_sink_inputs(SINK_INPUTS, &sinks);
+        assert_eq!(apps.len(), 3);
+        assert_eq!(apps[0].id, 19650);
+        assert_eq!(apps[0].app, "Firefox");
+        assert_eq!(apps[0].name, "AudioStream");
+        assert_eq!(apps[0].sink, "easyeffects_sink");
+        assert_eq!(apps[1].id, 19700);
+        assert_eq!(apps[1].app, "Discord");
+        assert_eq!(apps[1].sink, "alsa_output.pci-0000_00_1f.3.analog-stereo");
+        // Unknown sink ids stay visible as #<id>; missing app is empty.
+        assert_eq!(apps[2].sink, "#999999");
+        assert_eq!(apps[2].app, "");
+        assert_eq!(apps[2].name, "mystery");
+    }
+
+    #[test]
+    fn modules_with_argument_matches_needle() {
+        let text = "\
+12\tmodule-null-sink\tsink_name=vm-mic sink_properties=device.description='vm-mic virtual microphone'\n\
+20\tmodule-null-sink\tsink_name=vm-passthrough sink_properties=device.description='vm-passthrough (soundboard injection)'\n\
+21\tmodule-loopback\tsource=vm-passthrough.monitor sink=alsa_output.pci-0000_00_1f.3.analog-stereo latency_msec=20\n\
+30\tmodule-loopback\tsource=easyeffects_sink.monitor sink=alsa_output.pci-0000_00_1f.3.analog-stereo latency_msec=500\n";
+        assert_eq!(parse_modules_with_argument(text, "sink_name=vm-passthrough"), vec![20]);
+        assert_eq!(
+            parse_modules_with_argument(text, "source=vm-passthrough.monitor"),
+            vec![21]
+        );
+        assert!(parse_modules_with_argument(text, "sink_name=vm-monitor").is_empty());
     }
 }

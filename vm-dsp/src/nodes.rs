@@ -758,9 +758,10 @@ impl AudioNode for Delay {
 
 /// Filter shape: standard RBJ cookbook types selected at runtime via
 /// the `type` param (`bell` is accepted as an alias for `peaking` to
-/// match common EQ vocabulary).
+/// match common EQ vocabulary). Public since F-0.4.B: the UI EQ canvas
+/// draws the response through [`biquad_magnitude_db`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BqType {
+pub enum BqType {
     Lowpass,
     Highpass,
     Peaking,
@@ -771,7 +772,7 @@ enum BqType {
 }
 
 impl BqType {
-    fn parse(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "lowpass" => Some(Self::Lowpass),
             "highpass" => Some(Self::Highpass),
@@ -784,7 +785,7 @@ impl BqType {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Lowpass => "lowpass",
             Self::Highpass => "highpass",
@@ -839,7 +840,11 @@ pub(crate) fn rbj_highpass(rate: f32, freq: f32, q: f32) -> [f32; 5] {
     )
 }
 
-fn biquad_coeffs(kind: BqType, rate: f32, freq: f32, q: f32, gain_db: f32) -> [f32; 5] {
+/// RBJ cookbook coefficients for `kind` at `rate`/`freq`/`q`/`gain_db`,
+/// denormalized to `[b0, b1, b2, a1, a2]`. This is the single source of
+/// EQ math: the DSP [`Biquad`] and the UI canvas
+/// ([`biquad_magnitude_db`]) both read it.
+pub fn biquad_coeffs(kind: BqType, rate: f32, freq: f32, q: f32, gain_db: f32) -> [f32; 5] {
     let rate = rate.max(1.0);
     let freq = freq.clamp(1.0, rate * 0.49);
     let q = q.max(0.05);
@@ -896,6 +901,36 @@ fn biquad_coeffs(kind: BqType, rate: f32, freq: f32, q: f32, gain_db: f32) -> [f
         BqType::Bandpass => normalize(alpha, 0.0, -alpha, 1.0 + alpha, -2.0 * cos, 1.0 - alpha),
         BqType::Notch => normalize(1.0, -2.0 * cos, 1.0, 1.0 + alpha, -2.0 * cos, 1.0 - alpha),
     }
+}
+
+/// Magnitude response of the biquad (`biquad_coeffs`) at frequency `at`
+/// in dB, evaluated on the unit circle:
+/// `|H(e^{jw})| = |b0 + b1 e^{-jw} + b2 e^{-2jw}| / |1 + a1 e^{-jw} + a2 e^{-2jw}|`.
+/// Used by the UI EQ canvas, so the drawn curve is the exact filter the
+/// audio path runs. Pure and allocation-free.
+pub fn biquad_magnitude_db(
+    kind: BqType,
+    rate: f32,
+    freq: f32,
+    q: f32,
+    gain_db: f32,
+    at: f32,
+) -> f32 {
+    let c = biquad_coeffs(kind, rate, freq, q, gain_db);
+    let (b0, b1, b2, a1, a2) = (c[0], c[1], c[2], c[3], c[4]);
+    let w = 2.0 * std::f32::consts::PI * at.clamp(0.0, rate * 0.5) / rate.max(1.0);
+    let (sw, cw) = w.sin_cos();
+    let (s2w, c2w) = (2.0 * sw * cw, cw * cw - sw * sw);
+    let num_re = b0 + b1 * cw + b2 * c2w;
+    let num_im = -(b1 * sw + b2 * s2w);
+    let den_re = 1.0 + a1 * cw + a2 * c2w;
+    let den_im = -(a1 * sw + a2 * s2w);
+    let num2 = num_re * num_re + num_im * num_im;
+    let den2 = den_re * den_re + den_im * den_im;
+    if den2 <= f32::MIN_POSITIVE || num2 <= 0.0 {
+        return -100.0;
+    }
+    (10.0 * (num2 / den2).log10()).clamp(-100.0, 60.0)
 }
 
 /// RBJ biquad with runtime-selectable type/frequency/Q/gain (the EQ
@@ -1334,6 +1369,33 @@ mod biquad_tests {
         assert!(r_air > 1.3, "air band must lift: {r_air:.3}");
         let r_low = gain_at(&mut b, 200.0);
         assert!(r_low < 1.12, "shelf must not touch lows: {r_low:.3}");
+    }
+
+    #[test]
+    fn magnitude_db_matches_measured_response() {
+        // Bell +6 dB @ 1 kHz: the analytic peak hits the requested gain.
+        let db = biquad_magnitude_db(BqType::Peaking, 48_000.0, 1_000.0, 1.0, 6.0, 1_000.0);
+        assert!((db - 6.0).abs() < 0.05, "bell peak: {db}");
+        // Far above the bell the curve is flat again.
+        let far = biquad_magnitude_db(BqType::Peaking, 48_000.0, 1_000.0, 1.0, 6.0, 15_000.0);
+        assert!(far.abs() < 0.5, "15 kHz stays flat: {far}");
+        // Cross-check with the DSP itself: measured sine gain must match
+        // the analytic curve (single source of EQ math for UI + audio).
+        let mut b = Biquad::default();
+        b.set_param("type", ParamValue::Text("bell".into())).unwrap();
+        b.set_param("freq_hz", ParamValue::Float(1_000.0)).unwrap();
+        b.set_param("q", ParamValue::Float(1.0)).unwrap();
+        b.set_param("gain_db", ParamValue::Float(6.0)).unwrap();
+        let measured_db = 20.0 * gain_at(&mut b, 1_000.0).log10();
+        assert!(
+            (db - measured_db).abs() < 0.2,
+            "analytic {db:.2} dB vs measured {measured_db:.2} dB"
+        );
+        // Lowpass: flat at DC, deep roll-off by 20 kHz.
+        let dc = biquad_magnitude_db(BqType::Lowpass, 48_000.0, 1_000.0, 0.707, 0.0, 0.0);
+        assert!(dc.abs() < 0.01, "LP DC gain: {dc}");
+        let hf = biquad_magnitude_db(BqType::Lowpass, 48_000.0, 1_000.0, 0.707, 0.0, 20_000.0);
+        assert!(hf < -20.0, "LP at 20 kHz: {hf}");
     }
 
     #[test]

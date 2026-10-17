@@ -61,6 +61,57 @@ semantic versioning.
 - MIDI open failures are logged once per distinct error instead of
   every 2 s retry.
 
+### Added (F-0.4.B: soundboard pro + UX)
+
+- First-run setup wizard (item 29): guided modal (microphone test →
+  3 s room-noise measurement → gate → speech level → makeup/limiter
+  trim) that opens automatically on the first UI run (`wizard.json`
+  marker in the config dir; "Setup wizard" in the top bar reopens it).
+  It samples distinct level readings, takes the median, captures the
+  denoise noise profile (`captureNoiseProfile`) and suggests a gate
+  (floor + 6 dB, clamped to the node range) plus a makeup gain that
+  brings speech to −18 dBFS — each applied with one click. Levels
+  poll at 100 ms only while the wizard is open.
+- Graphical EQ (item 26): interactive response curve in the *Voices*
+  tab. Drag a handle (horizontal = frequency, vertical = gain),
+  double-click resets the gain, sliders fine-tune frequency/Q/gain of
+  the selected band. The curve is drawn from the exact DSP math
+  (`vm_dsp::biquad_magnitude_db` — analytic response cross-checked
+  against the measured biquad in the test suite), so canvas and audio
+  cannot drift.
+- Per-application passthrough (item 18): route one app's playback into
+  a `vm-passthrough` null-sink, forward it to any output through a
+  20 ms loopback (`setPassthrough`/`getPassthrough`; empty device =
+  system default; `listPassthroughApps` feeds the picker). Exactly the
+  chosen app sits on the sink and strays are restored; re-running the
+  action converges; an unknown app fails loudly and the daemon rolls
+  back config and backend. Soundboard playback injects into the same
+  sink (`vm-inject`, post-ducking, independent of the master mute).
+  Boot re-applies the saved state, adopting and cleaning leftovers
+  from crashed sessions.
+- Instant Replay (item 20): always-on ring of the final output
+  (post-mute), 30 s by default. `saveInstantReplay` (or the
+  `SaveReplay` hotkey) writes the window as PCM16 stereo 48 kHz WAV to
+  `$VM_CONFIG_DIR/replays/replay-<unix>.wav` — hand-rolled RIFF
+  writer, zero new dependencies; the RT thread only `try_lock`s
+  (contention = skip). `setInstantReplay`/`getInstantReplay`
+  (5..=120 s, `buffered_seconds`); disabling clears the history.
+- Config schema v4 (`replay`, `passthrough` sections; v1–v3 configs
+  migrate forward).
+- UI: new *Integrations* tab surfaces monitor mix, ducking, OBS and
+  MIDI; the *Soundboard* tab gains instant-replay and passthrough
+  rows; *Devices* splits Input / Output (sinks) / Virtual+monitor.
+
+### Fixed (F-0.4.B)
+
+- Live passthrough teardown bug (caught by the live smoke): adopting
+  a `vm-passthrough` sink left over from a previous session recorded
+  no module id, and the next loopback rebuild purged the adopted
+  null-sink itself — boot-apply then moved apps toward a sink name
+  that no longer existed (`No such entity`). Sink and loopback purges
+  are now separate: the adopted sink survives and boot-apply re-routes
+  the app as intended.
+
 ### Added (F-0.4.A: new-generation DSP)
 
 - `rnnoise` node: Xiph RNNoise denoiser via the pure-Rust

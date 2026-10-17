@@ -2,8 +2,9 @@
 //! headless CI (golden-render tests) until the PipeWire backend lands.
 
 use super::super::{
-    AudioBackend, AudioDevice, AudioError, CallbackStats, DeviceRole, DeviceUid, HotplugEvent,
-    StreamKind, StreamStopReason, StreamTopology, MAX_CHANNELS, SAMPLE_RATE,
+    AppStream, AudioBackend, AudioDevice, AudioError, CallbackStats, DeviceRole, DeviceUid,
+    HotplugEvent, PassthroughSettings, StreamKind, StreamStopReason, StreamTopology, MAX_CHANNELS,
+    SAMPLE_RATE,
 };
 
 /// In-memory loopback: what is "captured" is handed to DSP and fanned out
@@ -13,11 +14,34 @@ pub struct StubBackend {
     devices: Vec<AudioDevice>,
     open: Option<StreamTopology>,
     running: bool,
+    /// Passthrough model (F-0.4.B 18): canned app list + move tracking.
+    apps: Vec<AppStream>,
+    moved: std::collections::HashMap<u32, String>,
+    passthrough: PassthroughSettings,
 }
 
 impl StubBackend {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn ensure_stub_apps(&mut self) {
+        if self.apps.is_empty() {
+            self.apps = vec![
+                AppStream {
+                    id: 1,
+                    app: "FakePlayer".into(),
+                    name: "FakePlayer: stream".into(),
+                    sink: "stub-sink".into(),
+                },
+                AppStream {
+                    id: 2,
+                    app: "Discord".into(),
+                    name: "Discord: playback".into(),
+                    sink: "stub-sink".into(),
+                },
+            ];
+        }
     }
 }
 
@@ -94,5 +118,42 @@ impl AudioBackend for StubBackend {
 
     fn ensure_virtual_source(&mut self) -> Result<DeviceUid, AudioError> {
         Ok(DeviceUid::new("stub:virtual:vm-mic"))
+    }
+
+    fn output_streams(&mut self) -> Result<Vec<AppStream>, AudioError> {
+        self.ensure_stub_apps();
+        Ok(self.apps.clone())
+    }
+
+    /// In-memory passthrough model: the `app` field is declarative — when
+    /// enabled, exactly the matching app (if any) sits on `vm-passthrough`;
+    /// disabling restores every moved app to its original sink.
+    fn set_passthrough(&mut self, settings: &PassthroughSettings) -> Result<(), AudioError> {
+        self.ensure_stub_apps();
+        self.passthrough = settings.clone();
+        // Restore anything that must no longer be on the passthrough sink.
+        let moved = &mut self.moved;
+        for app in self.apps.iter_mut() {
+            let keep = settings.enabled
+                && !settings.app.is_empty()
+                && app.app.eq_ignore_ascii_case(&settings.app);
+            if app.sink == "vm-passthrough" && !keep {
+                app.sink = moved.remove(&app.id).unwrap_or_else(|| "stub-sink".into());
+            }
+        }
+        if settings.enabled && !settings.app.is_empty() {
+            let app = self
+                .apps
+                .iter_mut()
+                .find(|a| a.app.eq_ignore_ascii_case(&settings.app))
+                .ok_or_else(|| {
+                    AudioError::Backend(format!("application '{}' not found", settings.app))
+                })?;
+            if app.sink != "vm-passthrough" {
+                self.moved.entry(app.id).or_insert_with(|| app.sink.clone());
+                app.sink = "vm-passthrough".into();
+            }
+        }
+        Ok(())
     }
 }

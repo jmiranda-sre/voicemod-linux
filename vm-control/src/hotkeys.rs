@@ -20,6 +20,8 @@ pub enum HotkeyTarget {
     PlaySound(String),
     SelectVoice(String),
     StopAllSounds,
+    /// Edge: write the instant-replay window to disk (F-0.4.B item 20).
+    SaveReplay,
 }
 
 /// A user keybind: evdev key codes + target.
@@ -135,6 +137,12 @@ pub struct DaemonConfig {
     /// MIDI learn (F-0.4.C 37).
     #[serde(default)]
     pub midi: super::settings::MidiConfig,
+    /// Instant replay ring (F-0.4.B 20).
+    #[serde(default)]
+    pub replay: super::settings::ReplayConfig,
+    /// Per-application passthrough (F-0.4.B 18).
+    #[serde(default)]
+    pub passthrough: super::settings::PassthroughConfig,
 }
 
 /// On-disk config file shape.
@@ -153,12 +161,16 @@ struct ConfigFile {
     obs: super::settings::ObsConfig,
     #[serde(default)]
     midi: super::settings::MidiConfig,
+    #[serde(default)]
+    replay: super::settings::ReplayConfig,
+    #[serde(default)]
+    passthrough: super::settings::PassthroughConfig,
 }
 
-/// Current config schema version. v1 (hotkeys only) and v2 (device
-/// profiles) files migrate forward; unknown versions fail closed with a
-/// clear error.
-pub const CONFIG_VERSION: u32 = 3;
+/// Current config schema version. v1 (hotkeys only), v2 (device
+/// profiles) and v3 (F-0.4.C integrations) files migrate forward;
+/// unknown versions fail closed with a clear error.
+pub const CONFIG_VERSION: u32 = 4;
 
 /// Serialize the daemon config to file text.
 pub fn save_daemon_config(cfg: &DaemonConfig) -> String {
@@ -170,11 +182,13 @@ pub fn save_daemon_config(cfg: &DaemonConfig) -> String {
         ducking: cfg.ducking.clone(),
         obs: cfg.obs.clone(),
         midi: cfg.midi.clone(),
+        replay: cfg.replay.clone(),
+        passthrough: cfg.passthrough.clone(),
     })
     .unwrap_or_else(|_| {
         String::from(
-            "{\"version\":3,\"hotkeys\":[],\"device_profiles\":{},\"monitor\":{},\
-             \"ducking\":{},\"obs\":{},\"midi\":{}}",
+            "{\"version\":4,\"hotkeys\":[],\"device_profiles\":{},\"monitor\":{},\
+             \"ducking\":{},\"obs\":{},\"midi\":{},\"replay\":{},\"passthrough\":{}}",
         )
     })
 }
@@ -199,6 +213,8 @@ pub fn load_daemon_config(text: &str) -> Result<DaemonConfig, String> {
             ducking: cfg.ducking,
             obs: cfg.obs,
             midi: cfg.midi,
+            replay: cfg.replay,
+            passthrough: cfg.passthrough,
         }),
         v => Err(format!("unsupported daemon config version {v} (want {CONFIG_VERSION})")),
     }
@@ -338,6 +354,10 @@ mod hotkey_tests {
         assert!(is_momentary(&HotkeyTarget::PushToMute));
         assert!(!is_momentary(&HotkeyTarget::ToggleMute));
         assert!(!is_momentary(&HotkeyTarget::StopAllSounds));
+        assert!(!is_momentary(&HotkeyTarget::SaveReplay));
+        // New edge target round-trips on the wire.
+        let t: HotkeyTarget = serde_json::from_str(r#""SaveReplay""#).unwrap();
+        assert_eq!(t, HotkeyTarget::SaveReplay);
     }
 
     #[test]
@@ -400,6 +420,12 @@ mod hotkey_tests {
                 }],
                 ..Default::default()
             },
+            replay: crate::settings::ReplayConfig { enabled: false, seconds: 45 },
+            passthrough: crate::settings::PassthroughConfig {
+                enabled: true,
+                device: "alsa_output.pci-0000".into(),
+                app: "Discord".into(),
+            },
         };
         let text = save_daemon_config(&cfg);
         let back = load_daemon_config(&text).expect("roundtrip");
@@ -410,17 +436,21 @@ mod hotkey_tests {
         assert_eq!(back.ducking.depth_db, 18.0);
         assert!(back.obs.enabled && back.obs.password == "pw");
         assert_eq!(back.midi.bindings.len(), 1);
+        assert_eq!(back.replay, crate::settings::ReplayConfig { enabled: false, seconds: 45 });
+        assert!(back.passthrough.enabled && back.passthrough.app == "Discord");
         // v1/v2 files migrate forward; untouched sections keep defaults.
         let v1 = r#"{"version":1,"hotkeys":[]}"#;
         let migrated = load_daemon_config(v1).expect("v1 migrates");
         assert!(migrated.hotkeys.is_empty() && migrated.device_profiles.is_empty());
         assert!(migrated.ducking.enabled, "settings get v3 defaults");
+        assert!(migrated.replay.enabled, "replay defaults on (v4)");
         let v2 = r#"{"version":2,"hotkeys":[],"device_profiles":{"Fifine":"mic-npr-voice"}}"#;
         let migrated = load_daemon_config(v2).expect("v2 migrates");
         assert_eq!(migrated.device_profiles["Fifine"], "mic-npr-voice");
         assert!(!migrated.monitor.enabled, "monitor stays off unless configured");
+        assert!(!migrated.passthrough.enabled, "passthrough stays off unless configured");
         // Wrong version fails closed.
-        let bad = text.replace("\"version\": 3", "\"version\": 99");
+        let bad = text.replace("\"version\": 4", "\"version\": 99");
         assert!(load_daemon_config(&bad).is_err());
         // Garbage fails with a clear error, never an empty store.
         assert!(load_daemon_config("not json").is_err());
