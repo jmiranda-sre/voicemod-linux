@@ -51,6 +51,13 @@ target/release/vm actions   # must list the full catalogue (49 on v0.4.1)
 cargo build --release -p vm-ui
 UI=target/release/vm-ui packaging/smoke/ui-lifecycle.sh   # -> SMOKE_OK
 
+# 3c. Monitor lifecycle smoke — release gate since v0.4.2 (real
+#     PipeWire session; tolerates a running user daemon, asserts the
+#     raw monitorChanged frames and skips cleanly without
+#     pactl/pw-link/python3):
+cargo build --release -p vm-daemon -p vm-cli
+packaging/smoke/monitor-lifecycle.sh                      # -> SMOKE_OK
+
 # 4. Commit, tag, push:
 git add -A && git commit -m "Release vX.Y.Z — ..."
 git tag -a vX.Y.Z -m "Voicemod Linux X.Y.Z — ..."

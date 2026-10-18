@@ -6,6 +6,44 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added (Hear Myself, F-0.4.2)
+
+- **Hear Myself** card at the top of the *Voices* tab: a prominent
+  ON/OFF toggle with live status, a quick mute, the output picker
+  (physical outputs plus *system default*), the return-volume slider
+  and an *Advanced* drawer with the dry/wet blend and a headphones tip
+  against acoustic feedback. The duplicated monitor block was removed
+  from the *Integrations* tab, and the card follows the daemon:
+  state changes made outside the window (hotplug fallback, hotkey,
+  `vm call`) always win over stale local edits.
+- `ToggleMonitor` as a global-hotkey target (same API action the card
+  and the CLI fire).
+- `packaging/smoke/monitor-lifecycle.sh` — real-PipeWire release gate:
+  fresh wet default, enable → volume/blend edits, retarget to a
+  temporary null-sink, back to the default, unplug fallback, disable;
+  asserts wire state, disk persistence (schema v5), the WebSocket
+  `monitorChanged` frames and FL↔FL / FR↔FR port pairing.
+
+### Changed
+
+- Monitor defaults now favor **hearing the processed voice**: `mix`
+  defaults to `1.0` (wet, what callers hear) instead of `0.0`; configs
+  that never touched the blend migrate to wet while an explicit `0.0`
+  is preserved. Config schema bumped to v5.
+- `"device":""` now means *the system default, followed live* — the
+  daemon re-links when the default sink changes, and a pinned output
+  that disappears falls back to the default (persisted as `""`) while
+  the monitor stays on, re-linking by itself once a device is back.
+- Monitor targets are validated: only physical outputs (role `Sink`,
+  outside the `vm-*` namespace) are accepted; a rejected device rolls
+  back without disturbing the active route and reports why.
+
+### Fixed
+
+- Stereo links are paired by channel tag (`FL↔FL`, `FR↔FR`) instead of
+  PipeWire port-id order, which differs between nodes (streams vs ALSA
+  devices) — the old pairing shipped swapped channels nondeterministically.
+
 ## [0.4.1] — 2026-10-17
 
 ### Changed (desktop integration, F-0.4.1.A)

@@ -1203,3 +1203,63 @@ Progresso 2026-10-17: **D, A, C e B FECHADAS — ciclo v0.4.0 completo (release 
   resolve), AUR (PKGBUILD pronto, `.SRCINFO` com
   `MAKEPKG_LINT_PKGBUILD=0` — pkgver derivado de `git describe`, sem
   edição na receita) e issues do backlog pós-v0.4.1.
+
+## F-0.4.2 — Hear Myself (monitor) — 2026-10-17
+
+### F-0.4.2.A — FECHADA (hardening do monitor) — commit ac46806
+- `set_monitor` retargeta quando o uid muda, inclusive para `""`
+  (default do sistema); volume/mix não recriam links (sem churn).
+- Validação de alvo: só role `Sink` fora do namespace `vm-*`; erro
+  `"monitor device '{uid}' is not a physical output"` com rollback sem
+  destruir a rota ativa.
+- Default vivo: watcher de metadata `default.audio.sink` do WirePlumber
+  re-linka o monitor quando `device==""`; primeiro emissor de
+  `HotplugEvent::DefaultChanged`; unplug do device pinado → fallback ao
+  default + persist `""` + `MonitorChanged`; sem default → monitor fica
+  ligado e silencioso com auto-cura.
+- `mix` default **1.0 (wet)** em `MonitorConfig`/`MonitorSettings`;
+  `CONFIG_VERSION=5`; migração v3/v4 flipa só `!enabled && mix==0.0`
+  (dry explícito preservado); `HotkeyTarget::ToggleMonitor` mapeia para
+  `SetMonitor` com enabled invertido.
+- Verificação ao vivo (daemon real, serviço do sistema pausado e
+  restaurado): retarget explícito→`""`, default-follow via
+  `pactl set-default-sink` nos dois sentidos, rejeição `vm-mic#202` com
+  rollback, `unload` → log de fallback + `config.device=""`, schema v5
+  gravado, `getMonitor`/`getHealth` ok. Workspace 189/189→verde, clippy 0.
+
+### micro-fix — FECHADO (pareamento de canais) — commit 4944635
+- `pair_ports`: links FL↔FL / FR↔FR por tag de canal do `port.name`
+  (fallback determinístico (tag, id)); `PortSummary` ganhou `name`.
+  O zip por id antigo entregava canais trocados de forma
+  não-determinística (ordem de criação difere entre nós). 3 testes
+  unitários cobrindo ordens invertidas, MONO e tags desconhecidas.
+
+### F-0.4.2.B — FECHADA (card Hear Myself) — commit 8b3d8f1
+- Card no topo da aba *Voices*: toggle ON/OFF destacado com status ao
+  vivo, botão mute, combo de saída (sinks físicos + `(system default)`,
+  filtro `vm-*` por uid), slider de volume e drawer *Advanced*
+  (auto-aberto quando o blend é custom) com slider dry/wet + dica de
+  fones. Aba *Integrations* ficou só com roteamento/integrações.
+- Anti-stale: quando o daemon reporta estado diferente (hotplug,
+  hotkey, CLI), os mirrors do nó `monitor` são descartados — o card
+  nunca mostra device que já caiu.
+- Verificação visual com daemon stub isolado (`/tmp/opencode/ui-off.png`,
+  `ui-on.png`): estados OFF/ON, drawer avançado, propagação de mudança
+  externa em ~1 s; glifos todos verificados (zero tofu).
+
+### F-0.4.2.C — FECHADA (smoke + docs + screenshot) — commit deste front
+- `packaging/smoke/monitor-lifecycle.sh` (novo gate): sobe um
+  `vm-daemon --live` privado (config dir + porta próprios), e roda
+  enable → volume/blend (wire + disco schema v5 + "sem churn de
+  link") → retarget para null-sink temporário (FL↔FL/FR↔FR provado no
+  `pw-link`) → volta ao default → unplug com fallback (persist `""` +
+  log + link de volta) → disable + shutdown limpo. Frames do WS
+  capturados crus (python3 `websockets`): 6 `monitorChanged` incluindo
+  `enabled:true/false` e o uid do sink temporário. Asserts por DELTA
+  (baseline 4 links com o daemon do sistema rodando junto) — provado
+  ao vivo com o daemon do sistema ativo: `SMOKE_OK` exit 0; SKIP
+  limpo sem binários (`exit 0`).
+- Docs: README (*Hear yourself* reescrita: card, fones, hotkey,
+  equivalência CLI, default vivo + fallback), CHANGELOG [Unreleased]
+  com o ciclo 0.4.2 completo, RELEASE.md com o gate 3c, `voices.png`
+  regenerado com o card.

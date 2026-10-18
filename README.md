@@ -127,23 +127,38 @@ keep working. In Discord/OBS/etc. pick the input usually shown as **`vm-mic`**
 
 The daemon always creates a **`vm-monitor`** sink next to `vm-mic`, but
 it stays silent until you turn the monitor on — `vm-mic` is the clean
-signal apps record, the monitor is only for your own ears:
+signal apps record, the monitor is only for your own ears. In the app
+this is the **Hear Myself** card at the top of the *Voices* tab: the
+toggle with live status, a quick mute, the output picker, the return
+volume, and an *Advanced* drawer with the dry/wet blend. Use
+**headphones**: with speakers, the mic can pick the monitor back up and
+echo. A global hotkey can toggle it too — add one with target
+`ToggleMonitor`.
 
 ```bash
-vm call '{"action":"setMonitor","enabled":true,"mix":0.5,"volume_db":-6}'
+vm call '{"action":"setMonitor","enabled":true}'            # hear yourself
+vm call '{"action":"setMonitor","volume_db":-6,"mix":0.8}'  # quieter, mostly wet
 vm call '{"action":"getMonitor"}'
-vm call '{"action":"setMonitor","muted":true}'     # quick mute, settings kept
+vm call '{"action":"setMonitor","muted":true}'              # quick mute, settings kept
+vm call '{"action":"setMonitor","device":"alsa_output.pci-0000_00_1f.3.analog-stereo#53"}'
+vm call '{"action":"setMonitor","device":""}'               # follow the system default
 ```
 
-`mix` blends the two legs: `0.0` is the **raw input** (dry — zero added
-latency, no DSP), `1.0` is the fully processed voice. `0.5` lets you
-hear both, which is the classic "do I sound like that?" check without
-running your voice through a second output path. The monitor is
-independent of `vm-mic`: muting it (or disabling it) never touches what
-apps receive. A device retarget (`"device":"..."`, same names as
-`getAudioDevices`) rebuilds only the monitor link, so changing outputs
-never interrupts the main chain; a rejected device rolls the setting
-back and says why.
+`mix` blends the two legs: `1.0` (the default) is the **processed
+voice** — exactly what callers hear, so what you monitor is what they
+get; `0.0` is the **raw input** (dry — zero added latency, no DSP);
+`0.5` hears both, the classic "do I sound like that?" check. The
+monitor is independent of `vm-mic`: muting it (or disabling it) never
+touches what apps receive.
+
+`device` is a **physical output** (the names from `getAudioDevices`),
+or `""` for the **system default — followed live**: changing the
+default sink in your desktop retargets the monitor on the fly.
+Unplugging the pinned output falls back to the default automatically
+(persisted as `""`); with no output at all the monitor stays on and
+silent, re-linking by itself once one appears. A rejected device rolls
+the setting back and says why, and a retarget rebuilds only the monitor
+link — changing outputs never interrupts the main chain.
 
 ### Sidechain ducking
 
