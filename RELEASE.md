@@ -8,11 +8,11 @@ manifest, CHANGELOG and this documentation. (The Flatpak app ID
 `voicemodlinux` organization, a repository transfer keeps the old links
 working and only these references need updating.)
 
-## Per-release procedure (followed through v0.4.2)
+## Per-release procedure (followed through v0.4.3)
 
 ```bash
 # 0. Everything green first:
-cargo test --workspace            # 194/194 on v0.4.2
+cargo test --workspace            # 196/196 on v0.4.3
 cargo build --release
 cargo clippy --workspace --all-targets -- -D warnings
 appstreamcli validate packaging/io.github.voicemodlinux.vm.metainfo.xml
@@ -44,7 +44,7 @@ packaging/appimage/build.sh
 # 3. Smoke the release binaries (fresh VM_CONFIG_DIR, stub backend):
 VM_CONFIG_DIR=/tmp/vm-rel target/release/vm-daemon &
 # selectVoice / getHealth / hotkey + profile actions over ws://127.0.0.1:8765
-target/release/vm actions   # must list the full catalogue (49 on v0.4.2)
+target/release/vm actions   # must list the full catalogue (49 on v0.4.3)
 
 # 3b. Tray/UI lifecycle smoke — release gate since v0.4.1 (desktop
 #     session with a StatusNotifier host; CI/VMs skip it cleanly):
@@ -75,7 +75,7 @@ gh release create vX.Y.Z \
 
 ## Distribution channels
 
-Current release: **v0.4.2** (2026-10-17) — Flatpak `tag`, metainfo
+Current release: **v0.4.3** (2026-10-17) — Flatpak `tag`, metainfo
 entry and CHANGELOG are in sync with it.
 
 | Channel | Status | Action |

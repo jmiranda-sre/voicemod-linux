@@ -52,6 +52,17 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.4.3" date="2026-10-17">
+      <description>
+        <p>Real-use fixes: "Hear Myself" never auto-arms at boot anymore —
+        a monitor left on in the previous session no longer comes back at
+        login (no surprise feedback on speakers). The startup input pick
+        now follows the system default source instead of the unstable
+        first entry of the device list, so the intended USB microphone is
+        captured: no more hot, distorted audio from the onboard jack, and
+        physical mic knobs work again.</p>
+      </description>
+    </release>
     <release version="0.4.2" date="2026-10-17">
       <description>
         <p>Hear yourself, properly: the monitor gets a first-class card at
