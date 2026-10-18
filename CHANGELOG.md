@@ -6,6 +6,21 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Hear Myself never auto-arms at boot**: a monitor left enabled in the
+  previous session used to come back on when the daemon started (sound
+  at login, acoustic-feedback risk with speakers). The runtime now
+  always boots with the monitor off; the card, the `ToggleMonitor`
+  hotkey and `vm call` still enable it on demand, and the switch keeps
+  persisting within the session.
+- **Boot input pick follows the system default source** (`pactl
+  get-default-source`): "first input in the enumeration list" is not
+  stable across boots and could capture the onboard analog jack instead
+  of the USB microphone — extremely hot/distorted capture and physical
+  mic knobs with no effect. `VM_INPUT_UID` still wins when set, and the
+  startup log now says why the device was chosen.
+
 ## [0.4.2] — 2026-10-17
 
 ### Added (Hear Myself, F-0.4.2)

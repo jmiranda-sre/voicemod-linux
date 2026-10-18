@@ -14,7 +14,10 @@
 #   4. back to ""          -> links return to the system default sink
 #   5. unplug (unload the sink) -> DeviceRemoved falls back to the
 #      default, `device` persists as "", the monitor stays enabled
-#   6. disable             -> state + disk; SIGINT -> clean shutdown
+#   6. disable             -> state + disk; leave it ON for the reboot
+#      check; SIGINT -> clean shutdown
+#   7. reboot with a left-on config -> the monitor always starts off
+#      (never auto-arms at boot; the disarm is logged)
 #
 # The monitorChanged broadcast is asserted from the raw WebSocket feed
 # (python3 + the `websockets` module; without it the state asserts
@@ -285,6 +288,10 @@ if [ "$have_ws" = 1 ]; then
   grep -q '"event":"monitorChanged","enabled":false' "$events" || bad "no enabled=false frame"
   grep -q "\"device\":\"$SMOKE_SINK#" "$events" || bad "no frame carried the temp-sink device"
 fi
+# Simulate "monitor left on last session" for the reboot check below.
+call '{"action":"setMonitor","enabled":true}'
+[ "$(reply_ok)" = "true" ] || bad "re-enable failed: $REPLY"
+[ "$(cfgmon enabled)" = "true" ] || bad "config enabled=$(cfgmon enabled)"
 kill -INT "$dpid" 2>/dev/null
 for _ in $(seq 1 40); do kill -0 "$dpid" 2>/dev/null || break; sleep 0.25; done
 if kill -0 "$dpid" 2>/dev/null; then
@@ -293,6 +300,28 @@ else
   grep -q "^stopped\." "$cfg/daemon.log" \
     && echo "OK: clean shutdown" || bad "'stopped.' missing from the log"
 fi
+
+echo "== 7. reboot with a left-on config: hear-myself starts off"
+VM_CONFIG_DIR="$cfg" "$DAEMON" --live >"$cfg/daemon2.log" 2>&1 &
+dpid2=$!; pids+=("$dpid2")
+PORT2=""
+for _ in $(seq 1 100); do
+  PORT2=$(sed -n 's/.*control api listening (effective port \([0-9][0-9]*\)).*/\1/p' "$cfg/daemon2.log" | head -1)
+  [ -n "$PORT2" ] && break
+  kill -0 "$dpid2" 2>/dev/null || break
+  sleep 0.2
+done
+[ -n "$PORT2" ] || fatal "the reboot daemon never opened its control port:
+$(tail -5 "$cfg/daemon2.log")"
+PORT=$PORT2
+grep -q "hear-myself starts off" "$cfg/daemon2.log" \
+  && echo "OK: boot disarm logged" || bad "boot disarm line missing from daemon2.log"
+call '{"action":"getMonitor"}'
+[ "$(pick enabled)" = "false" ] \
+  || bad "left-on config re-armed the monitor (enabled=$(pick enabled))"
+kill -INT "$dpid2" 2>/dev/null
+for _ in $(seq 1 40); do kill -0 "$dpid2" 2>/dev/null || break; sleep 0.25; done
+kill -0 "$dpid2" 2>/dev/null && bad "reboot daemon did not exit on SIGINT"
 
 echo
 if [ "$fail" = 0 ]; then echo "SMOKE_OK"; else echo "SMOKE_FAIL"; fi

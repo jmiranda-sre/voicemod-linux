@@ -2096,6 +2096,12 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
             }
             device_profiles = cfg.device_profiles;
             monitor = cfg.monitor;
+            if disarm_boot_monitor(&mut monitor) {
+                println!(
+                    "monitor: hear-myself starts off each session (was left on); \
+                     toggle it when you want to listen"
+                );
+            }
             ducking = cfg.ducking;
             obs = cfg.obs;
             midi = cfg.midi;
@@ -2205,13 +2211,17 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
         println!("virtual source: {}", vm_uid.0);
         // Re-enumerate so the fresh node id is resolvable.
         let devices = audio.enumerate()?;
-        let input = pick_input(&devices).ok_or("no input device found")?;
+        let override_uid = std::env::var("VM_INPUT_UID").ok();
+        let default_input = audio.default_input_name();
+        let (input, why) =
+            pick_input(&devices, override_uid.as_deref(), default_input.as_deref())
+                .ok_or("no input device found")?;
         let virtual_out = devices
             .iter()
             .find(|d| d.uid == vm_uid)
             .or_else(|| devices.iter().find(|d| d.role == DeviceRole::Virtual))
             .ok_or("no virtual output found")?;
-        println!("using input: {}", input.uid.0);
+        println!("using input: {} ({why})", input.uid.0);
         let topo = StreamTopology {
             input: input.uid.clone(),
             virtual_out: virtual_out.uid.clone(),
@@ -2440,22 +2450,56 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn pick_input(devices: &[vm_audio::AudioDevice]) -> Option<&vm_audio::AudioDevice> {
-    if let Ok(want) = std::env::var("VM_INPUT_UID") {
+/// Boot input pick (F-0.4.2 follow-up). The enumeration order is not
+/// stable across boots, so "first input in the list" could capture the
+/// onboard analog jack over the user's USB microphone. Preference:
+/// `VM_INPUT_UID` override → system default source (what the desktop
+/// uses, via `pactl get-default-source`) → first physical input.
+///
+/// Returns the chosen device plus why it won, for the startup log.
+fn pick_input<'a>(
+    devices: &'a [vm_audio::AudioDevice],
+    override_uid: Option<&str>,
+    default_name: Option<&str>,
+) -> Option<(&'a vm_audio::AudioDevice, &'static str)> {
+    let physical = |d: &vm_audio::AudioDevice| {
+        d.role == DeviceRole::Input
+            && !d.uid.0.contains("easyeffects")
+            && !d.uid.0.contains("monitor")
+            && !d.uid.0.starts_with("vm-")
+    };
+    if let Some(want) = override_uid {
         if let Some(dev) = devices.iter().find(|d| d.uid.0 == want) {
-            println!("using override input: {}", dev.uid.0);
-            return Some(dev);
+            return Some((dev, "VM_INPUT_UID"));
         }
         eprintln!("VM_INPUT_UID '{want}' not found, falling back to auto-select");
     }
+    if let Some(name) = default_name {
+        if let Some(dev) = devices
+            .iter()
+            .find(|d| physical(d) && d.uid.0.split('#').next() == Some(name))
+        {
+            return Some((dev, "system default"));
+        }
+    }
     devices
         .iter()
-        .find(|d| {
-            d.role == DeviceRole::Input
-                && !d.uid.0.contains("easyeffects")
-                && !d.uid.0.contains("monitor")
-        })
+        .find(|d| physical(d))
         .or_else(|| devices.iter().find(|d| d.role == DeviceRole::Input))
+        .map(|d| (d, "first physical input"))
+}
+
+/// F-0.4.2 follow-up: the hear-myself monitor never auto-arms at boot.
+/// The persisted switch records the last session, but arming it
+/// windowless (login, headless) can blast acoustic feedback before
+/// anyone is at the machine. Returns whether it disarmed.
+fn disarm_boot_monitor(monitor: &mut MonitorConfig) -> bool {
+    if monitor.enabled {
+        monitor.enabled = false;
+        true
+    } else {
+        false
+    }
 }
 
 fn decode_to_loaded(
@@ -4056,6 +4100,62 @@ mod f04c_tests {
         });
         let opts = vm_soundboard::SoundOptions { send_to_vad, ..Default::default() };
         m.play(vm_soundboard::SoundHashId(id), opts).unwrap();
+    }
+
+    fn dev(uid: &str, role: DeviceRole) -> vm_audio::AudioDevice {
+        vm_audio::AudioDevice {
+            uid: vm_audio::DeviceUid(uid.to_string()),
+            name: uid.to_string(),
+            role,
+            sample_rate: 48_000,
+            channels: 2,
+            latency_secs: 0.02,
+            is_bluetooth: false,
+        }
+    }
+
+    #[test]
+    fn pick_input_follows_the_system_default() {
+        let devices = vec![
+            dev("alsa_input.pci-0000_00_1f.3.analog-stereo#56", DeviceRole::Input),
+            dev("alsa_input.usb-Mic_Yeti-00.mono-fallback#54", DeviceRole::Input),
+            dev("vm-mic#78", DeviceRole::Virtual),
+        ];
+        // The system default wins even when it is not the first entry.
+        let (input, why) =
+            pick_input(&devices, None, Some("alsa_input.usb-Mic_Yeti-00.mono-fallback")).unwrap();
+        assert_eq!(input.uid.0, "alsa_input.usb-Mic_Yeti-00.mono-fallback#54");
+        assert_eq!(why, "system default");
+        // No default: keep the old first-physical-input fallback.
+        let (input, why) = pick_input(&devices, None, None).unwrap();
+        assert_eq!(input.uid.0, "alsa_input.pci-0000_00_1f.3.analog-stereo#56");
+        assert_eq!(why, "first physical input");
+        // A virtual default (vm-mic) is never captured: fall back.
+        let (input, _) = pick_input(&devices, None, Some("vm-mic")).unwrap();
+        assert_eq!(input.role, DeviceRole::Input);
+        // The explicit override still beats everything.
+        let (input, why) = pick_input(
+            &devices,
+            Some("alsa_input.usb-Mic_Yeti-00.mono-fallback#54"),
+            Some("alsa_input.pci-0000_00_1f.3.analog-stereo"),
+        )
+        .unwrap();
+        assert_eq!(why, "VM_INPUT_UID");
+        assert_eq!(input.uid.0, "alsa_input.usb-Mic_Yeti-00.mono-fallback#54");
+    }
+
+    #[test]
+    fn boot_monitor_never_auto_arms() {
+        let mut m = MonitorConfig { enabled: true, ..MonitorConfig::default() };
+        assert!(disarm_boot_monitor(&mut m));
+        assert!(!m.enabled);
+        // Blend/volume/device survive untouched.
+        let d = MonitorConfig::default();
+        assert_eq!(m.mix, d.mix);
+        assert_eq!(m.volume_db, d.volume_db);
+        assert!(m.device.is_empty());
+        // Already off: nothing to do.
+        assert!(!disarm_boot_monitor(&mut m));
     }
 
     #[test]

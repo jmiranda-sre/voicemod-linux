@@ -1290,3 +1290,28 @@ Progresso 2026-10-17: **D, A, C e B FECHADAS — ciclo v0.4.0 completo (release 
   (ciclo completo F-0.4.2 A/B/C/D).
 - Próximo (do usuário): atualizar o Flathub (tag `v0.4.2` no manifest),
   AUR (regen `.SRCINFO`) e issues do backlog pós-v0.4.2.
+
+## Pós-0.4.2 — fixes de uso real (não publicado)
+
+Dois bugs reportados em uso real no KDE, com causa-raiz e correção:
+
+- **Hear Myself ligava sozinho no boot**: um toggle deixado ligado na
+  sessão anterior persistia no config v5 e o boot-apply armava o
+  monitor windowless (mix 1.0/wet = retorno/feedback já no login).
+  Fix: o runtime **nunca** auto-arma no boot (`disarm_boot_monitor` +
+  linha de log); a chave continua funcionando e persistindo na sessão.
+  Cobertura: teste `boot_monitor_never_auto_arms` + fase 7 nova do
+  `monitor-lifecycle.sh` (config left-on → boot desarmado).
+- **Áudio estourado + knob físico do mic ignorado**: `pick_input`
+  pegava a *primeira* entrada da enumeração (ordem instável entre
+  boots) e estava capturando a **entrada analógica interna** (hardware
+  a +60 dB: `Capture`/`Internal Mic Boost` a 30 dB cada; medido pico
+  0.0 dBFS / RMS −4 dBFS) em vez do Fifine, que é o default do
+  sistema. Fix: preferência `VM_INPUT_UID` → `pactl
+  get-default-source` → primeira entrada física, com motivo no log;
+  teste `pick_input_follows_the_system_default`. Verificado ao vivo com
+  cópia da config real: `using input: ...fifine...mono-fallback#54
+  (system default)` + `fmt=cap1ch` no stats.
+- Gates do round: 196/196 testes workspace, clippy 0
+  (`--all-targets -- -D warnings`), `monitor-lifecycle.sh` (7 fases) e
+  `ui-lifecycle.sh` → SMOKE_OK com o daemon do sistema rodando.

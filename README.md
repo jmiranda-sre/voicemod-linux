@@ -120,13 +120,17 @@ keep working exactly as before.
 The daemon creates a null-sink named **`vm-mic`** (plus `vm-monitor`) and links
 `capture → DSP graph → vm-mic` explicitly, so WirePlumber-independent updates
 keep working. In Discord/OBS/etc. pick the input usually shown as **`vm-mic`**
-(Monitor of `vm-mic`). Use the UI's *Devices* tab to pick the physical input
-(the environment variable `VM_INPUT_UID` pins one at startup).
+(Monitor of `vm-mic`). Use the UI's *Devices* tab to pick the physical input:
+the boot pick follows your desktop's **default source**
+(`pactl get-default-source`), and the environment variable `VM_INPUT_UID`
+still pins one at startup.
 
 ### Hear yourself (monitor mix)
 
 The daemon always creates a **`vm-monitor`** sink next to `vm-mic`, but
-it stays silent until you turn the monitor on — `vm-mic` is the clean
+it stays silent until you turn the monitor on — and it **always starts
+off when the daemon boots**, so a switch left on last session never comes
+back by itself. `vm-mic` is the clean
 signal apps record, the monitor is only for your own ears. In the app
 this is the **Hear Myself** card at the top of the *Voices* tab: the
 toggle with live status, a quick mute, the output picker, the return
