@@ -38,7 +38,11 @@ pub struct MonitorConfig {
 
 impl Default for MonitorConfig {
     fn default() -> Self {
-        Self { enabled: false, device: String::new(), mix: 0.0, volume_db: 0.0, muted: false }
+        // F-0.4.2: "hear myself" defaults to the **wet** path — the point
+        // of the feature is hearing the processed voice with effects.
+        // The dry blend remains available as the advanced option (and
+        // v4→v5 migration flips untouched dry defaults forward).
+        Self { enabled: false, device: String::new(), mix: 1.0, volume_db: 0.0, muted: false }
     }
 }
 
@@ -287,13 +291,16 @@ mod tests {
         assert_eq!(
             v,
             serde_json::json!({
-                "enabled": false, "device": "", "mix": 0.0, "volume_db": 0.0, "muted": false,
+                "enabled": false, "device": "", "mix": 1.0, "volume_db": 0.0, "muted": false,
             })
         );
-        // Partial payloads keep the remaining defaults.
+        // Partial payloads keep the remaining defaults (wet since F-0.4.2).
         let m: MonitorConfig = serde_json::from_str(r#"{"enabled":true,"device":"out#7"}"#).unwrap();
         assert!(m.enabled);
         assert_eq!(m.device, "out#7");
+        assert_eq!(m.mix, 1.0);
+        // An explicit dry blend on the wire is preserved verbatim.
+        let m: MonitorConfig = serde_json::from_str(r#"{"mix":0.0,"enabled":true}"#).unwrap();
         assert_eq!(m.mix, 0.0);
     }
 

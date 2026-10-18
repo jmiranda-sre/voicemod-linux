@@ -343,7 +343,10 @@ mod autostart_tests {
     #[test]
     fn unit_lookup_prefers_user_dir() {
         let dir = tmp("lookup");
-        assert!(find_unit(&dir).is_none());
+        // The fake home starts without a unit of its own. A system-wide
+        // package install may legitimately provide one in /usr/lib or
+        // /etc, so only assert about paths under `dir` (hermetic test).
+        assert!(find_unit(&dir).map(|p| !p.starts_with(&dir)).unwrap_or(true));
         let user_unit = dir.join(".config/systemd/user");
         std::fs::create_dir_all(&user_unit).unwrap();
         std::fs::write(user_unit.join(UNIT_NAME), "[Unit]").unwrap();

@@ -27,7 +27,9 @@ use super::super::{
 use pipewire as pw;
 use pw::{properties::properties, spa};
 use spa::pod::Pod;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -455,6 +457,25 @@ fn device_role(class: &str, name: &str) -> Option<DeviceRole> {
     }
 }
 
+/// A hear-myself target must be a **physical output**: role `Sink` and
+/// outside the reserved `vm-*` namespace (monitoring into our own
+/// virtual endpoints would double-deliver the voice into the graph).
+/// F-0.4.2.
+fn is_physical_monitor_target(node: &NodeSummary) -> bool {
+    matches!(device_role(&node.media_class, &node.name), Some(DeviceRole::Sink))
+        && !node.name.starts_with("vm-")
+}
+
+/// Extract the sink name out of the `default.audio.sink` metadata value
+/// (`{"name":"alsa_output.x"}`; `None` when unset/empty). F-0.4.2.
+fn parse_default_sink_value(v: &str) -> Option<String> {
+    let rest = &v[v.find("\"name\"")? + "\"name\"".len()..];
+    let rest = &rest[rest.find(':')? + 1..];
+    let rest = &rest[rest.find('"')? + 1..];
+    let name = &rest[..rest.find('"')?];
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 impl AudioBackend for PipeWireBackend {
     fn enumerate(&mut self) -> Result<Vec<AudioDevice>, AudioError> {
         let devs: Vec<AudioDevice> = flatten(self.roundtrip(Cmd::Enumerate, "enumerate"))?;
@@ -560,8 +581,17 @@ impl AudioBackend for PipeWireBackend {
         self.shared.monitor_mix.store(settings.mix.to_bits(), Ordering::Relaxed);
         self.shared.monitor_volume_db.store(settings.volume_db.to_bits(), Ordering::Relaxed);
         self.shared.monitor_muted.store(settings.muted, Ordering::Relaxed);
-        *self.shared.monitor_device.lock().unwrap() = settings.device.clone();
-        if !settings.device.is_empty() {
+        // Retarget only when the device actually changed: volume/blend
+        // edits must not churn links. The empty uid is a real target
+        // (system default) — F-0.4.2 fix: it used to skip the retarget
+        // entirely, leaving the stream stuck on the previous sink.
+        let prev = {
+            let mut cur = self.shared.monitor_device.lock().unwrap();
+            let prev = cur.clone();
+            *cur = settings.device.clone();
+            prev
+        };
+        if prev != settings.device {
             flatten(self.roundtrip(
                 |tx| Cmd::MonitorRetarget(settings.device.clone(), tx),
                 "monitor retarget",
@@ -656,6 +686,7 @@ fn worker_main(
     let nodes_g = nodes.clone();
     let nodes_r = nodes.clone();
     let hp_g = hp_tx.clone();
+    let hp_worker = hp_tx.clone();
     let ports: Arc<Mutex<HashMap<u32, PortSummary>>> = Arc::new(Mutex::new(HashMap::new()));
     let ports_g = ports.clone();
     let ports_r = ports.clone();
@@ -666,11 +697,52 @@ fn worker_main(
             return;
         }
     };
+    // Default-sink watcher (F-0.4.2): WirePlumber publishes the current
+    // default via the "default" metadata object. We bind it and record
+    // every `default.audio.sink` change; the run loop re-links the
+    // hear-myself monitor when it tracks the system default.
+    let pending_default: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let pending_default_g = pending_default.clone();
+    let meta_slot: Rc<RefCell<Option<(pw::metadata::Metadata, pw::metadata::MetadataListener)>>> =
+        Rc::new(RefCell::new(None));
+    let meta_slot_g = meta_slot.clone();
+    let registry_g = registry.clone();
     // NOTE: both the registry proxy AND the listener guard must stay
     // alive (dropping the proxy kills the server-side subscription).
     let _reg_listener = registry
         .add_listener_local()
         .global(move |obj| {
+            if obj.type_ == pw::types::ObjectType::Metadata {
+                let is_default = obj
+                    .props
+                    .as_ref()
+                    .and_then(|p| p.get("metadata.name"))
+                    .map(|n| n == "default")
+                    .unwrap_or(false);
+                let already_bound = meta_slot_g.borrow().is_some();
+                if is_default && !already_bound {
+                    if let Ok(md) = registry_g.bind::<pw::metadata::Metadata, _>(obj) {
+                        let pending = pending_default_g.clone();
+                        let listener = md
+                            .add_listener_local()
+                            .property(move |_subject, key, _type, value| {
+                                if key == Some("default.audio.sink") {
+                                    if let Some(v) = value {
+                                        if let Some(name) = parse_default_sink_value(v) {
+                                            if let Ok(mut slot) = pending.try_borrow_mut() {
+                                                *slot = Some(name);
+                                            }
+                                        }
+                                    }
+                                }
+                                0
+                            })
+                            .register();
+                        *meta_slot_g.borrow_mut() = Some((md, listener));
+                    }
+                }
+                return;
+            }
             if obj.type_ == pw::types::ObjectType::Port {
                 if let Some(props) = obj.props.as_ref() {
                     let node_id: u32 = props.get("node.id").and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -746,6 +818,8 @@ fn worker_main(
         ports,
         _registry: registry,
         _reg_listener,
+        hp: hp_worker,
+        pending_default,
         vm_proxy: None,
         vm_id: None,
         vm_module: None,
@@ -787,6 +861,12 @@ struct Worker {
     ports: Arc<Mutex<HashMap<u32, PortSummary>>>,
     _registry: pw::registry::RegistryRc,
     _reg_listener: pw::registry::Listener,
+    /// Hotplug sender (default-sink changes detected via metadata).
+    hp: mpsc::Sender<HotplugEvent>,
+    /// Latest `default.audio.sink` seen by the metadata watcher; the run
+    /// loop consumes it and re-links the monitor when it tracks the
+    /// system default (F-0.4.2 hotplug polish).
+    pending_default: Rc<RefCell<Option<String>>>,
     vm_proxy: Option<pw::node::Node>,
     vm_id: Option<u32>,
     /// pactl module index when created via module-null-sink (for unload).
@@ -843,6 +923,27 @@ impl Worker {
                     return;
                 }
                 self.handle(cmd, core, loop_);
+            }
+            // Default-sink metadata wake-up (F-0.4.2): when the monitor
+            // tracks the system default (empty uid), re-link it to the
+            // new sink; consumers also learn through the hotplug event.
+            let pending = self.pending_default.borrow_mut().take();
+            if let Some(name) = pending {
+                let tracks_default = self
+                    .shared
+                    .monitor_device
+                    .lock()
+                    .map(|d| d.is_empty())
+                    .unwrap_or(false);
+                if self.mon_node_id.is_some() && tracks_default {
+                    if let Err(e) = self.retarget_monitor("", core, loop_) {
+                        eprintln!("vm-audio: monitor default re-link: {e}");
+                    }
+                }
+                let _ = self.hp.send(HotplugEvent::DefaultChanged {
+                    role: DeviceRole::Sink,
+                    uid: DeviceUid::new(name),
+                });
             }
             // Pump control traffic (params/state/registry). Process
             // callbacks arrive on RT threads independently.
@@ -1690,26 +1791,43 @@ impl Worker {
 
     /// Move the hear-myself monitor to another sink node: drop the
     /// existing monitor links (dropping the proxies disconnects them) and
-    /// link the monitor stream to the requested node. Runs on the worker
-    /// thread (F-0.4.C item 15).
+    /// link the monitor stream to the requested node. An empty uid means
+    /// the system default sink; when no default is known the links are
+    /// simply dropped (the stream stays silent) and the metadata watcher
+    /// re-links as soon as one appears. Runs on the worker thread
+    /// (F-0.4.C item 15; default/validation semantics hardened in
+    /// F-0.4.2).
     fn retarget_monitor(
         &mut self,
         uid: &str,
         core: &pw::core::CoreRc,
         loop_: &pw::loop_::Loop,
     ) -> Result<(), AudioError> {
-        let id: u32 = uid
-            .rsplit('#')
-            .next()
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(|| AudioError::Backend(format!("bad monitor device uid '{uid}'")))?;
-        let known = self.nodes.lock().map(|m| m.contains_key(&id)).unwrap_or(false);
-        if !known {
-            return Err(AudioError::Backend(format!("monitor device '{uid}' not found")));
-        }
         let mon_id = self.mon_node_id.ok_or(AudioError::NoStream)?;
+        let target = if uid.is_empty() {
+            default_sink_id(&self.nodes)
+        } else {
+            let id: u32 = uid
+                .rsplit('#')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| AudioError::Backend(format!("bad monitor device uid '{uid}'")))?;
+            let node = self.nodes.lock().ok().and_then(|m| m.get(&id).cloned());
+            let node = node.ok_or_else(|| {
+                AudioError::Backend(format!("monitor device '{uid}' not found"))
+            })?;
+            if !is_physical_monitor_target(&node) {
+                return Err(AudioError::Backend(format!(
+                    "monitor device '{uid}' is not a physical output"
+                )));
+            }
+            Some(id)
+        };
         self.mon_links.clear();
-        let links = self.link_ports(core, loop_, mon_id, id)?;
+        let Some(target_id) = target else {
+            return Ok(());
+        };
+        let links = self.link_ports(core, loop_, mon_id, target_id)?;
         self.mon_links.extend(links);
         Ok(())
     }
@@ -2136,5 +2254,54 @@ Sink Input #19742\n\
             vec![21]
         );
         assert!(parse_modules_with_argument(text, "sink_name=vm-monitor").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod monitor_policy_tests {
+    use super::*;
+
+    fn node(name: &str, class: &str) -> NodeSummary {
+        NodeSummary {
+            id: 1,
+            name: name.into(),
+            media_class: class.into(),
+            description: String::new(),
+        }
+    }
+
+    #[test]
+    fn physical_monitor_targets_only() {
+        assert!(is_physical_monitor_target(&node(
+            "alsa_output.pci-0000_00_1f.3.analog-stereo",
+            "Audio/Sink"
+        )));
+        assert!(is_physical_monitor_target(&node("bluez_output.AC_12.1", "Audio/Sink")));
+        // Our own endpoints are never valid hear-myself targets.
+        assert!(!is_physical_monitor_target(&node("vm-mic", "Audio/Sink")));
+        assert!(!is_physical_monitor_target(&node("vm-passthrough", "Audio/Sink")));
+        assert!(!is_physical_monitor_target(&node("vm-monitor", "Audio/Sink")));
+        // Sources and non-audio nodes are rejected too.
+        assert!(!is_physical_monitor_target(&node("alsa_input.usb", "Audio/Source")));
+        assert!(!is_physical_monitor_target(&node("some-client", "Stream/Output/Audio")));
+    }
+
+    #[test]
+    fn default_sink_metadata_parses() {
+        assert_eq!(
+            parse_default_sink_value(r#"{"name":"alsa_output.pci-0000_00_1f.3.analog-stereo"}"#)
+                .as_deref(),
+            Some("alsa_output.pci-0000_00_1f.3.analog-stereo")
+        );
+        // WirePlumber may pad the JSON; spacing must not matter.
+        assert_eq!(
+            parse_default_sink_value(r#"{ "name" : "bluez_output.AC_12.1" }"#).as_deref(),
+            Some("bluez_output.AC_12.1")
+        );
+        // Unset / malformed values are ignored, never panic.
+        assert_eq!(parse_default_sink_value("null"), None);
+        assert_eq!(parse_default_sink_value(""), None);
+        assert_eq!(parse_default_sink_value(r#"{"name":""}"#), None);
+        assert_eq!(parse_default_sink_value(r#"{"other":true}"#), None);
     }
 }

@@ -1793,6 +1793,16 @@ fn hotkey_action(target: &HotkeyTarget, pressed: bool, state: &DaemonState) -> O
             Some(Action::SelectVoice { voice: name.clone() })
         }
         HotkeyTarget::StopAllSounds if pressed => Some(Action::StopAllSounds),
+        HotkeyTarget::ToggleMonitor if pressed => {
+            let cur = state.monitor.lock().unwrap().enabled;
+            Some(Action::SetMonitor {
+                enabled: Some(!cur),
+                device: None,
+                mix: None,
+                volume_db: None,
+                muted: None,
+            })
+        }
         HotkeyTarget::SaveReplay if pressed => Some(Action::SaveInstantReplay),
         _ => None,
     }
@@ -2219,7 +2229,28 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
     {
         let cfg = state.monitor.lock().unwrap().clone();
         if let Err(e) = state.apply_monitor(&cfg) {
-            eprintln!("monitor: boot apply failed: {e}");
+            // F-0.4.2: a pinned output that vanished while we were down
+            // must not brick the monitor — drop to the system default,
+            // persist it and keep the feature alive.
+            if cfg.device.is_empty() {
+                eprintln!("monitor: boot apply failed: {e}");
+            } else {
+                eprintln!("monitor: boot apply failed: {e}; falling back to system default");
+                let next = {
+                    let mut n = cfg.clone();
+                    n.device = String::new();
+                    n
+                };
+                if let Err(e) = state.transact_section(&state.monitor, |c| {
+                    *c = next.clone();
+                    Ok(())
+                }) {
+                    eprintln!("monitor: persisting boot fallback failed: {e}");
+                }
+                if let Err(e) = state.apply_monitor(&next) {
+                    eprintln!("monitor: boot fallback failed: {e}");
+                }
+            }
         }
     }
     if state.passthrough.lock().unwrap().enabled {
@@ -2323,23 +2354,63 @@ async fn run(live: bool) -> Result<(), Box<dyn std::error::Error>> {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                let mut arrivals = Vec::new();
+                let mut removed = Vec::new();
+                let mut default_changed = false;
                 {
                     let mut audio = state.audio.lock().unwrap();
-                    let mut arrivals = Vec::new();
                     for ev in audio.poll_hotplug() {
                         println!("hotplug: {ev:?} (link: {:?})", audio.link_state());
-                        // A (re)plugged input with a bound voice takes
-                        // over immediately (F-0.4.D device profiles).
-                        if let vm_audio::HotplugEvent::DeviceAdded(dev) = ev {
-                            if dev.role == DeviceRole::Input {
-                                arrivals.push((dev.uid.0.clone(), dev.name.clone()));
+                        match ev {
+                            // A (re)plugged input with a bound voice takes
+                            // over immediately (F-0.4.D device profiles).
+                            vm_audio::HotplugEvent::DeviceAdded(dev) => {
+                                if dev.role == DeviceRole::Input {
+                                    arrivals.push((dev.uid.0.clone(), dev.name.clone()));
+                                }
+                            }
+                            vm_audio::HotplugEvent::DeviceRemoved(uid) => {
+                                removed.push(uid.0);
+                            }
+                            // The backend re-links its own monitor when it
+                            // tracks the default (F-0.4.2); UIs just need a
+                            // list refresh.
+                            vm_audio::HotplugEvent::DefaultChanged { .. } => {
+                                default_changed = true;
                             }
                         }
                     }
-                    drop(audio);
-                    for (uid, name) in arrivals {
-                        state.autoswitch_for_device(&uid, &name);
+                }
+                for (uid, name) in arrivals {
+                    state.autoswitch_for_device(&uid, &name);
+                }
+                // Monitor output unplugged (F-0.4.2): fall back to the
+                // system default, persist and tell every listener — the
+                // config must never keep pointing at a device that is
+                // gone. The backend already dropped the dead links.
+                let monitor_lost = {
+                    let dev = state.monitor.lock().unwrap().device.clone();
+                    !dev.is_empty() && removed.contains(&dev)
+                };
+                if monitor_lost {
+                    println!("monitor: output device removed — falling back to system default");
+                    let (reply, evts) = state.handle(&Action::SetMonitor {
+                        enabled: None,
+                        device: Some(String::new()),
+                        mix: None,
+                        volume_db: None,
+                        muted: None,
+                    });
+                    if !reply.ok {
+                        eprintln!("monitor: hotplug fallback failed: {:?}", reply.error);
                     }
+                    let publisher = server.publisher();
+                    for e in &evts {
+                        publish(&publisher, e);
+                    }
+                }
+                if default_changed {
+                    publish(&server.publisher(), &ControlEvent::DevicesChanged);
                 }
                 // Watchdog (F-A): auto-restart a dead link / xrun storm.
                 state.watchdog_tick();
@@ -2802,9 +2873,9 @@ mod hotkey_api_tests {
         // Persisted to config.json with schema version.
         let text = std::fs::read_to_string(&state.config_path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v["version"], 4);
+        assert_eq!(v["version"], 5);
         assert_eq!(v["hotkeys"].as_array().unwrap().len(), 1);
-        // F-0.4.C/B: the v4 schema always carries the integration sections.
+        // F-0.4.C/B: the v5 schema always carries the integration sections.
         assert!(v["monitor"].is_object());
         assert!(v["ducking"].is_object());
         assert!(v["obs"].is_object());
@@ -2937,6 +3008,36 @@ mod hotkey_api_tests {
         assert_eq!(
             hotkey_action(&HotkeyTarget::StopAllSounds, true, &state),
             Some(Action::StopAllSounds)
+        );
+        // Monitor toggle (F-0.4.2): flips the live enabled flag.
+        assert_eq!(
+            hotkey_action(&HotkeyTarget::ToggleMonitor, true, &state),
+            Some(Action::SetMonitor {
+                enabled: Some(true),
+                device: None,
+                mix: None,
+                volume_db: None,
+                muted: None,
+            })
+        );
+        assert_eq!(hotkey_action(&HotkeyTarget::ToggleMonitor, false, &state), None);
+        let (reply, _) = state.handle(&Action::SetMonitor {
+            enabled: Some(true),
+            device: None,
+            mix: None,
+            volume_db: None,
+            muted: None,
+        });
+        assert!(reply.ok, "{:?}", reply.error);
+        assert_eq!(
+            hotkey_action(&HotkeyTarget::ToggleMonitor, true, &state),
+            Some(Action::SetMonitor {
+                enabled: Some(false),
+                device: None,
+                mix: None,
+                volume_db: None,
+                muted: None,
+            })
         );
     }
 }
@@ -3417,7 +3518,7 @@ mod device_profile_tests {
         // File is schema v4 with the profile + integration sections.
         let text = std::fs::read_to_string(&state.config_path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v["version"], 4);
+        assert_eq!(v["version"], 5);
         assert_eq!(v["device_profiles"]["stub:input:0"], "example-drive");
         assert_eq!(v["ducking"]["enabled"], true, "ducking defaults on");
         assert_eq!(v["replay"]["enabled"], true, "replay defaults on");

@@ -240,8 +240,9 @@ pub trait StreamProcessor: Send {
 
 /// Hear-myself monitor settings (F-0.4.C item 15). `mix` blends the raw
 /// mic (0.0, dry, zero added latency) with the processed output (1.0,
-/// wet); `device` is an output uid (`name#id`) or empty for the system
-/// default sink. Live backends apply this after `open` and on change.
+/// wet; the default since F-0.4.2); `device` is an output uid
+/// (`name#id`) or empty for the system default sink. Live backends
+/// apply this after `open` and on change.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MonitorSettings {
     pub enabled: bool,
@@ -253,7 +254,7 @@ pub struct MonitorSettings {
 
 impl Default for MonitorSettings {
     fn default() -> Self {
-        Self { enabled: false, device: String::new(), mix: 0.0, volume_db: 0.0, muted: false }
+        Self { enabled: false, device: String::new(), mix: 1.0, volume_db: 0.0, muted: false }
     }
 }
 

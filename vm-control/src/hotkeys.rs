@@ -20,6 +20,8 @@ pub enum HotkeyTarget {
     PlaySound(String),
     SelectVoice(String),
     StopAllSounds,
+    /// Edge: toggle the hear-myself monitor on/off (F-0.4.2).
+    ToggleMonitor,
     /// Edge: write the instant-replay window to disk (F-0.4.B item 20).
     SaveReplay,
 }
@@ -168,9 +170,10 @@ struct ConfigFile {
 }
 
 /// Current config schema version. v1 (hotkeys only), v2 (device
-/// profiles) and v3 (F-0.4.C integrations) files migrate forward;
-/// unknown versions fail closed with a clear error.
-pub const CONFIG_VERSION: u32 = 4;
+/// profiles), v3 (F-0.4.C integrations) and v4 (replay, passthrough)
+/// files migrate forward; v5 flips the untouched monitor default to the
+/// wet path (F-0.4.2). Unknown versions fail closed with a clear error.
+pub const CONFIG_VERSION: u32 = 5;
 
 /// Serialize the daemon config to file text.
 pub fn save_daemon_config(cfg: &DaemonConfig) -> String {
@@ -187,7 +190,7 @@ pub fn save_daemon_config(cfg: &DaemonConfig) -> String {
     })
     .unwrap_or_else(|_| {
         String::from(
-            "{\"version\":4,\"hotkeys\":[],\"device_profiles\":{},\"monitor\":{},\
+            "{\"version\":5,\"hotkeys\":[],\"device_profiles\":{},\"monitor\":{},\
              \"ducking\":{},\"obs\":{},\"midi\":{},\"replay\":{},\"passthrough\":{}}",
         )
     })
@@ -206,6 +209,26 @@ pub fn load_daemon_config(text: &str) -> Result<DaemonConfig, String> {
             device_profiles: cfg.device_profiles,
             ..DaemonConfig::default()
         }),
+        // v3 (F-0.4.C) and v4 (replay + passthrough) migrate to v5.
+        // Missing sections fall back to serde defaults; the monitor flips
+        // to the wet path only when it still carries the untouched dry
+        // default (never overrides a user-chosen blend).
+        3 | 4 => {
+            let mut monitor = cfg.monitor;
+            if !monitor.enabled && monitor.mix == 0.0 {
+                monitor.mix = 1.0;
+            }
+            Ok(DaemonConfig {
+                hotkeys: cfg.hotkeys,
+                device_profiles: cfg.device_profiles,
+                monitor,
+                ducking: cfg.ducking,
+                obs: cfg.obs,
+                midi: cfg.midi,
+                replay: cfg.replay,
+                passthrough: cfg.passthrough,
+            })
+        }
         CONFIG_VERSION => Ok(DaemonConfig {
             hotkeys: cfg.hotkeys,
             device_profiles: cfg.device_profiles,
@@ -355,9 +378,12 @@ mod hotkey_tests {
         assert!(!is_momentary(&HotkeyTarget::ToggleMute));
         assert!(!is_momentary(&HotkeyTarget::StopAllSounds));
         assert!(!is_momentary(&HotkeyTarget::SaveReplay));
+        assert!(!is_momentary(&HotkeyTarget::ToggleMonitor));
         // New edge target round-trips on the wire.
         let t: HotkeyTarget = serde_json::from_str(r#""SaveReplay""#).unwrap();
         assert_eq!(t, HotkeyTarget::SaveReplay);
+        let t: HotkeyTarget = serde_json::from_str(r#""ToggleMonitor""#).unwrap();
+        assert_eq!(t, HotkeyTarget::ToggleMonitor);
     }
 
     #[test]
@@ -449,8 +475,24 @@ mod hotkey_tests {
         assert_eq!(migrated.device_profiles["Fifine"], "mic-npr-voice");
         assert!(!migrated.monitor.enabled, "monitor stays off unless configured");
         assert!(!migrated.passthrough.enabled, "passthrough stays off unless configured");
+        // F-0.4.2: v3/v4 files migrate to v5. The monitor flips to the
+        // wet path only when it still carries the untouched dry default;
+        // an enabled monitor or a chosen blend is user intent, kept.
+        let v4_untouched = r#"{"version":4,"hotkeys":[],"monitor":{"enabled":false,"device":"","mix":0.0,"volume_db":0.0,"muted":false}}"#;
+        let migrated = load_daemon_config(v4_untouched).expect("v4 migrates");
+        assert_eq!(migrated.monitor.mix, 1.0, "untouched dry default flips to wet");
+        let v4_dry_user = r#"{"version":4,"hotkeys":[],"monitor":{"enabled":true,"device":"out#3","mix":0.0,"volume_db":-6.0,"muted":false}}"#;
+        let migrated = load_daemon_config(v4_dry_user).expect("v4 migrates");
+        assert_eq!(migrated.monitor.mix, 0.0, "an enabled dry monitor is kept");
+        assert_eq!(migrated.monitor.volume_db, -6.0);
+        let v4_blend = r#"{"version":4,"hotkeys":[],"monitor":{"enabled":false,"device":"","mix":0.5,"volume_db":0.0,"muted":false}}"#;
+        let migrated = load_daemon_config(v4_blend).expect("v4 migrates");
+        assert_eq!(migrated.monitor.mix, 0.5, "a chosen blend survives migration");
+        let v3 = r#"{"version":3,"hotkeys":[]}"#;
+        let migrated = load_daemon_config(v3).expect("v3 migrates");
+        assert_eq!(migrated.monitor.mix, 1.0, "v3: untouched monitor flips to wet");
         // Wrong version fails closed.
-        let bad = text.replace("\"version\": 4", "\"version\": 99");
+        let bad = text.replace("\"version\": 5", "\"version\": 99");
         assert!(load_daemon_config(&bad).is_err());
         // Garbage fails with a clear error, never an empty store.
         assert!(load_daemon_config("not json").is_err());
