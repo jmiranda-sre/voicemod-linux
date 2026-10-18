@@ -53,6 +53,8 @@ struct PortSummary {
     node_id: u32,
     /// "in" or "out" (port.direction).
     direction: String,
+    /// port.name (e.g. `output_FL`); used to pair channels by tag.
+    name: String,
 }
 
 /// Negotiated sample format, normalized to a small code.
@@ -476,6 +478,63 @@ fn parse_default_sink_value(v: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+/// Channel tag of a PipeWire port name: `output_FL` → `FL`,
+/// `playback_FR` → `FR`, `capture_MONO` → `MONO`. Ports without an
+/// underscore keep their whole name as the tag. F-0.4.2.
+fn channel_tag(name: &str) -> &str {
+    name.rsplit('_').next().unwrap_or(name)
+}
+
+/// Pair output ports with input ports **by channel tag** (FL↔FL,
+/// FR↔FR), falling back to id order for unmatched ports. PipeWire port
+/// ids follow creation order, which differs between nodes (streams and
+/// ALSA devices enumerate ports in different orders) — pairing by id
+/// alone shipped swapped stereo links nondeterministically. Input is
+/// `(port.name, port.id)` pairs; the result is deterministic. F-0.4.2.
+fn pair_ports(out: &[(String, u32)], inp: &[(String, u32)]) -> Vec<(u32, u32)> {
+    let mut outs = out.to_vec();
+    outs.sort_by(|a, b| (channel_tag(&a.0), a.1).cmp(&(channel_tag(&b.0), b.1)));
+    let mut ins = inp.to_vec();
+    ins.sort_by(|a, b| (channel_tag(&a.0), a.1).cmp(&(channel_tag(&b.0), b.1)));
+    let n = outs.len().min(ins.len());
+    let mut used_in = vec![false; ins.len()];
+    let mut out_used = vec![false; outs.len()];
+    let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(n);
+    // First pass: exact channel-tag matches.
+    for (oi, (oname, oid)) in outs.iter().enumerate() {
+        let tag = channel_tag(oname);
+        if let Some(ii) = ins
+            .iter()
+            .position(|(iname, _)| channel_tag(iname) == tag)
+            .filter(|ii| !used_in[*ii])
+        {
+            used_in[ii] = true;
+            out_used[oi] = true;
+            pairs.push((*oid, ins[ii].1));
+        }
+    }
+    // Second pass: leftovers in deterministic (tag, id) order.
+    let rest_out: Vec<u32> = outs
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !out_used[*i])
+        .map(|(_, (_, id))| *id)
+        .collect();
+    let rest_in: Vec<u32> = ins
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !used_in[*i])
+        .map(|(_, (_, id))| *id)
+        .collect();
+    for (o, i) in rest_out.iter().zip(rest_in.iter()) {
+        if pairs.len() >= n {
+            break;
+        }
+        pairs.push((*o, *i));
+    }
+    pairs
+}
+
 impl AudioBackend for PipeWireBackend {
     fn enumerate(&mut self) -> Result<Vec<AudioDevice>, AudioError> {
         let devs: Vec<AudioDevice> = flatten(self.roundtrip(Cmd::Enumerate, "enumerate"))?;
@@ -750,7 +809,7 @@ fn worker_main(
                     let direction = props.get("port.direction").unwrap_or("").to_string();
                     if node_id != 0 && !name.is_empty() {
                         if let Ok(mut map) = ports_g.lock() {
-                            map.insert(obj.id, PortSummary { id: obj.id, node_id, direction });
+                            map.insert(obj.id, PortSummary { id: obj.id, node_id, direction, name });
                         }
                     }
                 }
@@ -1729,31 +1788,30 @@ impl Worker {
         from_node: u32,
         to_node: u32,
     ) -> Result<Vec<pw::link::Link>, AudioError> {
-        let mut out_ports: Vec<u32> = Vec::new();
-        let mut in_ports: Vec<u32> = Vec::new();
+        let mut out_ports: Vec<(String, u32)> = Vec::new();
+        let mut in_ports: Vec<(String, u32)> = Vec::new();
         self.pump_until(loop_, Duration::from_secs(10), || {
             let map = match self.ports.lock() {
                 Ok(m) => m,
                 Err(_) => return false,
             };
-            let mut o: Vec<u32> = map
+            let mut o: Vec<(String, u32)> = map
                 .values()
                 .filter(|p| p.node_id == from_node && p.direction == "out")
-                .map(|p| p.id)
+                .map(|p| (p.name.clone(), p.id))
                 .collect();
-            o.sort_unstable();
+            o.sort_by(|a, b| (channel_tag(&a.0), a.1).cmp(&(channel_tag(&b.0), b.1)));
             out_ports = o;
-            let mut i: Vec<u32> = map
+            let mut i: Vec<(String, u32)> = map
                 .values()
                 .filter(|p| p.node_id == to_node && p.direction == "in")
-                .map(|p| p.id)
+                .map(|p| (p.name.clone(), p.id))
                 .collect();
-            i.sort_unstable();
+            i.sort_by(|a, b| (channel_tag(&a.0), a.1).cmp(&(channel_tag(&b.0), b.1)));
             in_ports = i;
             out_ports.len() >= 2 && in_ports.len() >= 2
         });
-        let n = out_ports.len().min(in_ports.len());
-        if n < 1 {
+        if out_ports.is_empty() || in_ports.is_empty() {
             return Err(AudioError::Backend(format!(
                 "ports not visible (from={from_node}:{}, to={to_node}:{})",
                 out_ports.len(),
@@ -1761,7 +1819,7 @@ impl Worker {
             )));
         }
         let mut links: Vec<pw::link::Link> = Vec::new();
-        for (out_port, in_port) in out_ports.iter().zip(in_ports.iter()).take(n) {
+        for (out_port, in_port) in pair_ports(&out_ports, &in_ports) {
             let link: pw::link::Link = core
                 .create_object(
                     "link-factory",
@@ -1778,7 +1836,7 @@ impl Worker {
         Ok(links)
     }
     /// Create output→input links from our vad stream ports to the vm-mic
-    /// sink ports, matched by channel index (FL→playback_1, FR→playback_2).
+    /// sink ports, matched by channel tag (FL→playback_FL).
     fn link_vad_to_vmic(
         &self,
         core: &pw::core::CoreRc,
@@ -2303,5 +2361,42 @@ mod monitor_policy_tests {
         assert_eq!(parse_default_sink_value(""), None);
         assert_eq!(parse_default_sink_value(r#"{"name":""}"#), None);
         assert_eq!(parse_default_sink_value(r#"{"other":true}"#), None);
+    }
+}
+
+#[cfg(test)]
+mod port_pairing_tests {
+    use super::*;
+
+    fn p(name: &str, id: u32) -> (String, u32) {
+        (name.into(), id)
+    }
+
+    #[test]
+    fn pairs_channels_by_tag_not_id_order() {
+        // FR carries the lower id: id-order pairing would swap stereo.
+        let out = vec![p("output_FR", 11), p("output_FL", 12)];
+        let inp = vec![p("playback_FR", 20), p("playback_FL", 21)];
+        let pairs = pair_ports(&out, &inp);
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.contains(&(12, 21)), "FL must pair with FL: {pairs:?}");
+        assert!(pairs.contains(&(11, 20)), "FR must pair with FR: {pairs:?}");
+    }
+
+    #[test]
+    fn mono_stream_pairs_positionally() {
+        let out = vec![p("capture_MONO", 5)];
+        let inp = vec![p("input_FL", 30), p("input_FR", 31)];
+        assert_eq!(pair_ports(&out, &inp), vec![(5, 30)]);
+    }
+
+    #[test]
+    fn unknown_tags_fall_back_deterministically() {
+        let out = vec![p("weird", 7)];
+        let inp = vec![p("other", 8)];
+        assert_eq!(pair_ports(&out, &inp), vec![(7, 8)]);
+        assert_eq!(channel_tag("output_FL"), "FL");
+        assert_eq!(channel_tag("capture_MONO"), "MONO");
+        assert_eq!(channel_tag("plain"), "plain");
     }
 }
