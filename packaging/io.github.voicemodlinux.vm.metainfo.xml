@@ -52,6 +52,18 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.4.2" date="2026-10-17">
+      <description>
+        <p>Hear yourself, properly: the monitor gets a first-class card at
+        the top of the Voices tab — toggle with live status, quick mute,
+        output picker, return volume and a dry/wet advanced drawer with a
+        headphones hint — defaulting to the processed voice. The output
+        follows the system default live, an unplugged device falls back
+        automatically and a new ToggleMonitor hotkey target works
+        alongside the CLI. Stereo links are now paired by channel tag,
+        and a real-PipeWire lifecycle smoke guards the whole path.</p>
+      </description>
+    </release>
     <release version="0.4.1" date="2026-10-17">
       <description>
         <p>Desktop integration and GUI-first cycle: canonical app-id with

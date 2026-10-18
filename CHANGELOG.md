@@ -6,6 +6,8 @@ semantic versioning.
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-10-17
+
 ### Added (Hear Myself, F-0.4.2)
 
 - **Hear Myself** card at the top of the *Voices* tab: a prominent
