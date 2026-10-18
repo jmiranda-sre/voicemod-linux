@@ -75,6 +75,11 @@ struct VmApp<'a> {
     prefs_note: Option<(bool, String)>,
     /// About dialog (F-0.4.1.C): identity, clean-room note, license.
     about_open: bool,
+    /// F-0.4.2.B: signature of the last rendered monitor state. When the
+    /// daemon reports new values (hotplug fallback, ToggleMonitor hotkey,
+    /// `vm call`), the monitor mirrors are dropped so the Hear Myself
+    /// card follows the truth instead of stale local edits.
+    mon_seen: Option<(bool, String, u32, u32, bool)>,
 }
 
 impl<'a> VmApp<'a> {
@@ -121,6 +126,7 @@ impl<'a> VmApp<'a> {
             prefs_status: None,
             prefs_note: None,
             about_open: false,
+            mon_seen: None,
         };
         app.refresh_presets();
         app
@@ -425,6 +431,29 @@ impl eframe::App for VmApp<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let snap = self.snap.lock().map(|s| s.clone()).unwrap_or_default();
 
+        // F-0.4.2.B: the monitor is mutable from outside this window
+        // (hotplug fallback, ToggleMonitor hotkey, `vm call`). When the
+        // daemon reports values different from the last frame, drop the
+        // widget mirrors so the card shows the daemon's truth.
+        let mon_sig = (
+            snap.monitor.enabled,
+            snap.monitor.device.clone(),
+            snap.monitor.mix.to_bits(),
+            snap.monitor.volume_db.to_bits(),
+            snap.monitor.muted,
+        );
+        if self.mon_seen.as_ref() != Some(&mon_sig) {
+            if self.mon_seen.is_some() {
+                for param in ["enabled", "device", "mix", "volume_db", "muted"] {
+                    let key = ("monitor".to_string(), param.to_string());
+                    self.sliders.remove(&key);
+                    self.toggles.remove(&key);
+                    self.texts.remove(&key);
+                }
+            }
+            self.mon_seen = Some(mon_sig);
+        }
+
         // Keep local preset selection in sync with the daemon voice. On a
         // fresh connect `selected_voice` (event-driven) is still empty
         // until the first voiceChanged, but `Health.voice` (status poll)
@@ -553,7 +582,108 @@ impl eframe::App for VmApp<'_> {
 }
 
 impl VmApp<'_> {
+    /// F-0.4.2.B: "Hear Myself" — the first thing on the Voices tab.
+    /// Hearing your own voice with the effects live is the moment the
+    /// voice changer stops being abstract; everything else can wait.
+    fn hear_myself_card(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
+        // Physical outputs only, mirroring the backend policy: the vm-*
+        // namespace is ours (monitoring into it would double-deliver the
+        // voice into the graph). Filtered on uid (raw node name) since
+        // `name` is the friendly description.
+        let sinks: Vec<&link::DeviceInfo> = snap
+            .devices
+            .iter()
+            .filter(|d| d.role == "Sink" && !d.uid.starts_with("vm-"))
+            .collect();
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            let mut en = self.m_bool("monitor", "enabled", snap.monitor.enabled);
+            ui.horizontal(|ui| {
+                let label = if en { "Hear Myself — ON" } else { "Hear Myself — OFF" };
+                if ui
+                    .toggle_value(&mut en, egui::RichText::new(label).size(16.0).strong())
+                    .changed()
+                {
+                    self.set_bool("monitor", "enabled", en);
+                    self.send_monitor(snap);
+                }
+                if en {
+                    let muted = self.m_bool("monitor", "muted", snap.monitor.muted);
+                    let mlabel = if muted { "unmute" } else { "mute" };
+                    if ui.button(mlabel).clicked() {
+                        self.set_bool("monitor", "muted", !muted);
+                        self.send_monitor(snap);
+                    }
+                }
+                ui.weak(if en {
+                    "live — you hear your voice with the current effects"
+                } else {
+                    "hear your own voice through your headphones or speakers"
+                });
+            });
+            let cur = self.m_text("monitor", "device", &snap.monitor.device);
+            let shown = if cur.is_empty() {
+                "(system default)".to_string()
+            } else {
+                sinks
+                    .iter()
+                    .find(|d| d.uid == cur)
+                    .map(|d| d.name.clone())
+                    .unwrap_or_else(|| "(device not connected)".to_string())
+            };
+            let mut chosen: Option<String> = None;
+            ui.horizontal(|ui| {
+                ui.label("Output:");
+                egui::ComboBox::from_id_salt("monitor_device")
+                    .selected_text(shown)
+                    .width(280.0)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(cur.is_empty(), "(system default)")
+                            .clicked()
+                        {
+                            chosen = Some(String::new());
+                        }
+                        for d in &sinks {
+                            if ui.selectable_label(cur == d.uid, &d.name).clicked() {
+                                chosen = Some(d.uid.clone());
+                            }
+                        }
+                    });
+            });
+            if let Some(c) = chosen {
+                self.texts
+                    .insert(("monitor".to_string(), "device".to_string()), c);
+                self.send_monitor(snap);
+            }
+            let mut vol = self.m_f32("monitor", "volume_db", snap.monitor.volume_db);
+            let r = ui.add(egui::Slider::new(&mut vol, -40.0..=12.0).text("return volume (dB)"));
+            self.set_f32("monitor", "volume_db", vol);
+            if r.drag_stopped() {
+                self.send_monitor(snap);
+            }
+            let mix_custom = self.m_f32("monitor", "mix", snap.monitor.mix) < 1.0;
+            egui::CollapsingHeader::new("Advanced")
+                .default_open(mix_custom)
+                .show(ui, |ui| {
+                    let mut mix = self.m_f32("monitor", "mix", snap.monitor.mix);
+                    let r =
+                        ui.add(egui::Slider::new(&mut mix, 0.0..=1.0).text("dry « blend » wet"));
+                    self.set_f32("monitor", "mix", mix);
+                    if r.drag_stopped() {
+                        self.send_monitor(snap);
+                    }
+                    ui.weak("0.0 = raw mic (dry, lowest latency) · 1.0 = processed voice (wet)");
+                    ui.weak(
+                        "Tip: use headphones — with speakers, the mic can pick the \
+                         monitor up again and echo (acoustic feedback).",
+                    );
+                });
+        });
+    }
+
     fn voices_tab(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
+        self.hear_myself_card(ui, snap);
+        ui.separator();
         ui.horizontal(|ui| {
             ui.label("Voice changer:");
             let mut enabled = snap.voice_enabled;
@@ -989,59 +1119,10 @@ impl VmApp<'_> {
     }
 
     fn integrations_tab(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
-        let sinks: Vec<&link::DeviceInfo> =
-            snap.devices.iter().filter(|d| d.role == "Sink").collect();
+        // The monitor card lives on the Voices tab since F-0.4.2.B (top
+        // of the tab, where it is actually discovered); this tab keeps
+        // the routing/bridge extras.
         egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.heading("Monitor — hear yourself");
-            ui.label("Plays your processed voice into an output with near-zero latency.");
-            ui.horizontal(|ui| {
-                let mut en = self.m_bool("monitor", "enabled", snap.monitor.enabled);
-                if ui.checkbox(&mut en, "enabled").changed() {
-                    self.set_bool("monitor", "enabled", en);
-                    self.send_monitor(snap);
-                }
-                let mut muted = self.m_bool("monitor", "muted", snap.monitor.muted);
-                if ui.checkbox(&mut muted, "mute").changed() {
-                    self.set_bool("monitor", "muted", muted);
-                    self.send_monitor(snap);
-                }
-            });
-            let cur = self.m_text("monitor", "device", &snap.monitor.device);
-            let shown = sinks
-                .iter()
-                .find(|d| d.uid == cur)
-                .map(|d| d.name.clone())
-                .unwrap_or_else(|| "(system default)".to_string());
-            let mut chosen: Option<String> = None;
-            egui::ComboBox::from_label("Output").selected_text(shown).show_ui(ui, |ui| {
-                if ui.selectable_label(cur.is_empty(), "(system default)").clicked() {
-                    chosen = Some(String::new());
-                }
-                for d in &sinks {
-                    if ui.selectable_label(cur == d.uid, &d.name).clicked() {
-                        chosen = Some(d.uid.clone());
-                    }
-                }
-            });
-            if let Some(c) = chosen {
-                self.texts
-                    .insert(("monitor".to_string(), "device".to_string()), c);
-                self.send_monitor(snap);
-            }
-            let mut mix = self.m_f32("monitor", "mix", snap.monitor.mix);
-            let r = ui.add(egui::Slider::new(&mut mix, 0.0..=1.0).text("dry/wet blend"));
-            self.set_f32("monitor", "mix", mix);
-            if r.drag_stopped() {
-                self.send_monitor(snap);
-            }
-            let mut vol = self.m_f32("monitor", "volume_db", snap.monitor.volume_db);
-            let r = ui.add(egui::Slider::new(&mut vol, -40.0..=12.0).text("volume (dB)"));
-            self.set_f32("monitor", "volume_db", vol);
-            if r.drag_stopped() {
-                self.send_monitor(snap);
-            }
-
-            ui.separator();
             ui.heading("Ducking — lower sounds while you speak");
             ui.label("Detects your voice on the raw mic and dips the soundboard for the effect.");
             let mut en = self.m_bool("ducking", "enabled", snap.ducking.enabled);
