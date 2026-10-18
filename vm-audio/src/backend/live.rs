@@ -341,6 +341,22 @@ fn default_sink_name() -> Option<String> {
     }
 }
 
+/// Default source **name** via `pactl get-default-source` (None on
+/// failure). Mirrors `default_sink_name`: the daemon's boot input pick
+/// prefers what the desktop uses over the (unstable) enumeration order.
+fn default_source_name() -> Option<String> {
+    let out = std::process::Command::new("pactl").arg("get-default-source").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 /// Run a `pactl` subcommand; stdout text or a descriptive error.
 fn pactl(args: &[&str]) -> Result<String, AudioError> {
     let out = std::process::Command::new("pactl")
@@ -657,6 +673,10 @@ impl AudioBackend for PipeWireBackend {
             ))?;
         }
         Ok(())
+    }
+
+    fn default_input_name(&mut self) -> Option<String> {
+        default_source_name()
     }
 
     fn output_streams(&mut self) -> Result<Vec<AppStream>, AudioError> {

@@ -324,6 +324,14 @@ pub trait AudioBackend: Send {
         Ok(())
     }
 
+    /// System default capture source name (`pactl get-default-source`),
+    /// used to steer the boot input pick (F-0.4.2 follow-up: the
+    /// enumeration order is not stable across boots, so "follow the
+    /// desktop default" beats "first in the list"). Default: none.
+    fn default_input_name(&mut self) -> Option<String> {
+        None
+    }
+
     /// List application output streams (pulse sink-inputs) for the
     /// passthrough picker (F-0.4.B item 18). Default: unsupported.
     fn output_streams(&mut self) -> Result<Vec<AppStream>, AudioError> {
