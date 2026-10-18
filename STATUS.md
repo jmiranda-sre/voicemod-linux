@@ -1291,7 +1291,7 @@ Progresso 2026-10-17: **D, A, C e B FECHADAS — ciclo v0.4.0 completo (release 
 - Próximo (do usuário): atualizar o Flathub (tag `v0.4.2` no manifest),
   AUR (regen `.SRCINFO`) e issues do backlog pós-v0.4.2.
 
-## Pós-0.4.2 — fixes de uso real (não publicado)
+## Pós-0.4.2 — fixes de uso real (publicados na v0.4.3)
 
 Dois bugs reportados em uso real no KDE, com causa-raiz e correção:
 
@@ -1315,3 +1315,34 @@ Dois bugs reportados em uso real no KDE, com causa-raiz e correção:
 - Gates do round: 196/196 testes workspace, clippy 0
   (`--all-targets -- -D warnings`), `monitor-lifecycle.sh` (7 fases) e
   `ui-lifecycle.sh` → SMOKE_OK com o daemon do sistema rodando.
+
+## PUBLICADO — v0.4.3 no ar (2026-10-17)
+
+- Ritual RELEASE.md seguido: 196/196 testes workspace, release build,
+  clippy 0 (`--all-targets -- -D warnings`), `appstreamcli validate` ✔
+  (com rede), `desktop-file-validate` ✔.
+- Smokes release: stub (config nova, schema v5 com `mix 1.0` no disco)
+  — `vm actions` = 49, selectVoice robot ok, getHealth ok (voice robot),
+  getVoices = 7, setMuted ok, getInstantReplay (enabled, 30 s),
+  addHotkey PushToTalk + SaveReplay ok, listHotkeys = 2; stub daemon na
+  porta efetiva 8766 (daemon do sistema na 8765 intocado);
+  `ui-lifecycle.sh` → SMOKE_OK (close→tray, `--minimized`→Show→close→
+  Quit, boot windowless, Show attaches=94); `monitor-lifecycle.sh`
+  (7 fases, incluindo a fase nova do boot left-on→desarmado) →
+  SMOKE_OK também com o daemon do sistema rodando.
+- Bump: workspace `Cargo.toml` + lock (0.4.3), Flatpak
+  `"tag": "v0.4.3"`, metainfo `<release 0.4.3>` com o resumo dos fixes,
+  CHANGELOG `[Unreleased]`→`[0.4.3]` e RELEASE.md atualizado (196/196,
+  "Current release: v0.4.3").
+- AppImage: `VoicemodLinux-0.4.3-x86_64.AppImage` (18.283.000 bytes);
+  extração + `ldd vm-ui` sem "not found" + `vm actions` = 49 dentro do
+  AppDir; anexado ao release.
+- Commits: `bddbbbe` + `611d97b` (fixes) + `1474ba0` (release); tag
+  anotada `v0.4.3`; release
+  github.com/jmiranda-sre/voicemod-linux/releases/tag/v0.4.3
+  (não-draft, não-prerelease) com AppImage + notas do CHANGELOG.
+- Próximo (do usuário): reinstalar o pacote/AppImage com a v0.4.3 e
+  validar (boot com monitor off; `journalctl --user -u vm-daemon -b |
+  grep "using input"` mostrando o Fifine), atualizar o Flathub (tag
+  `v0.4.3`) e o AUR (regen `.SRCINFO`; pkgver via `git describe` já
+  pega a tag nova).
