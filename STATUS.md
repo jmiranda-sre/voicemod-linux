@@ -1263,3 +1263,30 @@ Progresso 2026-10-17: **D, A, C e B FECHADAS — ciclo v0.4.0 completo (release 
   equivalência CLI, default vivo + fallback), CHANGELOG [Unreleased]
   com o ciclo 0.4.2 completo, RELEASE.md com o gate 3c, `voices.png`
   regenerado com o card.
+
+## PUBLICADO — v0.4.2 no ar (2026-10-17)
+- Ritual RELEASE.md seguido: 194/194 testes workspace, release build,
+  clippy 0 (`--all-targets -- -D warnings`), `appstreamcli validate` ✔
+  (com rede, URLs raw servindo o `voices.png` novo pós-push),
+  `desktop-file-validate` ✔.
+- Smokes release: stub (config nova, schema v5 com `mix 1.0` no disco)
+  — `vm actions` = 49, selectVoice robot ok, getHealth ok (voice
+  robot), getVoices = 7, setMuted ok, getInstantReplay (enabled, 30 s),
+  addHotkey PushToTalk + SaveReplay ok, listHotkeys = 2;
+  `ui-lifecycle.sh` → SMOKE_OK (close→tray, `--minimized`→Show→close→
+  Quit, boot windowless, Show attaches=120); `monitor-lifecycle.sh`
+  (gate 3c novo) → SMOKE_OK também com o daemon do sistema rodando.
+- Bump: workspace `Cargo.toml` + lock (0.4.2), Flatpak
+  `"tag": "v0.4.2"`, metainfo `<release 0.4.2>` com o resumo do ciclo,
+  CHANGELOG `[Unreleased]`→`[0.4.2]` (stub novo) e RELEASE.md
+  atualizado (194/194, "Current release: v0.4.2").
+- AppImage: `VoicemodLinux-0.4.2-x86_64.AppImage` (18.278.904 bytes);
+  extração + `ldd vm-ui` sem "not found" + `vm actions` = 49 dentro do
+  AppDir; anexado ao release.
+- Commits: `ac46806` (A) + `4944635` (canais) + `8b3d8f1` (B) +
+  `ffc3580` (C) + `fb9966f` (release); tag anotada `v0.4.2`; release
+  github.com/jmiranda-sre/voicemod-linux/releases/tag/v0.4.2
+  (não-draft, não-prerelease) com AppImage + notas do CHANGELOG
+  (ciclo completo F-0.4.2 A/B/C/D).
+- Próximo (do usuário): atualizar o Flathub (tag `v0.4.2` no manifest),
+  AUR (regen `.SRCINFO`) e issues do backlog pós-v0.4.2.
